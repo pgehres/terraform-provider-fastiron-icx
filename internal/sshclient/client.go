@@ -54,7 +54,7 @@ func NewClient(opts Options) (*Client, error) {
 
 	session, err := sshClient.NewSession()
 	if err != nil {
-		sshClient.Close()
+		_ = sshClient.Close()
 		return nil, fmt.Errorf("ssh session: %w", err)
 	}
 
@@ -62,28 +62,28 @@ func NewClient(opts Options) (*Client, error) {
 	if err := session.RequestPty("xterm", 80, 256, ssh.TerminalModes{
 		ssh.ECHO: 0,
 	}); err != nil {
-		session.Close()
-		sshClient.Close()
+		_ = session.Close()
+		_ = sshClient.Close()
 		return nil, fmt.Errorf("request pty: %w", err)
 	}
 
 	stdin, err := session.StdinPipe()
 	if err != nil {
-		session.Close()
-		sshClient.Close()
+		_ = session.Close()
+		_ = sshClient.Close()
 		return nil, fmt.Errorf("stdin pipe: %w", err)
 	}
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		session.Close()
-		sshClient.Close()
+		_ = session.Close()
+		_ = sshClient.Close()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 
 	if err := session.Shell(); err != nil {
-		session.Close()
-		sshClient.Close()
+		_ = session.Close()
+		_ = sshClient.Close()
 		return nil, fmt.Errorf("start shell: %w", err)
 	}
 
@@ -98,31 +98,31 @@ func NewClient(opts Options) (*Client, error) {
 	// Wait for the initial prompt.
 	initialOutput, err := c.readUntilPromptInitial()
 	if err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, fmt.Errorf("waiting for initial prompt: %w", err)
 	}
 
 	// Detect if we're in user mode (>) and need to enable.
 	if strings.HasSuffix(strings.TrimSpace(initialOutput), ">") {
 		if opts.EnablePassword == "" {
-			c.Close()
+			_ = c.Close()
 			return nil, fmt.Errorf("switch requires enable password but none was provided")
 		}
 		if err := c.enterEnableMode(); err != nil {
-			c.Close()
+			_ = c.Close()
 			return nil, fmt.Errorf("enter enable mode: %w", err)
 		}
 	}
 
 	// Build the prompt regex now that we're in privileged mode.
 	if err := c.detectPrompt(); err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, fmt.Errorf("detect prompt: %w", err)
 	}
 
 	// Disable paging.
 	if _, err := c.Execute("skip-page-display"); err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, fmt.Errorf("disable paging: %w", err)
 	}
 
@@ -208,12 +208,14 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	var errs []string
+
 	if c.inConfigMode {
-		c.execute("end")
+		if _, err := c.execute("end"); err != nil {
+			errs = append(errs, fmt.Sprintf("exit config mode: %v", err))
+		}
 		c.inConfigMode = false
 	}
-
-	var errs []string
 	if c.session != nil {
 		if err := c.session.Close(); err != nil {
 			errs = append(errs, fmt.Sprintf("session close: %v", err))

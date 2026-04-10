@@ -29,7 +29,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "connect error: %v\n", err)
 		os.Exit(1)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	output, err := client.GetRunningConfig()
 	if err != nil {
