@@ -1,0 +1,186 @@
+Current configuration:
+!
+ver 08.0.95mT213
+!
+stack unit 1
+  module 1 icx7250-24-port-management-module
+  module 2 icx7250-sfp-plus-8port-80g-module
+  stack-port 1/2/1
+  stack-port 1/2/3
+!
+!
+global-stp
+!
+!
+!
+vlan 1 name DEFAULT-VLAN by port
+ spanning-tree 802-1w
+ spanning-tree 802-1w priority 4096
+!
+vlan 10 name wireless by port
+ tagged ethe 1/1/19 to 1/1/20 ethe 1/2/1 ethe 1/2/3 to 1/2/8
+ router-interface ve 10
+ spanning-tree 802-1w
+ spanning-tree 802-1w priority 4096
+!
+vlan 20 name management by port
+ tagged ethe 1/1/19 to 1/1/20 ethe 1/1/22 ethe 1/2/3 ethe 1/2/7 to 1/2/8
+ untagged ethe 1/1/1 to 1/1/18 ethe 1/1/24 ethe 1/2/1 ethe 1/2/4 to 1/2/6
+ router-interface ve 1
+ spanning-tree 802-1w
+ spanning-tree 802-1w priority 4096
+ multicast passive
+!
+vlan 30 name servers by port
+ tagged ethe 1/1/15 ethe 1/1/19 to 1/1/20 ethe 1/2/1 ethe 1/2/3 to 1/2/8
+ untagged ethe 1/1/21 ethe 1/1/23 ethe 1/2/2
+ spanning-tree 802-1w
+ spanning-tree 802-1w priority 4096
+ multicast passive
+ multicast version 3
+!
+vlan 40 name storage by port
+ tagged ethe 1/1/15 ethe 1/1/19 to 1/1/20 ethe 1/2/1 ethe 1/2/3 to 1/2/8
+ spanning-tree 802-1w
+ spanning-tree 802-1w priority 4096
+!
+vlan 50 name dmz by port
+ tagged ethe 1/1/15 ethe 1/1/19 to 1/1/20 ethe 1/2/1 ethe 1/2/3 to 1/2/8
+ spanning-tree 802-1w
+ spanning-tree 802-1w priority 4096
+!
+vlan 60 name containers by port
+ tagged ethe 1/1/15 ethe 1/1/19 to 1/1/20 ethe 1/2/1 ethe 1/2/3 to 1/2/8
+ spanning-tree 802-1w
+ spanning-tree 802-1w priority 4096
+!
+vlan 70 name iot by port
+ tagged ethe 1/1/15 ethe 1/1/19 to 1/1/20 ethe 1/2/1 ethe 1/2/3 to 1/2/8
+ spanning-tree 802-1w
+ spanning-tree 802-1w priority 4096
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+optical-monitor
+optical-monitor non-ruckus-optic-enable
+aaa authentication web-server default local
+aaa authentication login default local
+enable aaa console
+ip dhcp-client disable
+ip default-network 10.0.20.0/24
+ip route 0.0.0.0/0 10.0.20.1
+!
+no telnet server
+username admin password .....
+!
+!
+!
+!
+!
+manager disable
+!
+!
+manager port-list 987
+!
+!
+!
+!
+!
+!
+!
+!
+!
+interface ethernet 1/1/8
+ port-name patchpanel-0
+!
+interface ethernet 1/1/9
+ port-name patchpanel-1
+!
+interface ethernet 1/1/10
+ port-name patchpanel-2
+!
+interface ethernet 1/1/12
+ port-name ipmi-0
+!
+interface ethernet 1/1/13
+ port-name ipmi-1
+!
+interface ethernet 1/1/15
+ port-name compute-blade-0
+!
+interface ethernet 1/1/19
+ port-name node-0-mgmt
+!
+interface ethernet 1/1/20
+ port-name node-1-mgmt
+!
+interface ethernet 1/1/21
+ port-name nas-0
+!
+interface ethernet 1/1/22
+ port-name console-server
+!
+interface ethernet 1/1/23
+ port-name media-server
+!
+interface ethernet 1/1/24
+ port-name workstation
+!
+interface ethernet 1/2/1
+ port-name uplink-router
+ spanning-tree 802-1w admin-pt2pt-mac
+!
+interface ethernet 1/2/2
+ port-name nas-10g
+!
+interface ethernet 1/2/3
+ port-name node-0-10g
+!
+interface ethernet 1/2/4
+ port-name node-1-10g
+!
+interface ethernet 1/2/5
+ no optical-monitor
+!
+interface ethernet 1/2/7
+ port-name trunk-to-sw2
+ no optical-monitor
+ spanning-tree 802-1w admin-pt2pt-mac
+!
+interface ethernet 1/2/8
+ port-name trunk-to-sw3
+ no optical-monitor
+ spanning-tree 802-1w admin-pt2pt-mac
+!
+interface ve 1
+ ip address 10.0.20.2 255.255.255.0
+!
+interface ve 10
+ ip address 10.0.10.2 255.255.255.0
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+end
