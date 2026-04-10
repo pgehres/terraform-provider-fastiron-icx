@@ -105,11 +105,11 @@ func NewClient(opts Options) (*Client, error) {
 	// Detect if we're in user mode (>) and need to enable.
 	if strings.HasSuffix(strings.TrimSpace(initialOutput), ">") {
 		if opts.EnablePassword == "" {
-			c.Close()
+			_ = c.Close()
 			return nil, fmt.Errorf("switch requires enable password but none was provided")
 		}
 		if err := c.enterEnableMode(); err != nil {
-			c.Close()
+			_ = c.Close()
 			return nil, fmt.Errorf("enter enable mode: %w", err)
 		}
 	}
@@ -208,12 +208,14 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	var errs []string
+
 	if c.inConfigMode {
-		_, _ = c.execute("end")
+		if _, err := c.execute("end"); err != nil {
+			errs = append(errs, fmt.Sprintf("exit config mode: %v", err))
+		}
 		c.inConfigMode = false
 	}
-
-	var errs []string
 	if c.session != nil {
 		if err := c.session.Close(); err != nil {
 			errs = append(errs, fmt.Sprintf("session close: %v", err))
