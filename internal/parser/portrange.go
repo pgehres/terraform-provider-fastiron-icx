@@ -2,7 +2,6 @@ package parser
 
 import (
 	"fmt"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,8 +51,6 @@ func portLess(a, b Port) bool {
 	}
 	return a.Port < b.Port
 }
-
-var portRangeTokenRe = regexp.MustCompile(`(\d+/\d+/\d+)`)
 
 // ExpandPortRange parses a FastIron port range string like
 // "ethe 1/1/19 to 1/1/20 ethe 1/1/22 to 1/1/24"

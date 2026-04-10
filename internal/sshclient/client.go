@@ -54,7 +54,7 @@ func NewClient(opts Options) (*Client, error) {
 
 	session, err := sshClient.NewSession()
 	if err != nil {
-		sshClient.Close()
+		_ = sshClient.Close()
 		return nil, fmt.Errorf("ssh session: %w", err)
 	}
 
@@ -62,28 +62,28 @@ func NewClient(opts Options) (*Client, error) {
 	if err := session.RequestPty("xterm", 80, 256, ssh.TerminalModes{
 		ssh.ECHO: 0,
 	}); err != nil {
-		session.Close()
-		sshClient.Close()
+		_ = session.Close()
+		_ = sshClient.Close()
 		return nil, fmt.Errorf("request pty: %w", err)
 	}
 
 	stdin, err := session.StdinPipe()
 	if err != nil {
-		session.Close()
-		sshClient.Close()
+		_ = session.Close()
+		_ = sshClient.Close()
 		return nil, fmt.Errorf("stdin pipe: %w", err)
 	}
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		session.Close()
-		sshClient.Close()
+		_ = session.Close()
+		_ = sshClient.Close()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 
 	if err := session.Shell(); err != nil {
-		session.Close()
-		sshClient.Close()
+		_ = session.Close()
+		_ = sshClient.Close()
 		return nil, fmt.Errorf("start shell: %w", err)
 	}
 
@@ -98,7 +98,7 @@ func NewClient(opts Options) (*Client, error) {
 	// Wait for the initial prompt.
 	initialOutput, err := c.readUntilPromptInitial()
 	if err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, fmt.Errorf("waiting for initial prompt: %w", err)
 	}
 
@@ -116,13 +116,13 @@ func NewClient(opts Options) (*Client, error) {
 
 	// Build the prompt regex now that we're in privileged mode.
 	if err := c.detectPrompt(); err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, fmt.Errorf("detect prompt: %w", err)
 	}
 
 	// Disable paging.
 	if _, err := c.Execute("skip-page-display"); err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, fmt.Errorf("disable paging: %w", err)
 	}
 
@@ -209,7 +209,7 @@ func (c *Client) Close() error {
 	defer c.mu.Unlock()
 
 	if c.inConfigMode {
-		c.execute("end")
+		_, _ = c.execute("end")
 		c.inConfigMode = false
 	}
 
