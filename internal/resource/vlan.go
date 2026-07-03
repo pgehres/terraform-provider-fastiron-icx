@@ -3,6 +3,7 @@ package resource
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -121,6 +122,27 @@ func (r *VLANResource) Create(ctx context.Context, req resource.CreateRequest, r
 	commands := r.buildCreateCommands(ctx, &plan, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+
+	// Reconcile "tag all VLANs" trunk ports. Interfaces configured with
+	// tag_all_vlans = true have that option expanded to an explicit tagged-VLAN
+	// list only when the icx_interface_ethernet resource itself is applied.
+	// Adding a new VLAN produces no diff on those interface resources, so
+	// Terraform never re-applies them and the new VLAN would silently be missing
+	// from every trunk. Detect those ports from the running config and tag the
+	// new VLAN onto them here. See findTrunkAllPorts for the detection rule.
+	config, err := r.getRunningConfig()
+	if err != nil {
+		resp.Diagnostics.AddError("Failed to read running config", err.Error())
+		return
+	}
+	newVLANID := plan.VlanID.ValueInt64()
+	for _, port := range findTrunkAllPorts(config, int(newVLANID)) {
+		commands = append(commands,
+			fmt.Sprintf("vlan %d", newVLANID),
+			fmt.Sprintf("tagged ethe %s", port),
+			"exit",
+		)
 	}
 
 	if err := r.client.ExecuteInConfigMode(commands); err != nil {
@@ -399,4 +421,82 @@ func (r *VLANResource) mapVLANToState(ctx context.Context, vlan *parser.VLAN, st
 	}
 
 	// raw_config is not read from the switch — preserve state.
+}
+
+// trunkAllMinVLANs is the minimum number of existing non-default VLANs a port
+// must be a tagged member of before it is inferred to be a "tag all VLANs"
+// trunk. It guards against misclassifying an access or lightly-tagged port as a
+// trunk when only a handful of VLANs exist.
+const trunkAllMinVLANs = 3
+
+// findTrunkAllPorts returns the ports that behave as "tag all VLANs" trunks:
+// ports that are tagged members of every existing non-default VLAN, allowing a
+// single exception for the port's own untagged VLAN.
+//
+// The FastIron CLI has no native "tag all present and future VLANs" primitive;
+// the provider's tag_all_vlans option is expanded into an explicit per-VLAN
+// tagged list at the time the icx_interface_ethernet resource is applied. When
+// a VLAN is added later, those interface resources show no Terraform diff and
+// are never re-applied, so the new VLAN ends up missing from every trunk. This
+// helper lets icx_vlan.Create reconcile that by re-deriving the trunk ports
+// from the running config so the new VLAN can be tagged onto them.
+//
+// newVLANID is excluded from consideration (it does not exist yet). A port must
+// be tagged on at least trunkAllMinVLANs VLANs to qualify, which avoids false
+// positives on small or lightly-configured switches.
+func findTrunkAllPorts(config *parser.RunningConfig, newVLANID int) []string {
+	type vlanInfo struct {
+		tagged   map[string]bool
+		untagged map[string]bool
+	}
+
+	var existing []vlanInfo
+	ports := map[string]bool{}
+	for _, v := range config.VLANs {
+		if v.ID == 1 || v.ID == newVLANID {
+			continue
+		}
+		tagged := make(map[string]bool, len(v.TaggedPorts))
+		for _, p := range v.TaggedPorts {
+			tagged[p] = true
+			ports[p] = true
+		}
+		untagged := make(map[string]bool, len(v.UntaggedPorts))
+		for _, p := range v.UntaggedPorts {
+			untagged[p] = true
+		}
+		existing = append(existing, vlanInfo{tagged: tagged, untagged: untagged})
+	}
+
+	if len(existing) < trunkAllMinVLANs {
+		return nil
+	}
+
+	var trunkPorts []string
+	for port := range ports {
+		taggedCount := 0
+		qualifies := true
+		for _, v := range existing {
+			switch {
+			case v.tagged[port]:
+				taggedCount++
+			case v.untagged[port]:
+				// This VLAN is the port's untagged VLAN — the one allowed
+				// exception for a trunk-all port.
+			default:
+				// Port is neither tagged nor untagged on this VLAN, so it is not
+				// a full trunk.
+				qualifies = false
+			}
+			if !qualifies {
+				break
+			}
+		}
+		if qualifies && taggedCount >= trunkAllMinVLANs {
+			trunkPorts = append(trunkPorts, port)
+		}
+	}
+
+	sort.Strings(trunkPorts)
+	return trunkPorts
 }
