@@ -7,9 +7,9 @@ terraform {
 }
 
 provider "icx" {
-  host            = "10.0.1.1"
-  username        = var.switch_username
-  password        = var.switch_password
+  host     = "10.0.1.1"
+  username = var.switch_username
+  password = var.switch_password
   # enable_password = var.enable_password  # uncomment if needed
 
   # Obtain with: ssh-keyscan 10.0.1.1
