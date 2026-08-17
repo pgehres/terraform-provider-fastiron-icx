@@ -21,6 +21,11 @@ archives:
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
+  # The registry manifest must be checksummed (and thereby covered by the
+  # GPG signature) as well as uploaded — see release.extra_files below.
+  extra_files:
+    - glob: terraform-registry-manifest.json
+      name_template: "{{ .ProjectName }}_{{ .Version }}_manifest.json"
   name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"
   algorithm: sha256
 
@@ -37,6 +42,12 @@ signs:
 
 release:
   draft: false
+  # Upload the registry manifest as a release asset. Without the
+  # <name>_<version>_manifest.json asset the Terraform Registry assumes
+  # plugin protocol 5.0; this provider speaks protocol 6 only.
+  extra_files:
+    - glob: terraform-registry-manifest.json
+      name_template: "{{ .ProjectName }}_{{ .Version }}_manifest.json"
 
 changelog:
   sort: asc
