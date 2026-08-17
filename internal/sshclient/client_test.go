@@ -83,9 +83,20 @@ func TestBuildHostKeyCallbackUnparseable(t *testing.T) {
 	}
 }
 
+func TestBuildHostKeyCallbackRejectsMarkers(t *testing.T) {
+	_, line := generateTestKey(t)
+	for _, marker := range []string{"@cert-authority", "@revoked"} {
+		hostKey := marker + " 10.0.0.1 " + line
+		if _, err := buildHostKeyCallback(Options{HostKey: hostKey}); err == nil ||
+			!strings.Contains(err.Error(), marker) {
+			t.Errorf("%s line: expected marker rejection, got %v", marker, err)
+		}
+	}
+}
+
 func TestExecuteRejectsControlCharacters(t *testing.T) {
 	c := &Client{}
-	for _, cmd := range []string{"vlan 10\nexit", "vlan 10\rexit", "vlan\t10"} {
+	for _, cmd := range []string{"vlan 10\nexit", "vlan 10\rexit", "vlan\t10", "vlan 10\x7f"} {
 		if _, err := c.execute(cmd); err == nil || !strings.Contains(err.Error(), "control characters") {
 			t.Errorf("command %q: expected control-character rejection, got %v", cmd, err)
 		}

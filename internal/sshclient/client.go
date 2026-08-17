@@ -120,6 +120,15 @@ func NewClient(opts Options) (*Client, error) {
 		for {
 			_, err := stdout.Read(buf)
 			if err != nil {
+				// Surface non-EOF transport errors (e.g. connection reset) to the
+				// reader instead of collapsing them into a generic EOF. The send is
+				// non-blocking so the goroutine cannot leak if nothing is draining.
+				if err != io.EOF {
+					select {
+					case c.byteCh <- byteResult{err: err}:
+					default:
+					}
+				}
 				return
 			}
 			c.byteCh <- byteResult{b: buf[0]}
@@ -198,10 +207,21 @@ func buildHostKeyCallback(opts Options) (ssh.HostKeyCallback, error) {
 	}
 
 	// Authorized_keys / known_hosts line format.
+	// known_hosts marker lines (@cert-authority, @revoked) are not a host key
+	// pin — a CA key is not the switch's own key, and a revoked key must never
+	// be accepted — so reject them outright rather than mis-parsing.
+	fields := strings.Fields(line)
+	if len(fields) > 0 && strings.HasPrefix(fields[0], "@") {
+		return nil, fmt.Errorf(
+			"host_key begins with known_hosts marker %q: @cert-authority and @revoked entries cannot be used as a pinned host key; "+
+				"provide the switch's own public key (ssh-keyscan %s)",
+			fields[0], opts.Host,
+		)
+	}
 	// known_hosts lines begin with a hostname field before the key type.
 	// SSH key types always start with "ssh-", "ecdsa-", or "sk-"; if the first
 	// token is not a key type, strip the leading hostname field.
-	if fields := strings.Fields(line); len(fields) >= 2 && !isSSHKeyType(fields[0]) {
+	if len(fields) >= 2 && !isSSHKeyType(fields[0]) {
 		line = strings.Join(fields[1:], " ")
 	}
 
@@ -359,10 +379,11 @@ func (c *Client) Close() error {
 
 // execute sends a command and reads output until the prompt. Must be called with mu held.
 func (c *Client) execute(command string) (string, error) {
-	// Reject commands containing control characters — defense-in-depth against
-	// CLI injection via embedded newlines, carriage returns, or other controls.
+	// Reject commands containing control characters (including DEL) —
+	// defense-in-depth against CLI injection via embedded newlines, carriage
+	// returns, or other controls.
 	for _, b := range []byte(command) {
-		if b < 0x20 {
+		if b < 0x20 || b == 0x7f {
 			return "", fmt.Errorf("command contains control characters and was not sent")
 		}
 	}
