@@ -20,12 +20,17 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # The Terraform Registry requires GPG-signed releases; fail fast if the key is missing.
+      # The Terraform Registry requires GPG-signed releases; fail fast if the key
+      # is missing. The secrets context is not available in step-level `if`
+      # expressions, so the check runs in the shell via env.
       - name: Check GPG key secret
-        if: ${{ secrets.GPG_PRIVATE_KEY == '' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
-          echo "::error::GPG_PRIVATE_KEY secret is not set — the Terraform Registry requires signed releases."
-          exit 1
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "::error::GPG_PRIVATE_KEY secret is not set — the Terraform Registry requires signed releases."
+            exit 1
+          fi
 
       - name: Import GPG key
         uses: crazy-max/ghaction-import-gpg@v6
