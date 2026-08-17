@@ -9,7 +9,7 @@ PLUGIN_DIR = ~/.terraform.d/plugins/registry.terraform.io/pgehres/fastiron-icx
 default: build
 
 build:
-	go build -o terraform-provider-fastiron-icx
+	go build -ldflags "-X main.version=$(VERSION)" -o terraform-provider-fastiron-icx
 
 install: build
 	mkdir -p $(PLUGIN_DIR)/$(VERSION)/$$(go env GOOS)_$$(go env GOARCH)
