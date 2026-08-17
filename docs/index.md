@@ -124,7 +124,7 @@ SSH password. Can also be set with the `FASTIRON_PASSWORD` environment variable.
 
 #### `enable_password` (Optional, Sensitive)
 
-Enable mode password. The provider always attempts to enter enable mode after connecting. If the switch has no enable password configured, the provider handles the "No password has been assigned yet" response gracefully — set this attribute anyway (to any value) to satisfy the configuration model, or leave it unset if the switch has no enable authentication. Can also be set with the `FASTIRON_ENABLE_PASSWORD` environment variable.
+Enable mode password. The provider enters enable mode only when the switch lands in user mode (a `>` prompt) after login; sessions that start in privileged EXEC (`#`) skip it entirely. If the switch has no enable password configured, the provider handles the "No password has been assigned yet" response gracefully — set this attribute anyway (to any value) to satisfy the configuration model, or leave it unset if the switch has no enable authentication. Can also be set with the `FASTIRON_ENABLE_PASSWORD` environment variable.
 
 #### `timeout` (Optional)
 
