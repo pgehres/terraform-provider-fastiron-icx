@@ -7,6 +7,27 @@ on:
     branches: [main]
 
 jobs:
+  # Validate the release configuration on every PR so template or schema
+  # errors surface here instead of on tag day.
+  goreleaser-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: check
+
+  # Lint the workflow files themselves (expression syntax, context
+  # availability, action inputs).
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: raven-actions/actionlint@v2
+
   test:
     runs-on: ubuntu-latest
     steps:
