@@ -166,10 +166,22 @@ func (r *InterfaceVEResource) Update(ctx context.Context, req resource.UpdateReq
 	if !plan.IPAddress.Equal(state.IPAddress) {
 		// Remove old IP first if changing.
 		if !state.IPAddress.IsNull() {
-			oldMask, _ := cidrToAddressMask(state.IPAddress.ValueString())
-			if oldMask != "" {
-				commands = append(commands, fmt.Sprintf("no ip address %s", oldMask))
+			oldMask, err := cidrToAddressMask(state.IPAddress.ValueString())
+			if err != nil {
+				// State holds an address that cannot be parsed — proceeding would
+				// silently skip the "no ip address" removal and leave the VE with
+				// two addresses. Surface this as an error instead.
+				resp.Diagnostics.AddError(
+					"Unparseable IP address in state",
+					fmt.Sprintf(
+						"The stored ip_address %q cannot be converted to address/mask format: %s. "+
+							"Fix this manually on the switch or re-import the resource.",
+						state.IPAddress.ValueString(), err,
+					),
+				)
+				return
 			}
+			commands = append(commands, fmt.Sprintf("no ip address %s", oldMask))
 		}
 		if !plan.IPAddress.IsNull() {
 			newMask, err := cidrToAddressMask(plan.IPAddress.ValueString())

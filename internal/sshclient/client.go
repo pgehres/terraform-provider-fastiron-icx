@@ -1,9 +1,11 @@
 package sshclient
 
 import (
-	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"regexp"
 	"strings"
 	"sync"
@@ -14,13 +16,23 @@ import (
 
 var _ CommandExecutor = &Client{}
 
+// byteResult carries a single byte pumped from the SSH stdout pipe, or an error.
+type byteResult struct {
+	b   byte
+	err error
+}
+
+// errDeadlineExceeded is returned by readByteWithDeadline when the deadline
+// passes before a byte arrives from the switch.
+var errDeadlineExceeded = errors.New("deadline exceeded")
+
 // Client manages an interactive SSH shell session to an ICX switch.
 type Client struct {
 	mu           sync.Mutex
 	sshClient    *ssh.Client
 	session      *ssh.Session
 	stdin        io.WriteCloser
-	reader       *bufio.Reader
+	byteCh       chan byteResult // pumped by the background reader goroutine
 	promptRegex  *regexp.Regexp
 	promptString string // The exact detected prompt (e.g., "ICX7250-24 Router#")
 	inConfigMode bool
@@ -37,12 +49,17 @@ func NewClient(opts Options) (*Client, error) {
 		opts.TimeoutSeconds = 30
 	}
 
+	hostKeyCallback, err := buildHostKeyCallback(opts)
+	if err != nil {
+		return nil, fmt.Errorf("host key config: %w", err)
+	}
+
 	config := &ssh.ClientConfig{
 		User: opts.Username,
 		Auth: []ssh.AuthMethod{
 			ssh.Password(opts.Password),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         time.Duration(opts.TimeoutSeconds) * time.Second,
 	}
 
@@ -91,9 +108,32 @@ func NewClient(opts Options) (*Client, error) {
 		sshClient: sshClient,
 		session:   session,
 		stdin:     stdin,
-		reader:    bufio.NewReader(stdout),
+		byteCh:    make(chan byteResult, 256),
 		options:   opts,
 	}
+
+	// Background goroutine: pump bytes from stdout into byteCh.
+	// Closes byteCh when the pipe errors or reaches EOF (including on session close).
+	go func() {
+		buf := make([]byte, 1)
+		defer close(c.byteCh)
+		for {
+			_, err := stdout.Read(buf)
+			if err != nil {
+				// Surface non-EOF transport errors (e.g. connection reset) to the
+				// reader instead of collapsing them into a generic EOF. The send is
+				// non-blocking so the goroutine cannot leak if nothing is draining.
+				if err != io.EOF {
+					select {
+					case c.byteCh <- byteResult{err: err}:
+					default:
+					}
+				}
+				return
+			}
+			c.byteCh <- byteResult{b: buf[0]}
+		}
+	}()
 
 	// Wait for the initial prompt.
 	initialOutput, err := c.readUntilPromptInitial()
@@ -120,13 +160,116 @@ func NewClient(opts Options) (*Client, error) {
 		return nil, fmt.Errorf("detect prompt: %w", err)
 	}
 
-	// Disable paging.
-	if _, err := c.Execute("skip-page-display"); err != nil {
+	// Disable paging and verify the command succeeded.
+	output, err := c.Execute("skip-page-display")
+	if err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("disable paging: %w", err)
 	}
+	if errMsg := detectCLIError(output); errMsg != "" {
+		_ = c.Close()
+		return nil, fmt.Errorf("disable paging: %s", errMsg)
+	}
 
 	return c, nil
+}
+
+// buildHostKeyCallback constructs the ssh.HostKeyCallback from Options.
+// Returns an error if neither HostKey nor InsecureSkipHostKeyVerify is set.
+func buildHostKeyCallback(opts Options) (ssh.HostKeyCallback, error) {
+	if opts.InsecureSkipHostKeyVerify {
+		return ssh.InsecureIgnoreHostKey(), nil //nolint:gosec // caller-requested
+	}
+
+	if opts.HostKey == "" {
+		return nil, fmt.Errorf(
+			"host key verification required: set host_key to the switch's SSH public key or SHA256 fingerprint "+
+				"(obtain with: ssh-keyscan %s), or set insecure_skip_host_key_verify = true for trusted lab networks only",
+			opts.Host,
+		)
+	}
+
+	line := strings.TrimSpace(opts.HostKey)
+
+	// SHA256 fingerprint format: "SHA256:base64..."
+	if strings.HasPrefix(line, "SHA256:") {
+		expected := line
+		return func(hostname string, _ net.Addr, key ssh.PublicKey) error {
+			presented := ssh.FingerprintSHA256(key)
+			if presented != expected {
+				return fmt.Errorf(
+					"SSH host key fingerprint mismatch for %s: presented %s, expected %s",
+					hostname, presented, expected,
+				)
+			}
+			return nil
+		}, nil
+	}
+
+	// Authorized_keys / known_hosts line format.
+	// known_hosts marker lines (@cert-authority, @revoked) are not a host key
+	// pin — a CA key is not the switch's own key, and a revoked key must never
+	// be accepted — so reject them outright rather than mis-parsing.
+	fields := strings.Fields(line)
+	if len(fields) > 0 && strings.HasPrefix(fields[0], "@") {
+		return nil, fmt.Errorf(
+			"host_key begins with known_hosts marker %q: @cert-authority and @revoked entries cannot be used as a pinned host key; "+
+				"provide the switch's own public key (ssh-keyscan %s)",
+			fields[0], opts.Host,
+		)
+	}
+	// known_hosts lines begin with a hostname field before the key type.
+	// SSH key types always start with "ssh-", "ecdsa-", or "sk-"; if the first
+	// token is not a key type, strip the leading hostname field.
+	if len(fields) >= 2 && !isSSHKeyType(fields[0]) {
+		line = strings.Join(fields[1:], " ")
+	}
+
+	parsedKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+	if err != nil {
+		return nil, fmt.Errorf("parse host_key %q: %w", opts.HostKey, err)
+	}
+	expectedMarshal := parsedKey.Marshal()
+
+	return func(hostname string, _ net.Addr, key ssh.PublicKey) error {
+		if !bytes.Equal(key.Marshal(), expectedMarshal) {
+			return fmt.Errorf(
+				"SSH host key mismatch for %s: presented key fingerprint is %s; "+
+					"update host_key or run ssh-keyscan %s to get the current key",
+				hostname, ssh.FingerprintSHA256(key), opts.Host,
+			)
+		}
+		return nil
+	}, nil
+}
+
+// isSSHKeyType returns true if s is a recognized SSH public key type prefix.
+func isSSHKeyType(s string) bool {
+	return strings.HasPrefix(s, "ssh-") ||
+		strings.HasPrefix(s, "ecdsa-") ||
+		strings.HasPrefix(s, "sk-")
+}
+
+// readByteWithDeadline reads the next byte from the background reader goroutine.
+// It blocks until a byte arrives or the deadline is reached.  One timer is
+// allocated per call (far cheaper than time.After, which cannot be GC'd early).
+func (c *Client) readByteWithDeadline(deadline time.Time) (byte, error) {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0, errDeadlineExceeded
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case res, ok := <-c.byteCh:
+		if !ok {
+			// Channel closed — the SSH pipe reached EOF or the session was closed.
+			return 0, io.EOF
+		}
+		return res.b, res.err
+	case <-timer.C:
+		return 0, errDeadlineExceeded
+	}
 }
 
 // Execute sends a command and returns the output (excluding the prompt).
@@ -204,6 +347,7 @@ func (c *Client) GetRunningConfig() (string, error) {
 }
 
 // Close exits config mode, closes the SSH session and connection.
+// Closing the session causes the reader goroutine to exit, so Close never deadlocks.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -235,6 +379,15 @@ func (c *Client) Close() error {
 
 // execute sends a command and reads output until the prompt. Must be called with mu held.
 func (c *Client) execute(command string) (string, error) {
+	// Reject commands containing control characters (including DEL) —
+	// defense-in-depth against CLI injection via embedded newlines, carriage
+	// returns, or other controls.
+	for _, b := range []byte(command) {
+		if b < 0x20 || b == 0x7f {
+			return "", fmt.Errorf("command contains control characters and was not sent")
+		}
+	}
+
 	// Send the command.
 	if _, err := fmt.Fprintf(c.stdin, "%s\n", command); err != nil {
 		return "", fmt.Errorf("write command: %w", err)
@@ -262,15 +415,13 @@ func (c *Client) readUntilPrompt() (string, error) {
 	deadline := time.Now().Add(time.Duration(c.options.TimeoutSeconds) * time.Second)
 
 	for {
-		if time.Now().After(deadline) {
-			return strings.Join(outputLines, "\n") + currentLine.String(),
-				fmt.Errorf("timeout waiting for prompt")
-		}
-
-		b, err := c.reader.ReadByte()
+		b, err := c.readByteWithDeadline(deadline)
 		if err != nil {
-			return strings.Join(outputLines, "\n") + currentLine.String(),
-				fmt.Errorf("read: %w", err)
+			buf := strings.Join(outputLines, "\n") + currentLine.String()
+			if errors.Is(err, errDeadlineExceeded) {
+				return buf, fmt.Errorf("timeout waiting for prompt")
+			}
+			return buf, fmt.Errorf("read: %w", err)
 		}
 
 		if b == '\n' {
@@ -301,13 +452,13 @@ func (c *Client) readUntilPromptInitial() (string, error) {
 	initialPrompt := regexp.MustCompile(`[\w@\-]+(?:\s+\w+)?\s*[#>]\s*$`)
 
 	for {
-		if time.Now().After(deadline) {
-			return buf.String(), fmt.Errorf("timeout waiting for initial prompt (buffer: %q)", buf.String())
-		}
-
-		b, err := c.reader.ReadByte()
+		b, err := c.readByteWithDeadline(deadline)
 		if err != nil {
-			return buf.String(), fmt.Errorf("read: %w", err)
+			bufStr := buf.String()
+			if errors.Is(err, errDeadlineExceeded) {
+				return bufStr, fmt.Errorf("timeout waiting for initial prompt (buffer: %q)", bufStr)
+			}
+			return bufStr, fmt.Errorf("read: %w", err)
 		}
 
 		buf.WriteByte(b)
@@ -325,21 +476,23 @@ func (c *Client) enterEnableMode() error {
 	}
 
 	// Read until we see a password prompt or the privileged prompt.
-	// The switch may go straight to # if no enable password is configured ("No password has been assigned yet...").
+	// The switch may go straight to # if no enable password is configured
+	// ("No password has been assigned yet...").
 	var buf strings.Builder
 	deadline := time.Now().Add(time.Duration(c.options.TimeoutSeconds) * time.Second)
-	// Password prompt is literally "Password:" at the end of a line — not "password" appearing in a sentence.
+	// Password prompt is literally "Password:" at the end of a line — not
+	// "password" appearing in a sentence.
 	passwordPrompt := regexp.MustCompile(`(?i)^Password:\s*$`)
 	privPrompt := regexp.MustCompile(`[\w@\-]+(?:\s+\w+)?#\s*$`)
 	passwordSent := false
 
 	for {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for enable prompt (buffer: %q)", buf.String())
-		}
-
-		b, err := c.reader.ReadByte()
+		b, err := c.readByteWithDeadline(deadline)
 		if err != nil {
+			bufStr := buf.String()
+			if errors.Is(err, errDeadlineExceeded) {
+				return fmt.Errorf("timeout waiting for enable prompt (buffer: %q)", bufStr)
+			}
 			return fmt.Errorf("read: %w", err)
 		}
 
@@ -381,12 +534,12 @@ func (c *Client) detectPrompt() error {
 	anyPrompt := regexp.MustCompile(`([\w@\-]+(?:\s+\w+)?)\s*(?:\([^\)]*\))?[#>]\s*$`)
 
 	for {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout detecting prompt (buffer: %q)", buf.String())
-		}
-
-		b, err := c.reader.ReadByte()
+		b, err := c.readByteWithDeadline(deadline)
 		if err != nil {
+			bufStr := buf.String()
+			if errors.Is(err, errDeadlineExceeded) {
+				return fmt.Errorf("timeout detecting prompt (buffer: %q)", bufStr)
+			}
 			return fmt.Errorf("read: %w", err)
 		}
 

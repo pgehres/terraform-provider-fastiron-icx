@@ -38,8 +38,9 @@ func (d *RunningConfigDataSource) Schema(_ context.Context, _ datasource.SchemaR
 				Computed: true,
 			},
 			"config": schema.StringAttribute{
-				Description: "The full running configuration text.",
+				Description: "The full running configuration text. Marked sensitive because it contains password hashes and SNMP community strings.",
 				Computed:    true,
+				Sensitive:   true,
 			},
 		},
 	}

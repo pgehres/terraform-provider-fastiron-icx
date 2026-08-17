@@ -3,13 +3,16 @@ package resource
 import (
 	"context"
 	"fmt"
+	"regexp"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
@@ -20,6 +23,12 @@ var (
 	_ resource.Resource                = &AAAResource{}
 	_ resource.ResourceWithImportState = &AAAResource{}
 )
+
+// reAAAMethodList matches valid AAA method-list strings: letters, digits,
+// hyphens, and spaces only. Values like "default local" and "radius local"
+// are typical. Control characters and newlines are rejected to prevent
+// command injection.
+var reAAAMethodList = regexp.MustCompile(`^[a-zA-Z0-9 \-]+$`)
 
 type AAAResource struct {
 	client sshclient.CommandExecutor
@@ -41,6 +50,14 @@ func (r *AAAResource) Metadata(_ context.Context, req resource.MetadataRequest, 
 }
 
 func (r *AAAResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+	// aaaMethodValidator rejects control chars and newlines; only letters,
+	// digits, spaces, and hyphens are accepted (covers "default local",
+	// "radius local", "tacacs local", etc.).
+	aaaMethodValidator := stringvalidator.RegexMatches(
+		reAAAMethodList,
+		`AAA method must contain only letters, digits, spaces, and hyphens (e.g., "default local")`,
+	)
+
 	resp.Schema = schema.Schema{
 		Description: "Manages AAA authentication settings on an ICX switch. This is a singleton resource.",
 		Attributes: map[string]schema.Attribute{
@@ -51,12 +68,14 @@ func (r *AAAResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				},
 			},
 			"web_server_auth": schema.StringAttribute{
-				Description: "AAA authentication method for web server (e.g., \"default local\").",
+				Description: `AAA authentication method for web server (e.g., "default local").`,
 				Optional:    true,
+				Validators:  []validator.String{aaaMethodValidator},
 			},
 			"login_auth": schema.StringAttribute{
-				Description: "AAA authentication method for login (e.g., \"default local\").",
+				Description: `AAA authentication method for login (e.g., "default local").`,
 				Optional:    true,
+				Validators:  []validator.String{aaaMethodValidator},
 			},
 			"enable_aaa_console": schema.BoolAttribute{
 				Description: "Enable AAA authentication for console access.",
@@ -190,6 +209,15 @@ func (r *AAAResource) Delete(ctx context.Context, req resource.DeleteRequest, re
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	// WARNING: removing AAA authentication login can lock out all SSH access on
+	// switches that have no local fallback configured. Verify that an out-of-band
+	// (console) recovery path is available before proceeding.
+	resp.Diagnostics.AddWarning(
+		"AAA delete may lock out SSH access",
+		"Removing AAA authentication settings can lock out all SSH (and console, if enable_aaa_console is set) "+
+			"access on switches with no local fallback. Ensure you have console or out-of-band access before applying.",
+	)
 
 	var commands []string
 	if !state.WebServerAuth.IsNull() {

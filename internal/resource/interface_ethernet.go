@@ -3,8 +3,13 @@ package resource
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -12,6 +17,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
@@ -23,20 +29,28 @@ var (
 	_ resource.ResourceWithImportState = &InterfaceEthernetResource{}
 )
 
+// rePort matches FastIron port identifiers in unit/slot/port format (e.g., "1/1/15").
+var rePort = regexp.MustCompile(`^\d+/\d+/\d+$`)
+
+// rePortName matches valid FastIron port names: no control characters or double
+// quotes. Spaces are allowed — quotePortName wraps them in double quotes for
+// the CLI command.
+var rePortName = regexp.MustCompile(`^[^"\x00-\x1f]+$`)
+
 type InterfaceEthernetResource struct {
 	client sshclient.CommandExecutor
 }
 
 type InterfaceEthernetResourceModel struct {
-	ID                  types.String `tfsdk:"id"`
-	Port                types.String `tfsdk:"port"`
-	PortName            types.String `tfsdk:"port_name"`
+	ID                   types.String `tfsdk:"id"`
+	Port                 types.String `tfsdk:"port"`
+	PortName             types.String `tfsdk:"port_name"`
 	SpanningTreePt2PtMac types.Bool   `tfsdk:"spanning_tree_pt2pt_mac"`
-	OpticalMonitor      types.Bool   `tfsdk:"optical_monitor"`
-	UntaggedVLAN        types.Int64  `tfsdk:"untagged_vlan"`
-	TaggedVLANs         types.Set    `tfsdk:"tagged_vlans"`
-	TagAllVLANs         types.Bool   `tfsdk:"tag_all_vlans"`
-	RawConfig           types.List   `tfsdk:"raw_config"`
+	OpticalMonitor       types.Bool   `tfsdk:"optical_monitor"`
+	UntaggedVLAN         types.Int64  `tfsdk:"untagged_vlan"`
+	TaggedVLANs          types.Set    `tfsdk:"tagged_vlans"`
+	TagAllVLANs          types.Bool   `tfsdk:"tag_all_vlans"`
+	RawConfig            types.List   `tfsdk:"raw_config"`
 }
 
 func NewInterfaceEthernetResource() resource.Resource {
@@ -61,10 +75,27 @@ func (r *InterfaceEthernetResource) Schema(_ context.Context, _ resource.SchemaR
 			"port": schema.StringAttribute{
 				Description: "Port identifier in unit/module/port format (e.g., \"1/1/15\").",
 				Required:    true,
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(
+						rePort,
+						`port must be in unit/slot/port format (e.g. "1/1/15")`,
+					),
+				},
 			},
 			"port_name": schema.StringAttribute{
-				Description: "Descriptive name for the port. Names with spaces are automatically quoted.",
+				Description: "Descriptive name for the port. Names with spaces are automatically quoted. Double quotes and control characters are not allowed.",
 				Optional:    true,
+				Validators: []validator.String{
+					// Double quotes are rejected because quotePortName wraps the name in
+					// double quotes; an embedded quote would break the CLI command.
+					// Control characters (including newlines) are rejected to prevent
+					// command injection.
+					stringvalidator.RegexMatches(
+						rePortName,
+						`port_name must not contain double quotes or control characters (0x00–0x1f)`,
+					),
+					stringvalidator.LengthBetween(1, 64),
+				},
 			},
 			"spanning_tree_pt2pt_mac": schema.BoolAttribute{
 				Description: "Enable 802.1w admin-pt2pt-mac on this interface.",
@@ -81,11 +112,19 @@ func (r *InterfaceEthernetResource) Schema(_ context.Context, _ resource.SchemaR
 			"untagged_vlan": schema.Int64Attribute{
 				Description: "VLAN ID for untagged traffic on this port. The port will be set as untagged in this VLAN.",
 				Optional:    true,
+				Validators: []validator.Int64{
+					int64validator.Between(1, 4094),
+				},
 			},
 			"tagged_vlans": schema.SetAttribute{
 				Description: "Set of VLAN IDs for tagged traffic on this port.",
 				Optional:    true,
 				ElementType: types.Int64Type,
+				Validators: []validator.Set{
+					setvalidator.ValueInt64sAre(
+						int64validator.Between(1, 4094),
+					),
+				},
 			},
 			"tag_all_vlans": schema.BoolAttribute{
 				Description: "Tag all VLANs on the switch (excluding untagged_vlan) on this port. Useful for trunk ports. Mutually exclusive with tagged_vlans.",
@@ -97,6 +136,16 @@ func (r *InterfaceEthernetResource) Schema(_ context.Context, _ resource.SchemaR
 				Description: "Additional raw CLI commands to execute within the interface context. On destroy, each command is prefixed with 'no'.",
 				Optional:    true,
 				ElementType: types.StringType,
+				Validators: []validator.List{
+					// Carriage returns and newlines would allow injecting additional
+					// CLI commands through raw_config elements.
+					listvalidator.ValueStringsAre(
+						stringvalidator.RegexMatches(
+							reNoNewlines,
+							`raw_config elements must not contain carriage returns or newlines`,
+						),
+					),
+				},
 			},
 		},
 	}

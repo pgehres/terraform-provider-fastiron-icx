@@ -3,16 +3,21 @@ package resource
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
-	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
@@ -23,6 +28,16 @@ var (
 	_ resource.Resource                = &VLANResource{}
 	_ resource.ResourceWithImportState = &VLANResource{}
 )
+
+// reVLANName matches valid FastIron VLAN names: no spaces, double quotes, or
+// single quotes. Names are interpolated bare into the VLAN header command
+// (`vlan N name <name> by port`), so any whitespace or quoting character
+// would corrupt the command or the parser.
+var reVLANName = regexp.MustCompile(`^[^\s"']+$`)
+
+// reNoNewlines matches strings that contain no carriage returns or newlines.
+// Used to reject raw_config elements that would inject additional CLI commands.
+var reNoNewlines = regexp.MustCompile(`^[^\r\n]*$`)
 
 type VLANResource struct {
 	client sshclient.CommandExecutor
@@ -62,10 +77,23 @@ func (r *VLANResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 			"vlan_id": schema.Int64Attribute{
 				Description: "VLAN ID (1-4094).",
 				Required:    true,
+				Validators: []validator.Int64{
+					int64validator.Between(1, 4094),
+				},
 			},
 			"name": schema.StringAttribute{
-				Description: "VLAN name.",
+				Description: "VLAN name (1-31 chars). Must not contain spaces, double quotes, or single quotes; FastIron interpolates the name bare into the VLAN header command.",
 				Optional:    true,
+				Validators: []validator.String{
+					// Spaces are rejected because the name is interpolated bare into
+					// `vlan N name <name> by port`; quotes are rejected because they
+					// would break the CLI command or the running-config parser.
+					stringvalidator.RegexMatches(
+						reVLANName,
+						`VLAN name must not contain spaces, double quotes, or single quotes`,
+					),
+					stringvalidator.LengthBetween(1, 31),
+				},
 			},
 			"router_interface": schema.Int64Attribute{
 				Description: "VE interface number to associate with this VLAN (creates router-interface ve N).",
@@ -95,6 +123,16 @@ func (r *VLANResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 				Description: "Additional raw CLI commands to execute within the VLAN context. On destroy, each command is prefixed with 'no'.",
 				Optional:    true,
 				ElementType: types.StringType,
+				Validators: []validator.List{
+					// Carriage returns and newlines would allow injecting additional
+					// CLI commands through raw_config elements.
+					listvalidator.ValueStringsAre(
+						stringvalidator.RegexMatches(
+							reNoNewlines,
+							`raw_config elements must not contain carriage returns or newlines`,
+						),
+					),
+				},
 			},
 		},
 	}
@@ -310,6 +348,23 @@ func (r *VLANResource) buildCreateCommands(ctx context.Context, plan *VLANResour
 func (r *VLANResource) buildUpdateCommands(ctx context.Context, plan, state *VLANResourceModel, diags *diag.Diagnostics) []string {
 	vlanID := plan.VlanID.ValueInt64()
 	var commands []string
+
+	// FastIron 08.0.95 has no `no vlan-name` command: entering the VLAN context
+	// without a name argument does NOT remove an existing name — it silently
+	// leaves the old name in place (permanent invisible drift). If the operator
+	// has cleared the name attribute, surface a clear error so they know a
+	// destroy-and-recreate (or keeping the name) is required.
+	stateHasName := !state.Name.IsNull() && state.Name.ValueString() != ""
+	planHasName := !plan.Name.IsNull() && plan.Name.ValueString() != ""
+	if stateHasName && !planHasName {
+		diags.AddError(
+			"Cannot remove VLAN name in place",
+			fmt.Sprintf("FastIron does not support removing a VLAN name via CLI on firmware 08.0.95. "+
+				"VLAN %d currently has name %q. To remove the name, destroy and recreate the VLAN, "+
+				"or keep the name attribute set.", vlanID, state.Name.ValueString()),
+		)
+		return nil
+	}
 
 	// Enter VLAN context. If name changed, the header updates it.
 	header := fmt.Sprintf("vlan %d", vlanID)
