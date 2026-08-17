@@ -79,7 +79,8 @@ func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest
 			"host_key": schema.StringAttribute{
 				Description: "The switch's SSH host public key in known_hosts format " +
 					"(e.g. \"ssh-rsa AAAA...\"), or its SHA256 fingerprint " +
-					"(e.g. \"SHA256:...\"). Obtain with: ssh-keyscan <host>. " +
+					"(e.g. \"SHA256:...\"). Obtain with: ssh-keyscan <host> — or, on older FastIron whose SSH stack " +
+					"ssh-keyscan cannot negotiate with, the provider repo's debug tool (go run ./cmd/debug-ssh -print-host-key). " +
 					"Can also be set with the FASTIRON_HOST_KEY environment variable.",
 				Optional: true,
 			},
@@ -142,7 +143,8 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 			fmt.Sprintf(
 				"Set host_key to the switch's SSH public key or SHA256 fingerprint, "+
 					"or set insecure_skip_host_key_verify = true for trusted lab networks only. "+
-					"Obtain the host key with: ssh-keyscan %s",
+					"Obtain the host key with: ssh-keyscan %s (if that prints nothing — common on older "+
+					"FastIron SSH stacks — use the provider repo's debug tool: go run ./cmd/debug-ssh -print-host-key)",
 				host,
 			),
 		)
