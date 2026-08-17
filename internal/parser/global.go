@@ -27,8 +27,8 @@ type GlobalSettings struct {
 
 // AAAConfig holds AAA authentication settings.
 type AAAConfig struct {
-	WebServerAuth   string // e.g., "default local"
-	LoginAuth       string // e.g., "default local"
+	WebServerAuth    string // e.g., "default local"
+	LoginAuth        string // e.g., "default local"
 	EnableAAAConsole bool
 }
 

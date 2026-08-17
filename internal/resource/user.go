@@ -3,12 +3,17 @@ package resource
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
@@ -20,8 +25,18 @@ var (
 	_ resource.ResourceWithImportState = &UserResource{}
 )
 
+// reUsernameValid rejects whitespace, control chars, and quote characters.
+// FastIron interpolates the username bare into CLI commands, so these chars
+// would corrupt the command or the running-config parser.
+var reUsernameValid = regexp.MustCompile(`^[^\s"']+$`)
+
+// rePasswordNoNewlines rejects carriage returns and newlines. Spaces and
+// other printable characters are allowed in passwords.
+var rePasswordNoNewlines = regexp.MustCompile(`^[^\r\n]+$`)
+
 type UserResource struct {
-	client sshclient.CommandExecutor
+	client           sshclient.CommandExecutor
+	providerUsername string // the account the provider is authenticated as
 }
 
 type UserResourceModel struct {
@@ -49,8 +64,17 @@ func (r *UserResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 				},
 			},
 			"username": schema.StringAttribute{
-				Description: "The username for the local account.",
+				Description: "The username for the local account (1-48 chars, no whitespace or quote characters).",
 				Required:    true,
+				Validators: []validator.String{
+					// Whitespace and quotes would corrupt the bare CLI command
+					// `username <name> password <pass>` or the running-config parser.
+					stringvalidator.RegexMatches(
+						reUsernameValid,
+						"username must not contain whitespace or quote characters",
+					),
+					stringvalidator.LengthBetween(1, 48),
+				},
 			},
 			"password": schema.StringAttribute{
 				Description: "The password for the user. This value cannot be read back from the switch.",
@@ -58,6 +82,13 @@ func (r *UserResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 				Sensitive:   true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
+				},
+				Validators: []validator.String{
+					// Newlines would inject additional CLI commands into the session.
+					stringvalidator.RegexMatches(
+						rePasswordNoNewlines,
+						"password must not contain carriage returns or newlines",
+					),
 				},
 			},
 		},
@@ -74,6 +105,7 @@ func (r *UserResource) Configure(_ context.Context, req resource.ConfigureReques
 		return
 	}
 	r.client = data.Client
+	r.providerUsername = data.Username
 }
 
 func (r *UserResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -83,17 +115,18 @@ func (r *UserResource) Create(ctx context.Context, req resource.CreateRequest, r
 		return
 	}
 
+	password := plan.Password.ValueString()
 	commands := []string{
-		fmt.Sprintf("username %s password %s", plan.Username.ValueString(), plan.Password.ValueString()),
+		fmt.Sprintf("username %s password %s", plan.Username.ValueString(), password),
 	}
 
 	if err := r.client.ExecuteInConfigMode(commands); err != nil {
-		resp.Diagnostics.AddError("Failed to create user", err.Error())
+		resp.Diagnostics.AddError("Failed to create user", redactPassword(err.Error(), password))
 		return
 	}
 
 	if err := r.client.WriteMemory(); err != nil {
-		resp.Diagnostics.AddError("Failed to save configuration", err.Error())
+		resp.Diagnostics.AddError("Failed to save configuration", redactPassword(err.Error(), password))
 		return
 	}
 
@@ -140,6 +173,7 @@ func (r *UserResource) Update(ctx context.Context, req resource.UpdateRequest, r
 		return
 	}
 
+	password := plan.Password.ValueString()
 	var commands []string
 
 	// If username changed, remove old and create new.
@@ -148,16 +182,16 @@ func (r *UserResource) Update(ctx context.Context, req resource.UpdateRequest, r
 	}
 
 	commands = append(commands,
-		fmt.Sprintf("username %s password %s", plan.Username.ValueString(), plan.Password.ValueString()),
+		fmt.Sprintf("username %s password %s", plan.Username.ValueString(), password),
 	)
 
 	if err := r.client.ExecuteInConfigMode(commands); err != nil {
-		resp.Diagnostics.AddError("Failed to update user", err.Error())
+		resp.Diagnostics.AddError("Failed to update user", redactPassword(err.Error(), password))
 		return
 	}
 
 	if err := r.client.WriteMemory(); err != nil {
-		resp.Diagnostics.AddError("Failed to save configuration", err.Error())
+		resp.Diagnostics.AddError("Failed to save configuration", redactPassword(err.Error(), password))
 		return
 	}
 
@@ -169,6 +203,22 @@ func (r *UserResource) Delete(ctx context.Context, req resource.DeleteRequest, r
 	var state UserResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Refuse to delete the account the provider session is authenticated as.
+	// Doing so would remove the SSH credentials mid-apply, severing the
+	// connection before the session can complete.
+	if r.providerUsername != "" && state.Username.ValueString() == r.providerUsername {
+		resp.Diagnostics.AddError(
+			"Cannot delete the authenticated user",
+			fmt.Sprintf(
+				"Deleting user %q would remove the account the provider is currently authenticated as, "+
+					"severing the SSH session mid-apply. Remove this resource from your configuration "+
+					"or use a different provider account to manage it.",
+				state.Username.ValueString(),
+			),
+		)
 		return
 	}
 
@@ -198,4 +248,20 @@ func (r *UserResource) getRunningConfig() (*parser.RunningConfig, error) {
 		return nil, err
 	}
 	return parser.ParseRunningConfig(output)
+}
+
+// redactPassword replaces plaintext password occurrences in an error string.
+// The SSH client wraps failed commands as fmt.Errorf("command %q: %s", cmd, errMsg),
+// so the password embedded in the username command can appear in error output.
+func redactPassword(errMsg, password string) string {
+	if password == "" {
+		return errMsg
+	}
+	errMsg = strings.ReplaceAll(errMsg, password, "(redacted)")
+	// %q backslash-escapes quotes and non-printables, so also redact the
+	// escaped form when it differs from the raw password.
+	if escaped := strconv.Quote(password); escaped[1:len(escaped)-1] != password {
+		errMsg = strings.ReplaceAll(errMsg, escaped[1:len(escaped)-1], "(redacted)")
+	}
+	return errMsg
 }

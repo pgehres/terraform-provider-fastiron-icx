@@ -41,7 +41,11 @@ func (r *PoEResource) Metadata(_ context.Context, req resource.MetadataRequest, 
 
 func (r *PoEResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Manages Power over Ethernet (PoE) settings on an ICX switch port.",
+		Description: "Manages Power over Ethernet (PoE) settings on an ICX switch port. " +
+			"NOTE: PoE state is not readable from 'show running-config' — the parser does not " +
+			"capture 'inline power' lines from interface stanzas. As a result, out-of-band " +
+			"changes (e.g., manual 'no inline power' on the switch) are not detected and will " +
+			"not appear as plan diffs. Use 'terraform apply' to force the desired state.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed: true,
@@ -110,9 +114,12 @@ func (r *PoEResource) Read(ctx context.Context, req resource.ReadRequest, resp *
 		return
 	}
 
-	// PoE status is read via "show inline power" — parse its output.
-	// For now, preserve state since parsing show inline power is complex.
-	// TODO: parse "show inline power <port>" output for accurate reads.
+	// PoE settings do not appear in 'show running-config' output, so the parser
+	// has no PoE fields to read. 'show inline power <port>' would be needed for
+	// accurate reads, but its output format varies across ICX models and firmware
+	// versions and is not currently parsed. Out-of-band changes to PoE settings
+	// are therefore invisible to Terraform — drift will not surface as a plan diff.
+	// The schema Description documents this limitation for users.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 

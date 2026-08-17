@@ -17,14 +17,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	client, err := sshclient.NewClient(sshclient.Options{
+	// Use FASTIRON_ENABLE_PASSWORD if set; fall back to the login password.
+	enablePass := os.Getenv("FASTIRON_ENABLE_PASSWORD")
+	if enablePass == "" {
+		enablePass = pass
+	}
+
+	hostKey := os.Getenv("FASTIRON_HOST_KEY")
+
+	opts := sshclient.Options{
 		Host:           host,
 		Port:           22,
 		Username:       user,
 		Password:       pass,
-		EnablePassword: pass,
+		EnablePassword: enablePass,
 		TimeoutSeconds: 15,
-	})
+		HostKey:        hostKey,
+	}
+
+	if hostKey == "" {
+		fmt.Fprintln(os.Stderr, "WARNING: FASTIRON_HOST_KEY not set — skipping SSH host key verification (MITM risk)")
+		opts.InsecureSkipHostKeyVerify = true
+	}
+
+	client, err := sshclient.NewClient(opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "connect error: %v\n", err)
 		os.Exit(1)

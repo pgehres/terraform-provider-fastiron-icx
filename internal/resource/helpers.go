@@ -50,10 +50,37 @@ func stringSliceContains(slice []string, s string) bool {
 }
 
 // quotePortName returns the port name quoted if it contains spaces.
+//
+// Schema validation on port_name already rejects double-quote characters, so
+// under normal operation this function will never see an embedded quote.
+// As a defensive measure, any double-quote characters that slip through
+// (e.g. from unvalidated call sites) are stripped before the name is
+// interpolated into the CLI command.
 func quotePortName(name string) string {
 	if name == "" {
 		return name
 	}
+
+	// Strip embedded double quotes — they would break the quoted form of the
+	// command. The schema validator rejects them at plan time, so this path
+	// should never be reached in normal use.
+	hasQuote := false
+	for _, c := range name {
+		if c == '"' {
+			hasQuote = true
+			break
+		}
+	}
+	if hasQuote {
+		clean := make([]byte, 0, len(name))
+		for i := 0; i < len(name); i++ {
+			if name[i] != '"' {
+				clean = append(clean, name[i])
+			}
+		}
+		name = string(clean)
+	}
+
 	for _, c := range name {
 		if c == ' ' {
 			return "\"" + name + "\""

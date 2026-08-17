@@ -9,13 +9,13 @@ import (
 
 // VLAN represents a parsed VLAN configuration stanza.
 type VLAN struct {
-	ID              int
-	Name            string
-	TaggedPorts     []string
-	UntaggedPorts   []string
-	RouterInterface *int // VE interface number, nil if not set
-	SpanningTree    bool
-	STPPriority     *int
+	ID               int
+	Name             string
+	TaggedPorts      []string
+	UntaggedPorts    []string
+	RouterInterface  *int // VE interface number, nil if not set
+	SpanningTree     bool
+	STPPriority      *int
 	MulticastPassive bool
 	MulticastVersion *int
 }

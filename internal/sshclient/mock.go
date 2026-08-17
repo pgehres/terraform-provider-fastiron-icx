@@ -11,12 +11,12 @@ var _ CommandExecutor = &MockClient{}
 // MockClient implements CommandExecutor for unit testing.
 // It records commands sent and returns pre-configured responses.
 type MockClient struct {
-	mu              sync.Mutex
-	Commands        []string
-	Responses       map[string]string
-	RunningConfig   string
+	mu               sync.Mutex
+	Commands         []string
+	Responses        map[string]string
+	RunningConfig    string
 	WriteMemoryCalls int
-	ErrorOnCommand  map[string]error
+	ErrorOnCommand   map[string]error
 }
 
 // NewMockClient creates a MockClient with the given running config.

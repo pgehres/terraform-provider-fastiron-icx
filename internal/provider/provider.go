@@ -23,12 +23,14 @@ type FastIronICXProvider struct {
 }
 
 type FastIronICXProviderModel struct {
-	Host           types.String `tfsdk:"host"`
-	Port           types.Int64  `tfsdk:"port"`
-	Username       types.String `tfsdk:"username"`
-	Password       types.String `tfsdk:"password"`
-	EnablePassword types.String `tfsdk:"enable_password"`
-	Timeout        types.Int64  `tfsdk:"timeout"`
+	Host                      types.String `tfsdk:"host"`
+	Port                      types.Int64  `tfsdk:"port"`
+	Username                  types.String `tfsdk:"username"`
+	Password                  types.String `tfsdk:"password"`
+	EnablePassword            types.String `tfsdk:"enable_password"`
+	Timeout                   types.Int64  `tfsdk:"timeout"`
+	HostKey                   types.String `tfsdk:"host_key"`
+	InsecureSkipHostKeyVerify types.Bool   `tfsdk:"insecure_skip_host_key_verify"`
 }
 
 func New(version string) func() provider.Provider {
@@ -74,6 +76,19 @@ func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest
 				Description: "SSH connection timeout in seconds. Defaults to 30.",
 				Optional:    true,
 			},
+			"host_key": schema.StringAttribute{
+				Description: "The switch's SSH host public key in known_hosts format " +
+					"(e.g. \"ssh-rsa AAAA...\"), or its SHA256 fingerprint " +
+					"(e.g. \"SHA256:...\"). Obtain with: ssh-keyscan <host>. " +
+					"Can also be set with the FASTIRON_HOST_KEY environment variable.",
+				Optional: true,
+			},
+			"insecure_skip_host_key_verify": schema.BoolAttribute{
+				Description: "If true, skip SSH host key verification. " +
+					"WARNING: this permits man-in-the-middle interception and " +
+					"should only be used on isolated lab networks where MITM is not a concern.",
+				Optional: true,
+			},
 		},
 	}
 }
@@ -89,6 +104,10 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 	username := stringValueOrEnv(config.Username, "FASTIRON_USERNAME")
 	password := stringValueOrEnv(config.Password, "FASTIRON_PASSWORD")
 	enablePassword := stringValueOrEnv(config.EnablePassword, "FASTIRON_ENABLE_PASSWORD")
+	hostKey := stringValueOrEnv(config.HostKey, "FASTIRON_HOST_KEY")
+	insecureSkip := !config.InsecureSkipHostKeyVerify.IsNull() &&
+		!config.InsecureSkipHostKeyVerify.IsUnknown() &&
+		config.InsecureSkipHostKeyVerify.ValueBool()
 
 	port := 22
 	if !config.Port.IsNull() && !config.Port.IsUnknown() {
@@ -117,14 +136,28 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 		resp.Diagnostics.AddError("Missing password", "The password must be set in the provider configuration or the FASTIRON_PASSWORD environment variable.")
 		return
 	}
+	if hostKey == "" && !insecureSkip {
+		resp.Diagnostics.AddError(
+			"Missing SSH host key",
+			fmt.Sprintf(
+				"Set host_key to the switch's SSH public key or SHA256 fingerprint, "+
+					"or set insecure_skip_host_key_verify = true for trusted lab networks only. "+
+					"Obtain the host key with: ssh-keyscan %s",
+				host,
+			),
+		)
+		return
+	}
 
 	client, err := sshclient.NewClient(sshclient.Options{
-		Host:           host,
-		Port:           port,
-		Username:       username,
-		Password:       password,
-		EnablePassword: enablePassword,
-		TimeoutSeconds: timeout,
+		Host:                      host,
+		Port:                      port,
+		Username:                  username,
+		Password:                  password,
+		EnablePassword:            enablePassword,
+		TimeoutSeconds:            timeout,
+		HostKey:                   hostKey,
+		InsecureSkipHostKeyVerify: insecureSkip,
 	})
 	if err != nil {
 		resp.Diagnostics.AddError("SSH connection failed", "Unable to connect to the ICX switch: "+err.Error())
@@ -132,7 +165,8 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 	}
 
 	data := &providerdata.ProviderData{
-		Client: client,
+		Client:   client,
+		Username: username,
 	}
 
 	resp.DataSourceData = data

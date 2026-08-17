@@ -3,13 +3,16 @@ package resource
 import (
 	"context"
 	"fmt"
+	"regexp"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
@@ -20,6 +23,13 @@ var (
 	_ resource.Resource                = &SystemResource{}
 	_ resource.ResourceWithImportState = &SystemResource{}
 )
+
+// reManagerPortList matches valid FastIron manager port-list values: digits,
+// slashes, commas, spaces, and the letters in "to" (for range syntax like
+// "1/1/1 to 1/1/24"). A literal space (not \s) is used so newlines and other
+// control characters are rejected at plan time, preventing command injection
+// via the `manager port-list %s` interpolation.
+var reManagerPortList = regexp.MustCompile(`^[0-9to/, ]+$`)
 
 type SystemResource struct {
 	client sshclient.CommandExecutor
@@ -98,8 +108,17 @@ func (r *SystemResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Default:     booldefault.StaticBool(false),
 			},
 			"manager_port_list": schema.StringAttribute{
-				Description: "Manager port list (e.g., \"987\").",
+				Description: "Manager port list (e.g., \"987\" or \"1/1/1 to 1/1/24\"). Only digits, slashes, commas, spaces, and the letters in \"to\" are allowed.",
 				Optional:    true,
+				Validators: []validator.String{
+					// Interpolated into `manager port-list %s` and `no manager port-list %s`.
+					// Reject newlines and any characters outside the expected charset to
+					// prevent command injection.
+					stringvalidator.RegexMatches(
+						reManagerPortList,
+						`manager_port_list may only contain digits, slashes, commas, spaces, and "to" (for ranges)`,
+					),
+				},
 			},
 		},
 	}
