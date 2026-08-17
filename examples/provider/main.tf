@@ -12,7 +12,8 @@ provider "icx" {
   password = var.switch_password
   # enable_password = var.enable_password  # uncomment if needed
 
-  # Obtain with: ssh-keyscan 10.0.1.1
+  # Obtain with: ssh-keyscan 10.0.1.1 — or, if that prints nothing (older FastIron
+  # SSH stacks), the provider repo debug tool: go run ./cmd/debug-ssh -print-host-key
   host_key = "10.0.1.1 ssh-rsa AAAAB3NzaC1yc2EAAAA..."
 
   # For lab use only — disables host key verification (MITM risk):

@@ -12,7 +12,9 @@ type Options struct {
 	// HostKey is the switch's SSH host public key in authorized_keys / known_hosts
 	// format (e.g. "ssh-rsa AAAA...") or a SHA256 fingerprint (e.g. "SHA256:...").
 	// If a known_hosts-style line with a leading hostname field is provided, the
-	// hostname field is stripped automatically.  Obtain the key with ssh-keyscan.
+	// hostname field is stripped automatically.  Obtain the key with ssh-keyscan,
+	// or with FetchHostKey / `debug-ssh -print-host-key` on older FastIron whose
+	// SSH stack ssh-keyscan cannot negotiate with.
 	HostKey string
 
 	// InsecureSkipHostKeyVerify disables SSH host key verification entirely.

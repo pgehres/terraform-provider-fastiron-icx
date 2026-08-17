@@ -184,7 +184,9 @@ func buildHostKeyCallback(opts Options) (ssh.HostKeyCallback, error) {
 	if opts.HostKey == "" {
 		return nil, fmt.Errorf(
 			"host key verification required: set host_key to the switch's SSH public key or SHA256 fingerprint "+
-				"(obtain with: ssh-keyscan %s), or set insecure_skip_host_key_verify = true for trusted lab networks only",
+				"(obtain with: ssh-keyscan %s — or, on older FastIron whose SSH stack ssh-keyscan cannot negotiate with, "+
+				"the provider repo's debug tool: go run ./cmd/debug-ssh -print-host-key), "+
+				"or set insecure_skip_host_key_verify = true for trusted lab networks only",
 			opts.Host,
 		)
 	}
@@ -235,12 +237,47 @@ func buildHostKeyCallback(opts Options) (ssh.HostKeyCallback, error) {
 		if !bytes.Equal(key.Marshal(), expectedMarshal) {
 			return fmt.Errorf(
 				"SSH host key mismatch for %s: presented key fingerprint is %s; "+
-					"update host_key or run ssh-keyscan %s to get the current key",
+					"update host_key with the current key (ssh-keyscan %s, or the provider repo's "+
+					"debug tool if ssh-keyscan returns nothing: go run ./cmd/debug-ssh -print-host-key)",
 				hostname, ssh.FingerprintSHA256(key), opts.Host,
 			)
 		}
 		return nil
 	}, nil
+}
+
+// FetchHostKey connects to the switch just far enough to capture its SSH host
+// public key, then disconnects without authenticating. This exists because
+// ssh-keyscan cannot negotiate with older FastIron SSH stacks (e.g. RomSShell
+// 5.40 offers KEX algorithms modern OpenSSH refuses), while the x/crypto
+// client used by this provider negotiates with them fine.
+func FetchHostKey(host string, port, timeoutSeconds int) (ssh.PublicKey, error) {
+	if port == 0 {
+		port = 22
+	}
+	if timeoutSeconds == 0 {
+		timeoutSeconds = 15
+	}
+
+	var captured ssh.PublicKey
+	config := &ssh.ClientConfig{
+		User: "host-key-probe",
+		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			captured = key
+			// Abort the handshake — the key is all we came for.
+			return fmt.Errorf("host key captured")
+		},
+		Timeout: time.Duration(timeoutSeconds) * time.Second,
+	}
+
+	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", host, port), config)
+	if client != nil {
+		_ = client.Close()
+	}
+	if captured != nil {
+		return captured, nil
+	}
+	return nil, fmt.Errorf("fetch host key from %s: %w", host, err)
 }
 
 // isSSHKeyType returns true if s is a recognized SSH public key type prefix.

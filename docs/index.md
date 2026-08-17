@@ -28,6 +28,12 @@ ssh-keyscan <switch-hostname-or-ip>
 
 Copy the relevant line (e.g. the `ssh-rsa` or `ecdsa-sha2-nistp256` entry) and set it as `host_key`.
 
+~> **If `ssh-keyscan` prints only banner comments and no keys**, the switch's SSH stack (e.g. RomSShell 5.40 on FastIron 08.0.x) offers key-exchange algorithms too old for modern OpenSSH to negotiate. The provider's own SSH client handles these switches fine — use the debug tool from the provider repository instead, which prints the key in both accepted formats:
+
+```shell
+FASTIRON_HOST=<switch> go run ./cmd/debug-ssh -print-host-key
+```
+
 ## Example Usage
 
 ```terraform
@@ -101,7 +107,7 @@ resource "icx_vlan" "servers_access" {
 | `password` | string | yes | `FASTIRON_PASSWORD` | SSH password. Sensitive. |
 | `enable_password` | string | no | `FASTIRON_ENABLE_PASSWORD` | Enable mode password. Required if the switch prompts for one; safe to set even when the switch has no enable password configured. Sensitive. |
 | `timeout` | number | no | — | SSH connection timeout in seconds. Defaults to 30. |
-| `host_key` | string | see note | `FASTIRON_HOST_KEY` | The switch's SSH host public key in `known_hosts` format or `SHA256:<fingerprint>`. Obtain with `ssh-keyscan <host>`. One of `host_key` or `insecure_skip_host_key_verify` is required. |
+| `host_key` | string | see note | `FASTIRON_HOST_KEY` | The switch's SSH host public key in `known_hosts` format or `SHA256:<fingerprint>`. Obtain with `ssh-keyscan <host>` (see the host-key note above if it prints nothing). One of `host_key` or `insecure_skip_host_key_verify` is required. |
 | `insecure_skip_host_key_verify` | bool | see note | — | Disable SSH host key verification. Exposes connections to man-in-the-middle attacks. For lab use only. |
 
 ### Argument Reference
@@ -136,7 +142,7 @@ The switch's SSH host public key used to verify the server's identity. Accepts e
 - A full `known_hosts`-format line (e.g. `192.168.1.1 ssh-rsa AAAAB3Nza...`)
 - A SHA256 fingerprint (e.g. `SHA256:abc123...`)
 
-Obtain the value with `ssh-keyscan <host>`. One of `host_key` or `insecure_skip_host_key_verify` must be set. Can also be set with the `FASTIRON_HOST_KEY` environment variable.
+Obtain the value with `ssh-keyscan <host>`, or with the debug tool described in [SSH and Host Key Verification](#ssh-and-host-key-verification) if `ssh-keyscan` prints nothing. One of `host_key` or `insecure_skip_host_key_verify` must be set. Can also be set with the `FASTIRON_HOST_KEY` environment variable.
 
 #### `insecure_skip_host_key_verify` (Optional)
 
