@@ -24,7 +24,9 @@ var (
 )
 
 type InterfaceVEResource struct {
-	client sshclient.CommandExecutor
+	client          sshclient.CommandExecutor
+	imageType       parser.ImageType
+	firmwareVersion string
 }
 
 type InterfaceVEResourceModel struct {
@@ -79,12 +81,18 @@ func (r *InterfaceVEResource) Configure(_ context.Context, req resource.Configur
 		return
 	}
 	r.client = data.Client
+	r.imageType = data.ImageType
+	r.firmwareVersion = data.FirmwareVersion
 }
 
 func (r *InterfaceVEResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan InterfaceVEResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
 		return
 	}
 
@@ -124,6 +132,10 @@ func (r *InterfaceVEResource) Read(ctx context.Context, req resource.ReadRequest
 		return
 	}
 
+	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
+		return
+	}
+
 	config, err := r.getRunningConfig()
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to read running config", err.Error())
@@ -157,6 +169,10 @@ func (r *InterfaceVEResource) Update(ctx context.Context, req resource.UpdateReq
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
 		return
 	}
 
@@ -227,6 +243,10 @@ func (r *InterfaceVEResource) Delete(ctx context.Context, req resource.DeleteReq
 	var state InterfaceVEResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
 		return
 	}
 

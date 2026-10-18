@@ -32,7 +32,9 @@ var (
 var reManagerPortList = regexp.MustCompile(`^[0-9to/, ]+$`)
 
 type SystemResource struct {
-	client sshclient.CommandExecutor
+	client          sshclient.CommandExecutor
+	imageType       parser.ImageType
+	firmwareVersion string
 }
 
 type SystemResourceModel struct {
@@ -134,12 +136,19 @@ func (r *SystemResource) Configure(_ context.Context, req resource.ConfigureRequ
 		return
 	}
 	r.client = data.Client
+	r.imageType = data.ImageType
+	r.firmwareVersion = data.FirmwareVersion
 }
 
 func (r *SystemResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan SystemResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if plan.GlobalSTP.ValueBool() &&
+		!requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics) {
 		return
 	}
 
@@ -202,6 +211,11 @@ func (r *SystemResource) Update(ctx context.Context, req resource.UpdateRequest,
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if (plan.GlobalSTP.ValueBool() || state.GlobalSTP.ValueBool()) &&
+		!requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics) {
 		return
 	}
 
@@ -298,6 +312,11 @@ func (r *SystemResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	}
 
 	// Reset all settings to defaults.
+	if state.GlobalSTP.ValueBool() &&
+		!requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics) {
+		return
+	}
+
 	var commands []string
 	if state.GlobalSTP.ValueBool() {
 		commands = append(commands, "no global-stp")

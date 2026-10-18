@@ -10,7 +10,7 @@ Manages a virtual ethernet (VE) interface on an ICX switch.
 
 ~> **Prerequisite:** The VE interface must be created by setting `router_interface` on the corresponding [`icx_vlan`](vlan.md) resource. `icx_interface_ve` only configures properties of an already-existing VE — it does not create the VE itself.
 
-~> **Router image only.** VE interfaces exist only on the FastIron **router image** (`SPR…`/`T213`-style versions). On a switch-image device (`SPS…`/`T211`, which uses a single global `ip address` instead) the `interface ve` command does not exist and this resource fails at apply time with a CLI error. See [Router Image vs. Switch Image](../index.md#router-image-vs-switch-image).
+~> **Router image only.** VE interfaces exist only on the FastIron **router image** (`SPR…`/`T213`-style versions). On a switch-image device (`SPS…`/`T211`, which uses a single global `ip address` instead) the `interface ve` command does not exist; the provider detects the image type at connect time and every operation on this resource fails with a clear "Router image required" error before any commands are sent. See [Router Image vs. Switch Image](../index.md#router-image-vs-switch-image).
 
 ## Example Usage
 

@@ -45,7 +45,7 @@ resource "icx_vlan" "multicast_vlan" {
 ### Optional
 
 - `name` (String) - VLAN name (1–31 chars; no spaces or quote characters). Once set, the name cannot be removed in place — FastIron has no CLI command to clear it — so clearing this attribute produces an error; destroy and recreate the VLAN instead.
-- `router_interface` (Number) - VE interface number to associate with this VLAN (generates `router-interface ve N`). The VE interface configuration is managed separately by [`icx_interface_ve`](interface_ve.md). Requires the FastIron **router image** — on a switch-image device the command does not exist and the apply fails with a CLI error (see [Router Image vs. Switch Image](../index.md#router-image-vs-switch-image)).
+- `router_interface` (Number) - VE interface number to associate with this VLAN (generates `router-interface ve N`). The VE interface configuration is managed separately by [`icx_interface_ve`](interface_ve.md). Requires the FastIron **router image** — on a switch-image device the command does not exist and the provider fails with a clear "Router image required" error before any commands are sent (see [Router Image vs. Switch Image](../index.md#router-image-vs-switch-image)).
 - `spanning_tree` (Boolean) - Enable 802.1w spanning tree on this VLAN. Defaults to `false`.
 - `stp_priority` (Number) - Spanning tree priority for this VLAN (e.g. `4096`). Only meaningful when `spanning_tree = true`.
 - `multicast_passive` (Boolean) - Enable IGMP snooping in passive mode on this VLAN. Defaults to `false`.

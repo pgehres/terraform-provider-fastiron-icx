@@ -40,7 +40,9 @@ var reVLANName = regexp.MustCompile(`^[^\s"']+$`)
 var reNoNewlines = regexp.MustCompile(`^[^\r\n]*$`)
 
 type VLANResource struct {
-	client sshclient.CommandExecutor
+	client          sshclient.CommandExecutor
+	imageType       parser.ImageType
+	firmwareVersion string
 }
 
 type VLANResourceModel struct {
@@ -148,12 +150,19 @@ func (r *VLANResource) Configure(_ context.Context, req resource.ConfigureReques
 		return
 	}
 	r.client = data.Client
+	r.imageType = data.ImageType
+	r.firmwareVersion = data.FirmwareVersion
 }
 
 func (r *VLANResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan VLANResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !plan.RouterInterface.IsNull() &&
+		!requireRouterImage(r.imageType, r.firmwareVersion, "The router_interface attribute of icx_vlan", &resp.Diagnostics) {
 		return
 	}
 
@@ -230,6 +239,11 @@ func (r *VLANResource) Update(ctx context.Context, req resource.UpdateRequest, r
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if (!plan.RouterInterface.IsNull() || !state.RouterInterface.IsNull()) &&
+		!requireRouterImage(r.imageType, r.firmwareVersion, "The router_interface attribute of icx_vlan", &resp.Diagnostics) {
 		return
 	}
 

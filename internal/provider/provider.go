@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	icxdatasource "github.com/pgehres/terraform-provider-fastiron-icx/internal/datasource"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
 	icxresource "github.com/pgehres/terraform-provider-fastiron-icx/internal/resource"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
@@ -167,8 +168,27 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 	}
 
 	data := &providerdata.ProviderData{
-		Client:   client,
-		Username: username,
+		Client:    client,
+		Username:  username,
+		ImageType: parser.ImageTypeUnknown,
+	}
+
+	// Detect the firmware image type once per provider instance so resources
+	// can refuse router-image-only operations on switch-image devices before
+	// any commands are sent.
+	output, err := client.GetRunningConfig()
+	if err != nil {
+		resp.Diagnostics.AddError("Failed to read running config",
+			"Unable to read the running configuration during provider setup: "+err.Error())
+		return
+	}
+	if parsed, err := parser.ParseRunningConfig(output); err != nil {
+		resp.Diagnostics.AddWarning("Could not detect firmware image type",
+			"The running configuration could not be parsed: "+err.Error()+
+				". Router-image-only features will not be validated before commands are sent.")
+	} else {
+		data.FirmwareVersion = parsed.Global.Version
+		data.ImageType = parsed.ImageType()
 	}
 
 	resp.DataSourceData = data

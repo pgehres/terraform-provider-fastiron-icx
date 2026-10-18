@@ -21,10 +21,12 @@ type StackUnitDataSource struct {
 }
 
 type StackUnitDataSourceModel struct {
-	ID         types.String `tfsdk:"id"`
-	UnitID     types.Int64  `tfsdk:"unit_id"`
-	Modules    types.List   `tfsdk:"modules"`
-	StackPorts types.List   `tfsdk:"stack_ports"`
+	ID              types.String `tfsdk:"id"`
+	UnitID          types.Int64  `tfsdk:"unit_id"`
+	Modules         types.List   `tfsdk:"modules"`
+	StackPorts      types.List   `tfsdk:"stack_ports"`
+	FirmwareVersion types.String `tfsdk:"firmware_version"`
+	ImageType       types.String `tfsdk:"image_type"`
 }
 
 var moduleObjectType = types.ObjectType{
@@ -62,6 +64,14 @@ func (d *StackUnitDataSource) Schema(_ context.Context, _ datasource.SchemaReque
 				Description: "List of stack port identifiers.",
 				Computed:    true,
 				ElementType: types.StringType,
+			},
+			"firmware_version": schema.StringAttribute{
+				Description: "FastIron firmware version string from the running config (e.g. \"08.0.95rT211\"). Device-wide, not per stack unit.",
+				Computed:    true,
+			},
+			"image_type": schema.StringAttribute{
+				Description: "FastIron firmware image type: \"router\" (SPR, Layer 3), \"switch\" (SPS, Layer 2 only), or \"unknown\". Device-wide, not per stack unit.",
+				Computed:    true,
 			},
 		},
 	}
@@ -119,6 +129,8 @@ func (d *StackUnitDataSource) Read(ctx context.Context, req datasource.ReadReque
 
 	state.ID = types.StringValue(strconv.Itoa(unitID))
 	state.UnitID = types.Int64Value(int64(unitID))
+	state.FirmwareVersion = types.StringValue(config.Global.Version)
+	state.ImageType = types.StringValue(string(config.ImageType()))
 
 	// Build modules list.
 	moduleValues := make([]attr.Value, len(found.Modules))
