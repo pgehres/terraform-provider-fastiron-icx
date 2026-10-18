@@ -37,6 +37,10 @@ func TestImageType_VersionSuffix(t *testing.T) {
 		{"08.0.95rT211", ImageTypeSwitch},
 		{"08.0.40q017T213", ImageTypeRouter},
 		{"08.0.40T211", ImageTypeSwitch},
+		// ICX 6000-series T31x codes (observed on a live ICX 6430-C12
+		// switch image reporting 08.0.30uT311).
+		{"08.0.30uT311", ImageTypeSwitch},
+		{"08.0.30uT313", ImageTypeRouter},
 		// Unrecognized T-codes and malformed versions must not be guessed at.
 		{"10.1.05T215", ImageTypeUnknown},
 		{"08.0.95", ImageTypeUnknown},

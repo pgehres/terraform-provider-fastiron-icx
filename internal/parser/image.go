@@ -15,7 +15,9 @@ const (
 
 // reImageCode matches the trailing T-code of a FastIron version string
 // (e.g. "08.0.95rT211", "08.0.95qT213"). The final digit identifies the
-// image: …1 = switch image (SPS), …3 = router image (SPR). Codes ending in
+// image: …1 = switch image (SPS), …3 = router image (SPR). The middle digits
+// vary by platform family (T21x on ICX 7000-series, T31x on ICX 6000-series —
+// a live ICX 6430-C12 switch image reports "08.0.30uT311"). Codes ending in
 // any other digit (e.g. boot-monitor T215) are left to the structural
 // fallback rather than guessed at.
 var reImageCode = regexp.MustCompile(`T\d*([13])$`)
