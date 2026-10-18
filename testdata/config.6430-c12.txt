@@ -1,0 +1,43 @@
+Current configuration:
+!
+! SYNTHETIC FIXTURE - hand-written to model FastIron 08.0.30 ICX 6430-C12 output (switch image, stackless, bare module lines). Replace with a real "show running-config" capture once a device is wired into the lab.
+!
+ver 08.0.30dT311
+!
+module 1 icx6430-c12-port-management-module
+module 2 icx6430-sfp-2port-2g-module
+!
+!
+!
+vlan 1 name DEFAULT-VLAN by port
+!
+vlan 20 name management by port
+ tagged ethe 1/2/1 to 1/2/2
+ untagged ethe 1/1/1 to 1/1/4
+!
+vlan 30 name servers by port
+ tagged ethe 1/1/5 to 1/1/6 ethe 1/2/1 to 1/2/2
+!
+vlan 70 name iot by port
+ tagged ethe 1/2/1 to 1/2/2
+ untagged ethe 1/1/7 to 1/1/8
+!
+!
+aaa authentication web-server default local
+aaa authentication login default local
+enable aaa console
+ip address 10.0.20.8 255.255.255.0
+ip default-gateway 10.0.20.1
+!
+no telnet server
+username admin password .....
+!
+!
+interface ethernet 1/1/1
+ port-name lab-host1
+!
+interface ethernet 1/2/1
+ port-name uplink to core
+!
+!
+end

@@ -16,6 +16,9 @@ The `fastiron-icx` provider manages Brocade/Ruckus ICX switches running FastIron
 - ICX 7150-C12P (12-port PoE compact, optical-monitor)
 - ICX 7150-C10ZP (10-port PoE compact, no global-stp, ISP VLANs)
 
+**Experimental / untested models:**
+- ICX 6430-C12 (EOL, FastIron 08.0.30, switch image only — L2, no stacking). Parser support for its stackless config format (bare top-level `module` lines) is in place but has only been exercised against a synthetic fixture, not a real device. Its very old SSH stack requires `legacy_ssh_algorithms = true` (see below). Expect rough edges until a real device has been tested.
+
 ## SSH and Host Key Verification
 
 **Host key verification is required** unless you explicitly opt out. One of `host_key` or `insecure_skip_host_key_verify` must be set.
@@ -33,6 +36,21 @@ Copy the relevant line (e.g. the `ssh-rsa` or `ecdsa-sha2-nistp256` entry) and s
 ```shell
 FASTIRON_HOST=<switch> go run ./cmd/debug-ssh -print-host-key
 ```
+
+### Legacy SSH Algorithms (EOL devices)
+
+Very old FastIron releases — e.g. **FastIron 08.0.30 on the EOL ICX 6430** — only support SSH algorithms (SHA-1 key exchange, CBC ciphers, `ssh-rsa` host key signatures) that modern SSH clients, including the Go `x/crypto` library this provider uses, disable by default. If the provider fails to connect with a key-exchange or cipher negotiation error, set:
+
+```terraform
+provider "icx" {
+  # ...
+  legacy_ssh_algorithms = true
+}
+```
+
+This *extends* the offered algorithm lists with `diffie-hellman-group14-sha1`, `diffie-hellman-group1-sha1`, `diffie-hellman-group-exchange-sha1`, `aes128-cbc`, `3des-cbc`, `ssh-rsa`, and `ssh-dss`. Modern algorithms remain first in the preference order, so a switch that supports anything newer still negotiates it — but these legacy algorithms are cryptographically weak, so enable this only for EOL devices on trusted networks. RC4 is never offered.
+
+The `debug-ssh -print-host-key` host-key capture always offers the legacy algorithms (nothing secret is exchanged during a key capture), so it works against these devices without extra flags.
 
 ## Example Usage
 
@@ -109,6 +127,7 @@ resource "icx_vlan" "servers_access" {
 | `timeout` | number | no | — | SSH connection timeout in seconds. Defaults to 30. |
 | `host_key` | string | see note | `FASTIRON_HOST_KEY` | The switch's SSH host public key in `known_hosts` format or `SHA256:<fingerprint>`. Obtain with `ssh-keyscan <host>` (see the host-key note above if it prints nothing). One of `host_key` or `insecure_skip_host_key_verify` is required. |
 | `insecure_skip_host_key_verify` | bool | see note | — | Disable SSH host key verification. Exposes connections to man-in-the-middle attacks. For lab use only. |
+| `legacy_ssh_algorithms` | bool | no | — | Additionally offer weak legacy SSH algorithms required by very old FastIron SSH stacks (e.g. 08.0.30 on the EOL ICX 6430). Defaults to `false`. |
 
 ### Argument Reference
 
@@ -147,3 +166,7 @@ Obtain the value with `ssh-keyscan <host>`, or with the debug tool described in 
 #### `insecure_skip_host_key_verify` (Optional)
 
 When `true`, host key verification is disabled. This means an attacker performing a man-in-the-middle attack could intercept switch credentials and configuration commands. **Do not use in production.** One of `host_key` or `insecure_skip_host_key_verify` must be set.
+
+#### `legacy_ssh_algorithms` (Optional)
+
+When `true`, the provider additionally offers legacy SSH algorithms — `diffie-hellman-group14-sha1`, `diffie-hellman-group1-sha1`, and `diffie-hellman-group-exchange-sha1` key exchange; `aes128-cbc` and `3des-cbc` ciphers; `ssh-rsa` and `ssh-dss` host key signatures — needed by very old FastIron SSH stacks such as FastIron 08.0.30 on the EOL ICX 6430. Modern algorithms remain preferred, so switches that support them are unaffected. **These algorithms are cryptographically weak** (SHA-1 key exchange, CBC-mode ciphers, SHA-1 signatures); enable this only for EOL devices on trusted networks. RC4 is never offered. Defaults to `false`. See [Legacy SSH Algorithms](#legacy-ssh-algorithms-eol-devices).

@@ -31,6 +31,7 @@ type FastIronICXProviderModel struct {
 	Timeout                   types.Int64  `tfsdk:"timeout"`
 	HostKey                   types.String `tfsdk:"host_key"`
 	InsecureSkipHostKeyVerify types.Bool   `tfsdk:"insecure_skip_host_key_verify"`
+	LegacySSHAlgorithms       types.Bool   `tfsdk:"legacy_ssh_algorithms"`
 }
 
 func New(version string) func() provider.Provider {
@@ -90,6 +91,16 @@ func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest
 					"should only be used on isolated lab networks where MITM is not a concern.",
 				Optional: true,
 			},
+			"legacy_ssh_algorithms": schema.BoolAttribute{
+				Description: "If true, additionally offer legacy SSH algorithms " +
+					"(diffie-hellman-group14-sha1/group1-sha1/group-exchange-sha1 key exchange, " +
+					"aes128-cbc and 3des-cbc ciphers, ssh-rsa and ssh-dss host key signatures) " +
+					"needed by very old FastIron SSH stacks, e.g. FastIron 08.0.30 on the EOL ICX 6430. " +
+					"Modern algorithms remain preferred, so switches that support them are unaffected. " +
+					"WARNING: these algorithms are cryptographically weak; enable only for EOL devices " +
+					"on trusted networks. Defaults to false.",
+				Optional: true,
+			},
 		},
 	}
 }
@@ -109,6 +120,9 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 	insecureSkip := !config.InsecureSkipHostKeyVerify.IsNull() &&
 		!config.InsecureSkipHostKeyVerify.IsUnknown() &&
 		config.InsecureSkipHostKeyVerify.ValueBool()
+	legacySSH := !config.LegacySSHAlgorithms.IsNull() &&
+		!config.LegacySSHAlgorithms.IsUnknown() &&
+		config.LegacySSHAlgorithms.ValueBool()
 
 	port := 22
 	if !config.Port.IsNull() && !config.Port.IsUnknown() {
@@ -160,6 +174,7 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 		TimeoutSeconds:            timeout,
 		HostKey:                   hostKey,
 		InsecureSkipHostKeyVerify: insecureSkip,
+		LegacySSHAlgorithms:       legacySSH,
 	})
 	if err != nil {
 		resp.Diagnostics.AddError("SSH connection failed", "Unable to connect to the ICX switch: "+err.Error())
