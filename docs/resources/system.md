@@ -10,7 +10,7 @@ Manages global system settings on an ICX switch.
 
 This is a **singleton resource** — only one `icx_system` resource may exist per provider instance. Its Terraform ID is always `"system"`.
 
-~> **ICX 7150-C10ZP note:** This model does not support `global-stp`. Setting `global_stp = true` on that hardware will produce a CLI error. Keep `global_stp = false` (the default) for C10ZP switches.
+~> **Switch-image note:** `global-stp` is a FastIron **router image** command. On a device running the switch image (`SPS…`/`T211`-style versions — e.g. an ICX 7150-C10ZP shipped with the L2 image), setting `global_stp = true` produces a CLI error at apply time; keep it `false` (the default) there. See [Router Image vs. Switch Image](../index.md#router-image-vs-switch-image).
 
 ## Example Usage
 
