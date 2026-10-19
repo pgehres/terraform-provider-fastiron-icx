@@ -260,8 +260,57 @@ terraform import icx_aaa.this aaa
 make build    # Build the binary
 make install  # Install to local Terraform plugin directory
 make test     # Run unit tests
-make testacc  # Run acceptance tests (requires TF_ACC=1 and a live switch)
+make testacc  # Run acceptance tests against a live lab switch (see below)
 ```
+
+## Acceptance Tests
+
+`internal/acctest` runs the provider's resources against a **live lab switch** through [terraform-plugin-testing](https://github.com/hashicorp/terraform-plugin-testing). Every test skips unless `TF_ACC` and the connection variables are set, so `go test ./...` never needs a switch. Each test snapshots the running configuration first, checks that the scratch resources it will use are free, creates / updates / destroys through real `terraform` runs (a step fails if its post-apply plan is not empty), verifies every step on the device over its own SSH session, and finally requires the running configuration to be **identical to the pre-test snapshot**.
+
+```bash
+FASTIRON_HOST=192.168.2.240 \
+FASTIRON_USERNAME=pgehres \
+FASTIRON_PASSWORD='...' \
+FASTIRON_ENABLE_PASSWORD='...' \
+FASTIRON_HOST_KEY='SHA256:...' \
+FASTIRON_LEGACY_SSH=true \
+TF_ACC_SCRATCH_PORT=1/1/11 \
+make testacc
+```
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `FASTIRON_HOST`, `FASTIRON_USERNAME`, `FASTIRON_PASSWORD` | yes | The provider's own connection variables (`FASTIRON_PORT` optional). |
+| `FASTIRON_ENABLE_PASSWORD` | if the switch prompts for it | Enable password. |
+| `FASTIRON_HOST_KEY` | yes | Host key or `SHA256:` fingerprint; the harness never skips verification. Capture it with `go run ./cmd/debug-ssh -print-host-key`. |
+| `FASTIRON_LEGACY_SSH` | no | `true` for FastIron 08.0.30 devices (ICX 6430/6450) — sets `legacy_ssh_algorithms`. |
+| `TF_ACC_SCRATCH_PORT` | for the interface test | The **one** port the tests may configure, e.g. `1/1/11`. Must be unconfigured, in no VLAN and have no link. |
+| `TF_ACC_SCRATCH_VLAN`, `TF_ACC_SCRATCH_VLAN_2` | no | VLAN IDs that must not exist on the device (defaults 3999 and 3998). |
+| `TF_ACC_ALLOW_TRUNK_RECONCILE` | no | See below. |
+
+Narrow the run with `make testacc TESTARGS='-run TestAccVLAN'`. A `terraform` binary on `PATH` is used (or `TF_ACC_TERRAFORM_PATH`); otherwise the framework downloads one. `TF_LOG=DEBUG` shows the CLI exchange.
+
+**Pre-flight checklist**
+
+1. The scratch port has nothing connected and shows `Down` in `show interfaces brief`, has no `interface ethernet` stanza and is in no VLAN besides the implicit default. The harness checks all of this and fails rather than run otherwise.
+2. The scratch VLAN IDs do not exist on the device (never VLAN 1, never the management VLAN).
+3. No local user `tfacc-test` exists, and the login user is not `tfacc-test`.
+4. The switch allows at least two concurrent SSH sessions (the provider's and the harness's).
+5. You have console access, in case the hostname test is interrupted (it restores the original name in cleanup even on failure, but a dead network would stop it).
+
+**What each test touches and leaves behind**
+
+| Test | Does | Never |
+|---|---|---|
+| `TestAccVLAN` | Creates the scratch VLAN with a name and spanning tree, renames it, imports it, deletes it. | Touches an existing VLAN. |
+| `TestAccInterfaceEthernet` | Puts the scratch port through access → tagged-only → trunk-with-untagged → access using both scratch VLANs, then destroys everything. On FastIron below 08.0.80 the trunk-with-untagged step exercises the `dual-mode` dialect; the log says which form was seen. | Configures any other port. |
+| `TestAccUser` | Creates `tfacc-test`, changes its password, imports it, deletes it. | Touches the login user. |
+| `TestAccSystemHostname` | Sets the hostname to `<original>-tfacc` through `icx_system` and back, exercising SSH prompt re-detection live; the resource is then *forgotten* with a `removed` block (Terraform ≥ 1.7), not destroyed, because destroying `icx_system` would reset every setting it owns. Every other `icx_system` attribute is rendered with the device's current value, so the commands sent for them are idempotent re-issues. If the device runs its factory-default name the provider cannot restore it (it never sends `no hostname`), so the harness does that itself. | Leaves a changed hostname behind: `t.Cleanup` restores it even when the test fails. |
+| `TestAccManagementIP` | Switch-image devices only (router image skips). Appends `192.0.2.53` to the device's DNS servers through `icx_management_ip` and restores the original list. | Sends `ip address` or `ip default-gateway`. Changing the address or gateway — including whether FastIron accepts an off-subnet gateway — is a **manual** lab test with console access. |
+
+**Trunk-all ports.** `icx_vlan.Create` tags a new VLAN onto every port it recognises as a "tag all VLANs" trunk (CLAUDE.md gotcha #8). On a device with such trunks the VLAN-creating tests would therefore configure ports other than the scratch port, so they **skip** and name the ports. Set `TF_ACC_ALLOW_TRUNK_RECONCILE=true` to allow it: the scratch VLAN's membership is removed again with the VLAN and nothing about an existing VLAN on those trunks changes.
+
+Every provider operation ends in `write memory`, so a full run writes the startup configuration a couple of dozen times. Tests run one at a time (one switch, one config session); do not run the package with `-parallel` against the same device.
 
 ## License
 

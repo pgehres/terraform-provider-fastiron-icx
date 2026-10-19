@@ -597,3 +597,11 @@ func findTrunkAllPorts(config *parser.RunningConfig, newVLANID int) []string {
 	sort.Strings(trunkPorts)
 	return trunkPorts
 }
+
+// FindTrunkAllPorts is findTrunkAllPorts, exported for the acceptance test
+// harness (internal/acctest): it predicts which ports icx_vlan.Create would
+// tag a new VLAN onto, so a test that must not touch any port but its scratch
+// port can refuse to create a VLAN on a device that has such trunks.
+func FindTrunkAllPorts(config *parser.RunningConfig, newVLANID int) []string {
+	return findTrunkAllPorts(config, newVLANID)
+}
