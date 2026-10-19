@@ -18,9 +18,11 @@ const (
 	// 6430/6450); SmartZone documents 08.0.80 as the minimum release for ICX
 	// management.
 	CapManager Capability = "manager"
-	// CapOpticalMonitor: global and per-interface `optical-monitor`. Present
-	// in every known dialect; whether a given optic or platform reports DOM
-	// data is a hardware question left to the switch.
+	// CapOpticalMonitor: the global `optical-monitor` commands behind
+	// icx_system's optical_monitor and optical_monitor_non_ruckus attributes.
+	// (Per-interface `optical-monitor` on icx_interface_ethernet is not
+	// gated.) Present in every known dialect; whether a given optic or
+	// platform reports DOM data is a hardware question left to the switch.
 	CapOpticalMonitor Capability = "optical_monitor"
 
 	// CapDualMode is a syntax form, not a feature: trunk ports that also carry

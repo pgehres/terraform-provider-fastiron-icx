@@ -14,15 +14,15 @@ func TestParseVersion(t *testing.T) {
 		want Version
 		ok   bool
 	}{
-		{"08.0.95mT213", Version{8, 0, 95, "m", "T213", "08.0.95mT213"}, true},
-		{"08.0.95qT213", Version{8, 0, 95, "q", "T213", "08.0.95qT213"}, true},
-		{"08.0.95rT211", Version{8, 0, 95, "r", "T211", "08.0.95rT211"}, true},
-		{"08.0.30uT311", Version{8, 0, 30, "u", "T311", "08.0.30uT311"}, true},
-		{"08.0.30uT313", Version{8, 0, 30, "u", "T313", "08.0.30uT313"}, true},
-		{"08.0.79T213", Version{8, 0, 79, "", "T213", "08.0.79T213"}, true},
-		{"09.0.10aT213", Version{9, 0, 10, "a", "T213", "09.0.10aT213"}, true},
-		{"08.0.80", Version{8, 0, 80, "", "", "08.0.80"}, true},
-		{"08.0.95 beta", Version{8, 0, 95, "", "", "08.0.95 beta"}, true},
+		{"08.0.95mT213", Version{8, 0, 95, "08.0.95mT213"}, true},
+		{"08.0.95qT213", Version{8, 0, 95, "08.0.95qT213"}, true},
+		{"08.0.95rT211", Version{8, 0, 95, "08.0.95rT211"}, true},
+		{"08.0.30uT311", Version{8, 0, 30, "08.0.30uT311"}, true},
+		{"08.0.30uT313", Version{8, 0, 30, "08.0.30uT313"}, true},
+		{"08.0.79T213", Version{8, 0, 79, "08.0.79T213"}, true},
+		{"09.0.10aT213", Version{9, 0, 10, "09.0.10aT213"}, true},
+		{"08.0.80", Version{8, 0, 80, "08.0.80"}, true},
+		{"08.0.95 beta", Version{8, 0, 95, "08.0.95 beta"}, true},
 		{"", Version{}, false},
 		{"garbage", Version{}, false},
 		{"8.0", Version{}, false},
@@ -32,6 +32,39 @@ func TestParseVersion(t *testing.T) {
 		if ok != tt.ok || got != tt.want {
 			t.Errorf("ParseVersion(%q) = %+v, %v; want %+v, %v", tt.in, got, ok, tt.want, tt.ok)
 		}
+	}
+}
+
+// Firmware reports the device's version string verbatim, parseable or not;
+// "unknown" is reserved for a device that reported no version at all.
+func TestFirmware(t *testing.T) {
+	tests := []struct {
+		in, want string
+		known    bool
+	}{
+		{"08.0.95mT213", "08.0.95mT213", true},
+		{"08.0.30uT311", "08.0.30uT311", true},
+		{"FastIron-weird-build", "FastIron-weird-build", false},
+		{"8.0", "8.0", false},
+		{"", "unknown", false},
+	}
+	for _, tt := range tests {
+		d := Detect(tt.in, parser.ImageTypeSwitch)
+		if got := d.Firmware(); got != tt.want || d.Known != tt.known {
+			t.Errorf("Detect(%q): Firmware() = %q, Known = %v; want %q, %v", tt.in, got, d.Known, tt.want, tt.known)
+		}
+	}
+
+	// The router-image guard on an unparseable version names the raw string.
+	d := Detect("FastIron-weird-build", parser.ImageTypeSwitch)
+	if err := d.Why(CapVEInterfaces); !strings.Contains(err, "firmware FastIron-weird-build") {
+		t.Errorf("Why(CapVEInterfaces) = %q, want it to name the raw version", err)
+	}
+
+	// Observe keeps an unparseable config version for diagnostics too.
+	o := Dialect{}.Observe(&parser.RunningConfig{Global: parser.GlobalSettings{Version: "odd"}})
+	if o.Known || o.Firmware() != "odd" {
+		t.Errorf("Observe(odd): Known = %v, Firmware() = %q", o.Known, o.Firmware())
 	}
 }
 

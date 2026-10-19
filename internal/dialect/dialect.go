@@ -35,43 +35,28 @@ import (
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 )
 
-// reVersion matches a FastIron release string as it appears on the `ver` line
-// of the running config: a numeric major.minor.patch, an optional patch-letter
-// build ("u", "m", "q", ...), and an optional T-code identifying the platform
-// family and image ("T311", "T213").
-var reVersion = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)([A-Za-z]*?)(T\d+)?$`)
+// reVersion matches the numeric major.minor.patch prefix of a FastIron release
+// string as it appears on the `ver` line of the running config. Anything after
+// the triple (a patch-letter build such as "m" and a T-code such as "T213") is
+// ignored here: image detection from the T-code is the parser's job
+// (parser.RunningConfig.ImageType), and no capability depends on the build.
+var reVersion = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)`)
 
 // Version is a parsed FastIron release number, e.g. "08.0.95mT213" is
-// {8, 0, 95, "m", "T213"}.
+// {8, 0, 95}.
 type Version struct {
 	Major, Minor, Patch int
-	// Build is the patch-letter suffix ("m" in 08.0.95m). Empty for a GA build.
-	Build string
-	// Code is the T-code ("T213"): the middle digits identify the platform
-	// family (T21x ICX 7000-series, T31x ICX 6000-series) and the last digit
-	// the image (1 switch, 3 router). Image detection itself is the parser's
-	// job (parser.RunningConfig.ImageType); Code is kept for display and for
-	// future platform-family predicates.
-	Code string
-	// Raw is the string the version was parsed from, used verbatim in
-	// diagnostics.
+	// Raw is the device's version string, used verbatim in diagnostics. Detect
+	// records it even when it cannot be parsed, so error text always shows
+	// what the device reported.
 	Raw string
 }
 
 // ParseVersion parses a FastIron release string. ok is false when the string
-// does not start with a recognizable major.minor.patch triple; trailing text
-// that is not a build letter + T-code is tolerated and ignored, so that only
-// the numeric triple is required.
+// does not start with a recognizable major.minor.patch triple; any trailing
+// text (build letter, T-code, or something unfamiliar) is ignored.
 func ParseVersion(s string) (v Version, ok bool) {
-	if m := reVersion.FindStringSubmatch(s); m != nil {
-		v.Major, _ = strconv.Atoi(m[1])
-		v.Minor, _ = strconv.Atoi(m[2])
-		v.Patch, _ = strconv.Atoi(m[3])
-		v.Build, v.Code, v.Raw = m[4], m[5], s
-		return v, true
-	}
-	// Fall back to the bare numeric prefix for unfamiliar suffixes.
-	m := reNumericPrefix.FindStringSubmatch(s)
+	m := reVersion.FindStringSubmatch(s)
 	if m == nil {
 		return Version{}, false
 	}
@@ -81,8 +66,6 @@ func ParseVersion(s string) (v Version, ok bool) {
 	v.Raw = s
 	return v, true
 }
-
-var reNumericPrefix = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)`)
 
 // Less reports whether v is an earlier release than o, comparing only the
 // numeric triple.
@@ -118,9 +101,11 @@ type Dialect struct {
 
 // Detect builds the Dialect for a version string (the `ver` line of the
 // running config) and image type. It never fails: an unparseable version
-// yields a Dialect with Known = false, which is permissive.
+// yields a Dialect with Known = false, which is permissive. The raw string is
+// kept either way so diagnostics show the device's actual version.
 func Detect(versionString string, image parser.ImageType) Dialect {
 	v, ok := ParseVersion(versionString)
+	v.Raw = versionString
 	if image == "" {
 		image = parser.ImageTypeUnknown
 	}
@@ -144,6 +129,8 @@ func (d Dialect) Observe(c *parser.RunningConfig) Dialect {
 	if !d.Known {
 		if v, ok := ParseVersion(c.Global.Version); ok {
 			d.Version, d.Known = v, true
+		} else if d.Version.Raw == "" {
+			d.Version.Raw = c.Global.Version
 		}
 	}
 	if d.Image == "" || d.Image == parser.ImageTypeUnknown {
@@ -155,7 +142,8 @@ func (d Dialect) Observe(c *parser.RunningConfig) Dialect {
 	return d
 }
 
-// Firmware returns the device's version string for diagnostics, or "unknown".
+// Firmware returns the device's version string for diagnostics (verbatim, even
+// when it could not be parsed), or "unknown" when the device reported none.
 func (d Dialect) Firmware() string {
 	if d.Version.Raw != "" {
 		return d.Version.Raw
