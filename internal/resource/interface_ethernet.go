@@ -249,12 +249,15 @@ func (r *InterfaceEthernetResource) claimPort(config tfsdk.Config, diags *diag.D
 	if config.Raw.IsNull() || !config.Raw.IsKnown() {
 		return
 	}
-	var attrs map[string]tftypes.Value
-	if err := config.Raw.As(&attrs); err != nil {
+	// tftypes.Value.As hands back the Value's own attribute map, not a copy,
+	// so build a separate map rather than deleting from it: the request's
+	// Config must stay intact for the checks that run after this one.
+	var raw map[string]tftypes.Value
+	if err := config.Raw.As(&raw); err != nil {
 		diags.AddError("Unexpected configuration shape", err.Error())
 		return
 	}
-	portVal, ok := attrs["port"]
+	portVal, ok := raw["port"]
 	if !ok || portVal.IsNull() || !portVal.IsFullyKnown() {
 		return // the port is not known until apply; nothing to compare yet
 	}
@@ -263,8 +266,12 @@ func (r *InterfaceEthernetResource) claimPort(config tfsdk.Config, diags *diag.D
 		diags.AddError("Unexpected port value", err.Error())
 		return
 	}
-	delete(attrs, "port")
-	delete(attrs, "id")
+	attrs := make(map[string]tftypes.Value, len(raw))
+	for k, v := range raw {
+		if k != "port" && k != "id" {
+			attrs[k] = v
+		}
+	}
 
 	conflicts := r.ports.Claim(port, attrs)
 	if len(conflicts) == 0 {
