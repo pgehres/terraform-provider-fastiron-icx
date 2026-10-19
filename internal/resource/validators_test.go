@@ -1,8 +1,12 @@
 package resource
 
 import (
+	"context"
 	"regexp"
 	"testing"
+
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
 // These regexes are load-bearing security controls: they are what stands
@@ -120,5 +124,56 @@ func TestQuotePortName(t *testing.T) {
 		if got := quotePortName(tt.in); got != tt.want {
 			t.Errorf("quotePortName(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+// IPv4 validators require dotted-quad input: IPv4-mapped IPv6 forms pass
+// net.IP.To4 but would reach the CLI verbatim (or with an IPv6 mask).
+func TestIPv4Validators_RejectMappedIPv6(t *testing.T) {
+	run := func(v validator.String, in string) bool {
+		var resp validator.StringResponse
+		v.ValidateString(context.Background(), validator.StringRequest{ConfigValue: types.StringValue(in)}, &resp)
+		return !resp.Diagnostics.HasError()
+	}
+	for _, tt := range []struct {
+		in string
+		ok bool
+	}{
+		{"10.0.20.1", true},
+		{"::ffff:10.0.20.1", false},
+		{"::ffff:a00:1401", false},
+		{"2001:db8::1", false},
+		{"10.0.20.1/24", false},
+		{"10.0.20", false},
+		{"", false},
+	} {
+		if got := run(ipv4Validator{}, tt.in); got != tt.ok {
+			t.Errorf("ipv4Validator(%q) valid = %v, want %v", tt.in, got, tt.ok)
+		}
+	}
+	for _, tt := range []struct {
+		in string
+		ok bool
+	}{
+		{"10.0.20.5/24", true},
+		{"10.0.20.5/32", true},
+		{"::ffff:10.0.20.5/120", false},
+		{"::ffff:10.0.20.5/24", false},
+		{"2001:db8::5/64", false},
+		{"10.0.20.5/33", false},
+		{"10.0.20.5", false},
+	} {
+		if got := run(ipv4CIDRValidator{}, tt.in); got != tt.ok {
+			t.Errorf("ipv4CIDRValidator(%q) valid = %v, want %v", tt.in, got, tt.ok)
+		}
+	}
+
+	// The converter refuses a mapped prefix too, rather than emitting an
+	// IPv6 mask.
+	if got, err := cidrToAddressMask("::ffff:10.0.20.5/120"); err == nil {
+		t.Errorf("cidrToAddressMask(mapped) = %q, want an error", got)
+	}
+	if got, err := cidrToAddressMask("10.0.20.5/24"); err != nil || got != "10.0.20.5 255.255.255.0" {
+		t.Errorf("cidrToAddressMask = %q, %v", got, err)
 	}
 }
