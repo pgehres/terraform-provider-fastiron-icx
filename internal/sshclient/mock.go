@@ -31,6 +31,20 @@ type MockClient struct {
 	DisconnectBatches      [][]string
 	SeverOnDisconnectBatch bool
 	Disconnected           bool
+	// LoseSessionOnPromptChange makes ExecutePromptChanging fail the way the
+	// real client does when the prompt cannot be re-detected after a hostname
+	// change: the session is marked lost and every later call fails with
+	// ErrSessionLostAfterHostname.
+	LoseSessionOnPromptChange bool
+	lostErr                   error
+}
+
+// lostError mirrors Client.lostError. Must be called with mu held.
+func (m *MockClient) lostError() error {
+	if m.lostErr != nil {
+		return m.lostErr
+	}
+	return ErrSessionSevered
 }
 
 // NewMockClient creates a MockClient with the given running config.
@@ -46,6 +60,9 @@ func (m *MockClient) Execute(command string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.Disconnected {
+		return "", m.lostError()
+	}
 	m.Commands = append(m.Commands, command)
 
 	if err, ok := m.ErrorOnCommand[command]; ok {
@@ -61,6 +78,9 @@ func (m *MockClient) ExecuteInConfigMode(commands []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.Disconnected {
+		return m.lostError()
+	}
 	for _, cmd := range commands {
 		m.Commands = append(m.Commands, cmd)
 
@@ -76,11 +96,16 @@ func (m *MockClient) ExecutePromptChanging(command string) error {
 	defer m.mu.Unlock()
 
 	if m.Disconnected {
-		return ErrSessionSevered
+		return m.lostError()
 	}
 	m.Commands = append(m.Commands, command)
 	m.PromptChangingCommands = append(m.PromptChangingCommands, command)
 	m.PromptRedetects++
+	if m.LoseSessionOnPromptChange {
+		m.Disconnected = true
+		m.lostErr = ErrSessionLostAfterHostname
+		return fmt.Errorf("command %q: %w", command, ErrSessionLostAfterHostname)
+	}
 	if err, ok := m.ErrorOnCommand[command]; ok {
 		return fmt.Errorf("command %q: %w", command, err)
 	}
@@ -92,7 +117,7 @@ func (m *MockClient) ExecuteExpectingDisconnect(commands []string) error {
 	defer m.mu.Unlock()
 
 	if m.Disconnected {
-		return ErrSessionSevered
+		return m.lostError()
 	}
 	if len(commands) == 0 {
 		return nil
@@ -106,6 +131,7 @@ func (m *MockClient) ExecuteExpectingDisconnect(commands []string) error {
 	}
 	if m.SeverOnDisconnectBatch {
 		m.Disconnected = true
+		m.lostErr = ErrSessionSevered
 		return fmt.Errorf("after %q: %w", commands[len(commands)-1], ErrSessionSevered)
 	}
 	m.Commands = append(m.Commands, "end", "write memory")
@@ -118,7 +144,7 @@ func (m *MockClient) WriteMemory() error {
 	defer m.mu.Unlock()
 
 	if m.Disconnected {
-		return ErrSessionSevered
+		return m.lostError()
 	}
 	m.WriteMemoryCalls++
 	m.Commands = append(m.Commands, "write memory")
@@ -129,6 +155,9 @@ func (m *MockClient) GetRunningConfig() (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.Disconnected {
+		return "", m.lostError()
+	}
 	m.Commands = append(m.Commands, "show running-config")
 	return m.RunningConfig, nil
 }

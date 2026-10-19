@@ -263,3 +263,90 @@ func TestReadNewPromptShapes(t *testing.T) {
 		}
 	}
 }
+
+// anyPrompt is anchored, so a terminal control sequence printed in front of
+// the prompt must be stripped before matching — at connect time (detectPrompt)
+// and after a hostname change (readNewPrompt) alike — or detection times out.
+// Two-byte escapes must not take the first prompt character with them.
+func TestReadNewPromptStripsANSI(t *testing.T) {
+	tests := []struct {
+		name    string
+		printed string
+		base    string
+	}{
+		{"erase line", "\r\n\x1b[2KSSH@ICX7250-24 Router#", "SSH@ICX7250-24 Router"},
+		{"cursor and colour", "\r\n\x1b[?25h\x1b[0;1mSSH@lab-core Router(config)#", "SSH@lab-core Router"},
+		{"two-byte escape", "\r\n\x1b7SSH@ICX7150-C10ZP Switch#", "SSH@ICX7150-C10ZP Switch"},
+		{"charset designation", "\r\n\x1b(BSSH@sw1.lab Router#", "SSH@sw1.lab Router"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdin := &recordingStdin{}
+			c := promptClient(feed(tt.printed, false), stdin)
+			c.promptRegex, c.promptString = nil, ""
+			if err := c.detectPrompt(); err != nil {
+				t.Fatalf("detectPrompt: %v", err)
+			}
+			want := regexp.QuoteMeta(tt.base) + `\s*(?:\([^\)]*\))?[#>]\s*$`
+			if c.promptRegex.String() != want {
+				t.Errorf("regex = %q, want %q", c.promptRegex, want)
+			}
+			if strings.ContainsRune(c.promptString, '\x1b') || !strings.HasPrefix(c.promptString, tt.base) {
+				t.Errorf("promptString = %q, want it to start with %q and carry no escapes", c.promptString, tt.base)
+			}
+		})
+	}
+
+	// The same through the hostname path.
+	stdin := &recordingStdin{}
+	c := promptClient(feed("hostname lab-core\r\n\x1b[2KSSH@lab-core Router(config)#", false), stdin)
+	if err := c.ExecutePromptChanging("hostname lab-core"); err != nil {
+		t.Fatalf("ExecutePromptChanging: %v", err)
+	}
+	if !c.promptRegex.MatchString("SSH@lab-core Router#") {
+		t.Errorf("prompt regex %q does not match the new prompt", c.promptRegex)
+	}
+}
+
+// If the new prompt cannot be recognised after `hostname`, the switch may
+// already run under the new name: the session is marked lost and every later
+// call — WriteMemory first among them — fails fast with a clear cause and
+// sends nothing.
+func TestExecutePromptChangingTimeoutMarksSessionLost(t *testing.T) {
+	stdin := &recordingStdin{}
+	// Echo only; no prompt the client can recognise ever follows.
+	c := promptClient(feed("hostname lab-core\r\n", false), stdin)
+
+	err := c.ExecutePromptChanging("hostname lab-core")
+	if !errors.Is(err, ErrSessionLostAfterHostname) {
+		t.Fatalf("expected ErrSessionLostAfterHostname, got %v", err)
+	}
+	if !c.disconnected {
+		t.Fatal("client must be marked disconnected")
+	}
+	writes := len(stdin.writes)
+
+	start := time.Now()
+	for name, call := range map[string]func() error{
+		"WriteMemory":                func() error { return c.WriteMemory() },
+		"ExecuteInConfigMode":        func() error { return c.ExecuteInConfigMode([]string{"vlan 10"}) },
+		"Execute":                    func() error { _, err := c.Execute("show version"); return err },
+		"GetRunningConfig":           func() error { _, err := c.GetRunningConfig(); return err },
+		"ExecutePromptChanging":      func() error { return c.ExecutePromptChanging("hostname x") },
+		"ExecuteExpectingDisconnect": func() error { return c.ExecuteExpectingDisconnect([]string{"ip address 1.1.1.1 255.0.0.0"}) },
+	} {
+		err := call()
+		if !errors.Is(err, ErrSessionLostAfterHostname) {
+			t.Errorf("%s after a lost hostname change: got %v, want ErrSessionLostAfterHostname", name, err)
+		}
+		if errors.Is(err, ErrSessionSevered) {
+			t.Errorf("%s: a lost hostname session must not be reported as an (expected) IP-change severance", name)
+		}
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Error("a lost session must fail fast, not wait for the read timeout")
+	}
+	if len(stdin.writes) != writes {
+		t.Errorf("nothing may be sent once the session is lost, got %q", stdin.writes[writes:])
+	}
+}

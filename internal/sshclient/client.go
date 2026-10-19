@@ -35,6 +35,16 @@ var errDeadlineExceeded = errors.New("deadline exceeded")
 var ErrSessionSevered = errors.New("SSH session severed by a management address change; " +
 	"update the provider's host and run terraform again")
 
+// ErrSessionLostAfterHostname is returned (wrapped) when the prompt could not
+// be re-detected after a `hostname` command. The switch may or may not have
+// applied the new name, so the client can no longer tell where one command's
+// output ends — it is marked disconnected and every later command fails
+// immediately with this error rather than waiting out the read timeout each
+// time. Nothing after the hostname command, `write memory` included, is sent.
+var ErrSessionLostAfterHostname = errors.New("SSH session lost after a hostname change (the new prompt " +
+	"was not recognised); nothing after it was sent or saved — run terraform again to reconnect, then " +
+	"check the hostname and save with `write memory` if needed")
+
 // anyPrompt matches a FastIron prompt of any hostname and mode:
 // "SSH@ICX7250-24 Router#", "SSH@lab-sw.site Router(config)#", "ICX7150>" ...
 // The base portion (hostname plus optional "Router"/"Switch" word) is captured
@@ -54,7 +64,8 @@ type Client struct {
 	promptRegex  *regexp.Regexp
 	promptString string // The exact detected prompt (e.g., "ICX7250-24 Router#")
 	inConfigMode bool
-	disconnected bool // set once a session-severing command went through; see ErrSessionSevered
+	disconnected bool  // set once the session is known to be unusable; see markLost
+	lostErr      error // why; returned by every later call (ErrSessionSevered if unset)
 	options      Options
 }
 
@@ -432,14 +443,19 @@ func (c *Client) ExecutePromptChanging(command string) error {
 		return err
 	}
 	if c.disconnected {
-		return ErrSessionSevered
+		return c.lostError()
 	}
 	if _, err := fmt.Fprintf(c.stdin, "%s\n", command); err != nil {
 		return fmt.Errorf("write command: %w", err)
 	}
 	output, err := c.readNewPrompt()
 	if err != nil {
-		return fmt.Errorf("command %q: re-detect prompt: %w", command, err)
+		// The switch may already run under the new name: the old prompt regex
+		// is then useless and the shell is in an unknown mode. Mark the
+		// session lost so later calls (WriteMemory included) fail fast with a
+		// clear cause instead of each waiting out the timeout.
+		c.markLost(ErrSessionLostAfterHostname)
+		return fmt.Errorf("command %q: %w (re-detect prompt: %v)", command, ErrSessionLostAfterHostname, err)
 	}
 	output = stripEchoedCommand(sanitizeOutput(output), command)
 	if errMsg := detectCLIError(output); errMsg != "" {
@@ -483,7 +499,7 @@ func (c *Client) ExecuteExpectingDisconnect(commands []string) error {
 		c.inConfigMode = true
 	}
 	if c.disconnected {
-		return ErrSessionSevered
+		return c.lostError()
 	}
 
 	batch := append(append([]string{}, commands...), "end", "write memory")
@@ -497,7 +513,7 @@ func (c *Client) ExecuteExpectingDisconnect(commands []string) error {
 	for _, cmd := range batch {
 		output, err := c.readUntilPrompt()
 		if err != nil {
-			c.disconnected = true
+			c.markLost(ErrSessionSevered)
 			return fmt.Errorf("after %q: %w (%v)", cmd, ErrSessionSevered, err)
 		}
 		output = stripEchoedCommand(sanitizeOutput(output), cmd)
@@ -594,13 +610,29 @@ func (c *Client) checkControlCharacters(command string) error {
 	return nil
 }
 
+// markLost records that the session can no longer be used, and why. From
+// then on every command fails immediately with cause. Must be called with mu
+// held.
+func (c *Client) markLost(cause error) {
+	c.disconnected = true
+	c.lostErr = cause
+}
+
+// lostError is the error every call returns once the session was marked lost.
+func (c *Client) lostError() error {
+	if c.lostErr != nil {
+		return c.lostErr
+	}
+	return ErrSessionSevered
+}
+
 // execute sends a command and reads output until the prompt. Must be called with mu held.
 func (c *Client) execute(command string) (string, error) {
 	if err := c.checkControlCharacters(command); err != nil {
 		return "", err
 	}
 	if c.disconnected {
-		return "", ErrSessionSevered
+		return "", c.lostError()
 	}
 
 	// Send the command.
@@ -766,10 +798,13 @@ func (c *Client) readNewPrompt() (string, error) {
 
 		buf.WriteByte(b)
 
-		// Check the last line of the buffer for a prompt match.
+		// Check the last line of the buffer for a prompt match. anyPrompt is
+		// anchored, so terminal control sequences in front of the prompt (a
+		// line-erase, cursor or colour code) must be stripped first or the
+		// match never succeeds and detection times out.
 		content := buf.String()
 		lines := strings.Split(content, "\n")
-		lastLine := strings.TrimRight(lines[len(lines)-1], "\r ")
+		lastLine := strings.TrimRight(sanitizePromptLine(lines[len(lines)-1]), "\r ")
 		if m := anyPrompt.FindStringSubmatch(lastLine); m != nil {
 			// m[1] is the base portion, e.g., "SSH@ICX7250-24 Router"
 			c.promptString = strings.TrimSpace(lastLine)
@@ -783,6 +818,24 @@ func (c *Client) readNewPrompt() (string, error) {
 
 // ansiRegex matches ANSI escape sequences.
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b[^[\]].?`)
+
+// promptANSIRegex matches complete terminal control sequences precisely
+// enough to strip them from a prompt line without eating prompt characters:
+// CSI sequences including private modes ("\x1b[2K", "\x1b[?25h"), OSC
+// sequences ending in BEL, charset designations ("\x1b(B") and two-byte
+// escapes ("\x1b7", "\x1bM"). ansiRegex's catch-all `\x1b[^[\]].?` would
+// also swallow the character after a two-byte escape — the "S" of "SSH@" —
+// which is harmless in command output but would corrupt the detected prompt.
+// An incomplete sequence is left alone, so byte-by-byte matching simply waits
+// for the rest of it.
+var promptANSIRegex = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()#][0-9A-Za-z]|\x1b[^\[\]()#]`)
+
+// sanitizePromptLine strips terminal control sequences and carriage returns
+// from a candidate prompt line before it is matched against anyPrompt.
+func sanitizePromptLine(s string) string {
+	s = promptANSIRegex.ReplaceAllString(s, "")
+	return carriageReturnRegex.ReplaceAllString(s, "")
+}
 
 // carriageReturnRegex matches carriage returns (often paired with newlines in terminal output).
 var carriageReturnRegex = regexp.MustCompile(`\r`)
