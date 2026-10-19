@@ -187,6 +187,7 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 		Client:   client,
 		Username: username,
 		Dialect:  dialect.Detect("", parser.ImageTypeUnknown),
+		Ports:    providerdata.NewPortRegistry(),
 	}
 
 	// Detect the firmware dialect (release + image type) once per provider

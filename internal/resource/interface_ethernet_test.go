@@ -216,18 +216,20 @@ func TestInterfaceEthernetRead_NonDualModePortsUnchanged(t *testing.T) {
 	}
 }
 
-// A tag_all_vlans trunk keeps tagged_vlans untouched on Read (existing
-// behavior) but still gets its untagged VLAN from dual-mode.
+// A tag_all_vlans trunk on dual-mode firmware: the dual-mode VLAN is the
+// untagged VLAN, excluded from the expansion, so a full trunk reads clean —
+// tagged_vlans untouched and tag_all_vlans intact.
 func TestInterfaceEthernetRead_DualModeWithTagAll(t *testing.T) {
-	got := readEth(t, "6430-c12", "1/2/1", true)
+	// 6450 1/1/12: dual-mode 102, tagged in every other VLAN.
+	got := readEth(t, "6450-c12pd", "1/1/12", true)
 	if got.UntaggedVLAN.ValueInt64() != 102 {
 		t.Errorf("untagged_vlan = %v, want 102", got.UntaggedVLAN)
 	}
 	if !got.TaggedVLANs.IsNull() {
-		t.Errorf("tagged_vlans must be left alone with tag_all_vlans, got %v", got.TaggedVLANs)
+		t.Errorf("tagged_vlans must be left alone on a full tag_all_vlans trunk, got %v", got.TaggedVLANs)
 	}
 	if !got.TagAllVLANs.ValueBool() {
-		t.Error("tag_all_vlans must survive Read")
+		t.Error("tag_all_vlans must survive Read on a full trunk")
 	}
 }
 
