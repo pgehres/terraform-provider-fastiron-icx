@@ -2,8 +2,12 @@ package sshclient
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"net"
+	"os"
 	"testing"
+	"time"
 )
 
 // scriptedConn is a one-shot io.ReadWriteCloser: Read serves the scripted
@@ -56,7 +60,7 @@ func TestTelnetDecodeRefusesEveryOption(t *testing.T) {
 	}
 	for _, chunk := range []int{0, 1, 2} { // whole, byte-by-byte, odd splits
 		conn := newScriptedConn(raw, chunk)
-		tc := newTelnetConn(conn)
+		tc := newTelnetConn(conn, 0)
 		if got := drain(t, tc); string(got) != "ok" {
 			t.Errorf("chunk %d: data = %q, want %q", chunk, got, "ok")
 		}
@@ -78,7 +82,7 @@ func TestTelnetDecodeEscapesAndSubnegotiation(t *testing.T) {
 	}
 	for _, chunk := range []int{0, 1, 3} {
 		conn := newScriptedConn(raw, chunk)
-		got := drain(t, newTelnetConn(conn))
+		got := drain(t, newTelnetConn(conn, 0))
 		if want := []byte{'a', 0xff, 'b', 'c', 'd'}; !bytes.Equal(got, want) {
 			t.Errorf("chunk %d: data = % x, want % x", chunk, got, want)
 		}
@@ -92,7 +96,7 @@ func TestTelnetDecodeEscapesAndSubnegotiation(t *testing.T) {
 // negotiation keeps going until data or an error arrives.
 func TestTelnetReadSkipsPureNegotiation(t *testing.T) {
 	raw := []byte{telnetIAC, telnetDO, 24, telnetIAC, telnetWILL, 1, 'p', 'r', 'o', 'm', 'p', 't', '>'}
-	tc := newTelnetConn(newScriptedConn(raw, 3))
+	tc := newTelnetConn(newScriptedConn(raw, 3), 0)
 	buf := make([]byte, 1)
 	n, err := tc.Read(buf)
 	if err != nil || n != 1 || buf[0] != 'p' {
@@ -100,16 +104,17 @@ func TestTelnetReadSkipsPureNegotiation(t *testing.T) {
 	}
 }
 
+// Lines go out with a bare LF, as telnetlib sends them: a CR LF can be taken
+// as two Enters and shift every later read by one prompt.
 func TestTelnetWriteNVT(t *testing.T) {
 	tests := []struct{ in, want string }{
-		{"show version\n", "show version\r\n"},
-		{"already\r\nterminated\r\n", "already\r\nterminated\r\n"},
+		{"show version\n", "show version\n"},
 		{"a\xffb", "a\xff\xffb"},
-		{"\n\n", "\r\n\r\n"},
+		{"\n\n", "\n\n"},
 	}
 	for _, tt := range tests {
 		conn := newScriptedConn(nil, 0)
-		tc := newTelnetConn(conn)
+		tc := newTelnetConn(conn, 0)
 		n, err := tc.Write([]byte(tt.in))
 		if err != nil || n != len(tt.in) {
 			t.Errorf("Write(%q) = (%d, %v)", tt.in, n, err)
@@ -122,8 +127,47 @@ func TestTelnetWriteNVT(t *testing.T) {
 
 func TestTelnetCloseClosesConn(t *testing.T) {
 	conn := newScriptedConn(nil, 0)
-	tc := newTelnetConn(conn)
+	tc := newTelnetConn(conn, 0)
 	if err := tc.Close(); err != nil || !conn.closed {
 		t.Fatalf("Close = %v, closed = %v", err, conn.closed)
+	}
+}
+
+// RFC 854 CR NUL: the NUL is padding and must not reach the session layer,
+// including when CR and NUL arrive in different reads. A NUL anywhere else
+// is left alone.
+func TestTelnetDecodeDropsNULAfterCR(t *testing.T) {
+	raw := []byte("a\r\x00b\r\nc\x00d\r")
+	raw = append(raw, 0, 'e')
+	for _, chunk := range []int{0, 1, 2, 3} {
+		got := drain(t, newTelnetConn(newScriptedConn(raw, chunk), 0))
+		if want := "a\rb\r\nc\x00d\re"; string(got) != want {
+			t.Errorf("chunk %d: data = %q, want %q", chunk, got, want)
+		}
+	}
+}
+
+// A peer that stops reading must not hang a write past the session timeout.
+func TestTelnetWriteDeadline(t *testing.T) {
+	client, server := net.Pipe() // writes block until the other end reads
+	defer func() { _ = server.Close() }()
+	tc := newTelnetConn(client, 100*time.Millisecond)
+	defer func() { _ = tc.Close() }()
+
+	done := make(chan error, 1)
+	go func() { _, err := tc.Write([]byte("show version\n")); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Write error = %v, want a deadline error", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Write blocked past its deadline")
+	}
+
+	// Negotiation replies, written from the read side, are bounded too.
+	tc2 := newTelnetConn(client, 100*time.Millisecond)
+	if _, err := tc2.decode([]byte{telnetIAC, telnetDO, 24}, make([]byte, 3)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("negotiation reply error = %v, want a deadline error", err)
 	}
 }

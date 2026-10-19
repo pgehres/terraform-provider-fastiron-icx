@@ -22,7 +22,11 @@ func main() {
 	transport := flag.String("transport", sshclient.TransportSSH,
 		"CLI transport: ssh or telnet (FASTIRON_TRANSPORT). Telnet is PLAINTEXT and unauthenticated — lab and "+
 			"competition switches that expose no SSH only; this tool connects exactly as the provider does with "+
-			"transport = \"telnet\" and insecure_transport_ack = true.")
+			"transport = \"telnet\" and insecure_transport_ack = true, and like the provider refuses telnet without "+
+			"-insecure-transport-ack (or FASTIRON_INSECURE_TRANSPORT_ACK=true).")
+	insecureAck := flag.Bool("insecure-transport-ack", false,
+		"acknowledge that -transport telnet is plaintext and unauthenticated (the provider's insecure_transport_ack); "+
+			"FASTIRON_INSECURE_TRANSPORT_ACK=true is equivalent. Required with telnet.")
 	allowEmpty := flag.Bool("allow-empty-credentials", false,
 		"permit empty FASTIRON_USERNAME / FASTIRON_PASSWORD / FASTIRON_ENABLE_PASSWORD, as a factory-fresh switch "+
 			"with no local users accepts (the provider's allow_empty_credentials).")
@@ -96,6 +100,12 @@ func main() {
 			opts.InsecureSkipHostKeyVerify = true
 		}
 	case sshclient.TransportTelnet:
+		if !*insecureAck && os.Getenv("FASTIRON_INSECURE_TRANSPORT_ACK") != "true" {
+			fmt.Fprintln(os.Stderr, "refusing telnet: it sends credentials and configuration in PLAINTEXT and does not verify "+
+				"the switch's identity. Pass -insecure-transport-ack or set FASTIRON_INSECURE_TRANSPORT_ACK=true to acknowledge "+
+				"this (the provider's insecure_transport_ack).")
+			os.Exit(1)
+		}
 		fmt.Fprintln(os.Stderr, "WARNING: telnet transport — credentials and configuration cross the network in plaintext, "+
 			"and the switch's identity is not verified")
 	default:

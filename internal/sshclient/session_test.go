@@ -1,6 +1,7 @@
 package sshclient
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -29,6 +30,19 @@ type fakeSwitch struct {
 	enablePrompts        bool   // `enable` asks "Password:" (answer in enablePass)
 	enablePass           string
 	runningConfig        string
+
+	// Login prompt wording; defaults "User Name:" / "Password:". banner is
+	// written before the first login prompt.
+	userPrompt, passPrompt, banner string
+
+	// Desync hazards a real switch might present.
+	crlfSeparate  bool            // CR and LF are each an Enter (readLoop emits a line for both)
+	noEcho        bool            // commands are not echoed back
+	extraInitial  bool            // the first prompt is printed twice
+	strayAfter    map[string]bool // after these commands, print one extra prompt...
+	strayDeferred bool            // ...only once the next command has arrived (else immediately)
+	strayPending  bool
+	crReceived    int // CR bytes received outside telnet negotiation
 
 	lines chan string
 
@@ -72,31 +86,58 @@ func (f *fakeSwitch) run() {
 			telnetIAC, 241, // NOP
 		}))
 	}
+	if f.banner != "" {
+		f.write(f.banner)
+	}
 	if f.loginUser != "" {
-		f.write("\r\nUser Name:")
+		userPrompt, passPrompt := f.userPrompt, f.passPrompt
+		if userPrompt == "" {
+			userPrompt = "User Name:"
+		}
+		if passPrompt == "" {
+			passPrompt = "Password:"
+		}
+		f.write("\r\n" + userPrompt)
 		if got := f.next(); got != f.loginUser {
-			f.write("\r\nLogin failed\r\nUser Name:")
+			f.write("\r\nLogin failed\r\n" + userPrompt)
 			return // a rejected login re-prompts; the client must not answer again
 		}
-		f.write("\r\nPassword:")
+		f.write("\r\n" + passPrompt)
 		if got := f.next(); got != f.loginPass {
-			f.write("\r\nLogin failed\r\nUser Name:")
+			f.write("\r\nLogin failed\r\n" + userPrompt)
 			return
 		}
 	}
 	f.privileged = !f.userMode
 	f.write("\r\n" + f.prompt())
+	if f.extraInitial {
+		f.write("\r\n" + f.prompt())
+	}
 
 	for cmd := range f.lines {
 		f.mu.Lock()
 		f.received = append(f.received, cmd)
 		f.mu.Unlock()
+		if f.strayPending {
+			f.strayPending = false
+			f.write("\r\n" + f.prompt())
+		}
 		f.handle(cmd)
+		if f.strayAfter[cmd] {
+			if f.strayDeferred {
+				f.strayPending = true
+			} else {
+				f.write("\r\n" + f.prompt())
+			}
+		}
 	}
 }
 
 func (f *fakeSwitch) handle(cmd string) {
 	echo := cmd + "\r\n"
+	if f.noEcho {
+		echo = "\r\n"
+	}
 	switch {
 	case cmd == "":
 		f.write("\r\n" + f.prompt())
@@ -160,7 +201,8 @@ func (f *fakeSwitch) next() string {
 }
 
 // readLoop splits the client's bytes into CR/LF-terminated lines and telnet
-// negotiation triples.
+// negotiation triples. With crlfSeparate, CR and LF each end a line — a
+// switch that treats them as two Enters — so a CR LF yields an extra "".
 func (f *fakeSwitch) readLoop() {
 	defer close(f.lines)
 	buf := make([]byte, 1)
@@ -182,9 +224,20 @@ func (f *fakeSwitch) readLoop() {
 			}
 		case b == telnetIAC:
 			iac = []byte{b}
+		case b == '\r' && f.crlfSeparate:
+			f.mu.Lock()
+			f.crReceived++
+			f.mu.Unlock()
+			f.lines <- string(line)
+			line = nil
 		case b == '\n':
 			f.lines <- strings.TrimRight(string(line), "\r")
 			line = nil
+		case b == '\r':
+			f.mu.Lock()
+			f.crReceived++
+			f.mu.Unlock()
+			line = append(line, b)
 		default:
 			line = append(line, b)
 		}
@@ -260,7 +313,7 @@ func TestTelnetSessionNoCredentials(t *testing.T) {
 		t.Errorf("CLI error not detected over telnet: %v", err)
 	}
 
-	want := []string{"enable", "", "skip-page-display", "show running-config", "configure terminal", "vlan 10", "name servers", "end", "write memory", "configure terminal", "bogus command"}
+	want := []string{"enable", "", "skip-page-display", "", "show running-config", "configure terminal", "vlan 10", "name servers", "end", "write memory", "configure terminal", "bogus command"}
 	if got := f.sent(); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("switch received %q\nwant %q", got, want)
 	}
@@ -381,5 +434,216 @@ func TestAuthMethodsGatedOnOptIn(t *testing.T) {
 	}
 	if n := len(authMethods(Options{AllowEmptyCredentials: true})); n != 2 {
 		t.Errorf("opt-in must add keyboard-interactive, got %d methods", n)
+	}
+}
+
+// telnetFake is a no-login, privileged telnet switch.
+func telnetFake(t *testing.T) *fakeSwitch {
+	f := newFakeSwitch(t)
+	f.telnet = true
+	return f
+}
+
+// runDialogue drives a representative command sequence and checks every
+// command got its own output.
+func runDialogue(t *testing.T, c *Client) {
+	t.Helper()
+	cfg, err := c.GetRunningConfig()
+	if err != nil {
+		t.Fatalf("GetRunningConfig: %v", err)
+	}
+	if !strings.Contains(cfg, "vlan 1 name DEFAULT-VLAN by port") {
+		t.Errorf("GetRunningConfig returned %q, not the running config", cfg)
+	}
+	out, err := c.Execute("show version")
+	if err != nil {
+		t.Fatalf("Execute(show version): %v", err)
+	}
+	if !strings.HasPrefix(out, "SW: Version 08.0.95qT213") {
+		t.Errorf("show version returned %q", out)
+	}
+	if err := c.ExecuteInConfigMode([]string{"vlan 10", "name servers"}); err != nil {
+		t.Fatalf("ExecuteInConfigMode: %v", err)
+	}
+	if err := c.WriteMemory(); err != nil {
+		t.Fatalf("WriteMemory: %v", err)
+	}
+	out, err = c.Execute("show version")
+	if err != nil || !strings.HasPrefix(out, "SW: Version") {
+		t.Errorf("show version after config = (%q, %v)", out, err)
+	}
+}
+
+// Regression: a switch that treats CR and LF as two separate Enters. With a
+// CR LF line ending every command produced two prompts and every later read
+// returned the previous command's output (GetRunningConfig returned the
+// skip-page-display output, then show version returned ""). The client sends
+// a bare LF, so each command is one Enter and stays matched to its output.
+func TestTelnetCRLFSeparateEntersStayInSync(t *testing.T) {
+	f := telnetFake(t)
+	f.crlfSeparate = true
+
+	c, err := connectFake(t, f, Options{Transport: TransportTelnet, AllowEmptyCredentials: true})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	runDialogue(t, c)
+
+	f.mu.Lock()
+	crs := f.crReceived
+	f.mu.Unlock()
+	if crs != 0 {
+		t.Errorf("client sent %d CR bytes; telnet lines must end in a bare LF", crs)
+	}
+	want := []string{"", "skip-page-display", "", "show running-config", "show version", "configure terminal", "vlan 10", "name servers", "end", "write memory", "show version"}
+	if got := f.sent(); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("switch received %q\nwant %q", got, want)
+	}
+}
+
+// Stray prompts printed at connect are drained before the prompt probe and
+// the first command, so start-up cannot begin out of step.
+func TestTelnetExtraInitialPromptDrained(t *testing.T) {
+	f := telnetFake(t)
+	f.extraInitial = true
+
+	c, err := connectFake(t, f, Options{Transport: TransportTelnet, AllowEmptyCredentials: true})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if c.telnetEcho != echoOn {
+		t.Errorf("echo mode = %v, want learned on from skip-page-display", c.telnetEcho)
+	}
+	runDialogue(t, c)
+}
+
+// A stray prompt that is already waiting when the next command is sent cannot
+// be its answer, and is dropped before the command goes out.
+func TestTelnetPendingStrayPromptDropped(t *testing.T) {
+	f := telnetFake(t)
+	f.strayAfter = map[string]bool{"show running-config": true}
+
+	c, err := connectFake(t, f, Options{Transport: TransportTelnet, AllowEmptyCredentials: true})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.GetRunningConfig(); err != nil {
+		t.Fatalf("GetRunningConfig: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond) // let the stray prompt arrive
+	out, err := c.Execute("show version")
+	if err != nil || !strings.HasPrefix(out, "SW: Version") {
+		t.Fatalf("show version = (%q, %v), want its own output", out, err)
+	}
+}
+
+// A stray prompt that arrives only after the next command was sent shifts
+// the read. The client must fail loudly instead of returning the wrong
+// command's output, and refuse every later command.
+func TestTelnetDesyncFailsLoudly(t *testing.T) {
+	f := telnetFake(t)
+	f.strayAfter = map[string]bool{"show running-config": true}
+	f.strayDeferred = true
+
+	c, err := connectFake(t, f, Options{Transport: TransportTelnet, AllowEmptyCredentials: true})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.GetRunningConfig(); err != nil {
+		t.Fatalf("GetRunningConfig: %v", err)
+	}
+	out, err := c.Execute("show version")
+	if !errors.Is(err, ErrTelnetOutOfSync) || !strings.Contains(err.Error(), "telnet session out of sync") {
+		t.Fatalf("Execute = (%q, %v), want ErrTelnetOutOfSync", out, err)
+	}
+	if out != "" {
+		t.Errorf("out-of-sync Execute returned data %q", out)
+	}
+	if err := c.ExecuteInConfigMode([]string{"vlan 30"}); !errors.Is(err, ErrTelnetOutOfSync) {
+		t.Errorf("later command: got %v, want ErrTelnetOutOfSync", err)
+	}
+	if contains(f.sent(), "vlan 30") {
+		t.Error("nothing may be sent after the session went out of sync")
+	}
+}
+
+// A switch that does not echo commands still works: the echo check is
+// learned off and the drains alone guard the session.
+func TestTelnetNoEchoSwitch(t *testing.T) {
+	f := telnetFake(t)
+	f.noEcho = true
+
+	c, err := connectFake(t, f, Options{Transport: TransportTelnet, AllowEmptyCredentials: true})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if c.telnetEcho != echoOff {
+		t.Errorf("echo mode = %v, want off", c.telnetEcho)
+	}
+	runDialogue(t, c)
+}
+
+// Older Foundry/FastIron login wording, behind a banner whose "Last login:"
+// line must not be mistaken for the username prompt.
+func TestTelnetLegacyLoginPrompts(t *testing.T) {
+	f := telnetFake(t)
+	f.loginUser, f.loginPass = "admin", "s3cret"
+	f.userPrompt, f.passPrompt = "Please Enter Login Name:", "Please Enter Password:"
+	f.banner = "\r\nLast login: never\r\nWelcome\r\n"
+
+	c, err := connectFake(t, f, Options{Transport: TransportTelnet, Username: "admin", Password: "s3cret"})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if out, err := c.Execute("show version"); err != nil || !strings.HasPrefix(out, "SW: Version") {
+		t.Errorf("show version = (%q, %v)", out, err)
+	}
+}
+
+func TestLoginPromptPatterns(t *testing.T) {
+	for _, l := range []string{"User Name:", "Username:", "login:", "Please Enter Login Name:", "LOGIN NAME: "} {
+		if !usernamePrompt.MatchString(l) {
+			t.Errorf("%q not recognised as a username prompt", l)
+		}
+	}
+	for _, l := range []string{"Password:", "Please Enter Password:", "password : "} {
+		if !passwordPrompt.MatchString(l) {
+			t.Errorf("%q not recognised as a password prompt", l)
+		}
+	}
+	for _, l := range []string{"Your password: is about to expire soon", "name: x"} {
+		if usernamePrompt.MatchString(l) || passwordPrompt.MatchString(l) {
+			t.Errorf("%q must not be taken for a prompt", l)
+		}
+	}
+}
+
+// Credentials are written raw to a telnet login, so control characters are
+// refused before anything is sent — and the value never appears in the error.
+func TestTelnetRejectsControlCharactersInCredentials(t *testing.T) {
+	for name, opts := range map[string]Options{
+		"username":        {Username: "ad\nmin", Password: "pw"},
+		"password":        {Username: "admin", Password: "pw\rconfigure terminal"},
+		"enable password": {Username: "admin", Password: "pw", EnablePassword: "x\x7f"},
+	} {
+		clientConn, serverConn := net.Pipe()
+		opts.Transport, opts.TimeoutSeconds = TransportTelnet, 1
+		_, err := newTelnetSession(clientConn, opts)
+		_ = serverConn.Close()
+		if err == nil || !strings.Contains(err.Error(), name+" contains control characters") {
+			t.Errorf("%s: got %v", name, err)
+			continue
+		}
+		for _, secret := range []string{opts.Username, opts.Password, opts.EnablePassword} {
+			if secret != "" && hasControlCharacters(secret) && strings.Contains(err.Error(), secret) {
+				t.Errorf("%s: error leaks the value: %v", name, err)
+			}
+		}
 	}
 }

@@ -1,10 +1,14 @@
 package provider
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
 )
 
@@ -144,5 +148,72 @@ func TestResolveConnectionAckOverSSHWarns(t *testing.T) {
 	_, diags := resolveConnection(s)
 	if diags.HasError() || !hasSummary(diags, diag.SeverityWarning, "no effect over SSH") {
 		t.Errorf("diags = %v", diags)
+	}
+}
+
+// Existing SSH users see the pre-telnet wording for missing credentials; the
+// empty-credentials hint is a separate sentence after it.
+func TestResolveConnectionMissingCredentialWording(t *testing.T) {
+	for _, tt := range []struct {
+		mutate func(*connectionSettings)
+		prefix string
+	}{
+		{func(s *connectionSettings) { s.Username = "" }, "The username must be set in the provider configuration or the FASTIRON_USERNAME environment variable."},
+		{func(s *connectionSettings) { s.Password = "" }, "The password must be set in the provider configuration or the FASTIRON_PASSWORD environment variable."},
+	} {
+		s := sshSettings()
+		tt.mutate(&s)
+		_, diags := resolveConnection(s)
+		if len(diags) != 1 || !strings.HasPrefix(diags[0].Detail(), tt.prefix+" ") {
+			t.Errorf("diags = %v, want a detail starting with %q", diags, tt.prefix)
+		}
+	}
+}
+
+// Control characters in credentials are refused (environment values reach
+// resolveConnection unvalidated), and the value never appears in the message.
+func TestResolveConnectionRejectsControlCharacters(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		mutate func(*connectionSettings)
+	}{
+		{"username", func(s *connectionSettings) { s.Username = "zq\nxv" }},
+		{"password", func(s *connectionSettings) { s.Password = "kj\rwy" }},
+		{"enable_password", func(s *connectionSettings) { s.EnablePassword = "qp\x7fzz" }},
+	} {
+		s := sshSettings()
+		tt.mutate(&s)
+		_, diags := resolveConnection(s)
+		if !hasSummary(diags, diag.SeverityError, "Invalid "+tt.name) {
+			t.Errorf("%s: errors = %v", tt.name, summaries(diags, diag.SeverityError))
+		}
+		for _, d := range diags {
+			for _, secret := range []string{"zq\nxv", "kj\rwy", "qp\x7fzz", "zq", "xv", "kj", "wy", "qp", "zz"} {
+				if strings.Contains(d.Detail(), secret) || strings.Contains(d.Summary(), secret) {
+					t.Errorf("%s: diagnostic leaks the value: %q", tt.name, d.Detail())
+				}
+			}
+		}
+	}
+}
+
+func TestNoControlCharactersValidator(t *testing.T) {
+	for value, wantErr := range map[string]bool{"admin": false, "p@ss w0rd!": false, "": false, "a\nb": true, "a\tb": true, "a\x7f": true} {
+		req := validator.StringRequest{Path: path.Root("password"), ConfigValue: types.StringValue(value)}
+		var resp validator.StringResponse
+		noControlCharacters{}.ValidateString(context.Background(), req, &resp)
+		if resp.Diagnostics.HasError() != wantErr {
+			t.Errorf("%q: error = %v, want %v", value, resp.Diagnostics.HasError(), wantErr)
+		}
+		for _, d := range resp.Diagnostics {
+			if value != "" && strings.Contains(d.Detail(), value) {
+				t.Errorf("%q: diagnostic leaks the value", value)
+			}
+		}
+	}
+	var resp validator.StringResponse
+	noControlCharacters{}.ValidateString(context.Background(), validator.StringRequest{Path: path.Root("password"), ConfigValue: types.StringNull()}, &resp)
+	if resp.Diagnostics.HasError() {
+		t.Error("null must pass")
 	}
 }

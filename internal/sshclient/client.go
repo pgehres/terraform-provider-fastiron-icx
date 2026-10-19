@@ -32,7 +32,7 @@ var errDeadlineExceeded = errors.New("deadline exceeded")
 // command on the client fails immediately with it instead of waiting out the
 // read timeout, so an apply that continues past the change fails fast with a
 // clear cause.
-var ErrSessionSevered = errors.New("SSH session severed by a management address change; " +
+var ErrSessionSevered = errors.New("session severed by a management address change; " +
 	"update the provider's host and run terraform again")
 
 // ErrSessionLostAfterHostname is returned (wrapped) when the prompt could not
@@ -41,9 +41,17 @@ var ErrSessionSevered = errors.New("SSH session severed by a management address 
 // output ends — it is marked disconnected and every later command fails
 // immediately with this error rather than waiting out the read timeout each
 // time. Nothing after the hostname command, `write memory` included, is sent.
-var ErrSessionLostAfterHostname = errors.New("SSH session lost after a hostname change (the new prompt " +
+var ErrSessionLostAfterHostname = errors.New("session lost after a hostname change (the new prompt " +
 	"was not recognised); nothing after it was sent or saved — run terraform again to reconnect, then " +
 	"check the hostname and save with `write memory` if needed")
+
+// ErrTelnetOutOfSync is returned (wrapped) when a telnet command's output does
+// not begin with the echo of that command — the sign that a stray prompt has
+// shifted the session so that every read returns the previous command's
+// output. The session is marked lost: failing loudly is the only safe answer,
+// because returning the shifted output would hand resources the wrong data.
+var ErrTelnetOutOfSync = errors.New("telnet session out of sync: a command's output did not start with its echo, " +
+	"so it may belong to an earlier command; nothing more was sent — run terraform again to reconnect")
 
 // anyPrompt matches a FastIron prompt of any hostname and mode:
 // "SSH@ICX7250-24 Router#", "SSH@lab-sw.site Router(config)#", "ICX7150>" ...
@@ -71,7 +79,28 @@ type Client struct {
 	disconnected   bool  // set once the session is known to be unusable; see markLost
 	lostErr        error // why; returned by every later call (ErrSessionSevered if unset)
 	options        Options
+
+	// Telnet-only desync defences; all inert over SSH (telnet is false).
+	telnet     bool
+	telnetEcho echoMode // whether the switch echoes commands, learned from the first one
 }
+
+// echoMode records whether a telnet switch echoes the commands it is sent.
+// It is learned from the first command run through execute (skip-page-display,
+// on a freshly drained session) and decides whether every later command's
+// echo can be verified.
+type echoMode int
+
+const (
+	echoUnknown echoMode = iota
+	echoOn
+	echoOff
+)
+
+// telnetQuietWindow is how long a telnet session must stay silent before a
+// drain considers the switch done talking. A switch answers an Enter in
+// milliseconds, so any stray prompt arrives well within it.
+var telnetQuietWindow = 250 * time.Millisecond
 
 // Connect opens a session over the transport named in opts.Transport ("ssh",
 // the default when empty, or "telnet") and returns a ready-to-use Client.
@@ -266,9 +295,19 @@ func (c *Client) start(initialOutput string) error {
 		}
 	}
 
+	// Over telnet, absorb anything still arriving (a second login prompt, a
+	// banner repeated per line ending) so the prompt probe's answer is the
+	// next thing read. Inert over SSH.
+	if err := c.drainQuietIfTelnet(); err != nil {
+		return err
+	}
+
 	// Build the prompt regex now that we're in privileged mode.
 	if err := c.detectPrompt(); err != nil {
 		return fmt.Errorf("detect prompt: %w", err)
+	}
+	if err := c.drainQuietIfTelnet(); err != nil {
+		return err
 	}
 
 	// Disable paging and verify the command succeeded.
@@ -519,6 +558,9 @@ func (c *Client) ExecutePromptChanging(command string) error {
 	if c.disconnected {
 		return c.lostError()
 	}
+	if err := c.drainPendingIfTelnet(); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintf(c.stdin, "%s\n", command); err != nil {
 		return fmt.Errorf("write command: %w", err)
 	}
@@ -530,6 +572,9 @@ func (c *Client) ExecutePromptChanging(command string) error {
 		// clear cause instead of each waiting out the timeout.
 		c.markLost(ErrSessionLostAfterHostname)
 		return fmt.Errorf("command %q: %w (re-detect prompt: %v)", command, ErrSessionLostAfterHostname, err)
+	}
+	if err := c.verifyEchoIfTelnet(sanitizeOutput(output), command); err != nil {
+		return err
 	}
 	output = stripEchoedCommand(sanitizeOutput(output), command)
 	if errMsg := detectCLIError(output); errMsg != "" {
@@ -576,6 +621,9 @@ func (c *Client) ExecuteExpectingDisconnect(commands []string) error {
 		return c.lostError()
 	}
 
+	if err := c.drainPendingIfTelnet(); err != nil {
+		return err
+	}
 	batch := append(append([]string{}, commands...), "end", "write memory")
 	if _, err := io.WriteString(c.stdin, strings.Join(batch, "\n")+"\n"); err != nil {
 		return fmt.Errorf("write command batch: %w", err)
@@ -589,6 +637,9 @@ func (c *Client) ExecuteExpectingDisconnect(commands []string) error {
 		if err != nil {
 			c.markLost(ErrSessionSevered)
 			return fmt.Errorf("after %q: %w (%v)", cmd, ErrSessionSevered, err)
+		}
+		if err := c.verifyEchoIfTelnet(sanitizeOutput(output), cmd); err != nil {
+			return err
 		}
 		output = stripEchoedCommand(sanitizeOutput(output), cmd)
 		if errMsg := detectCLIError(output); errMsg != "" && cliErr == nil {
@@ -673,12 +724,21 @@ func (c *Client) Close() error {
 // (including DEL) — defense-in-depth against CLI injection via embedded
 // newlines, carriage returns, or other controls.
 func (c *Client) checkControlCharacters(command string) error {
-	for _, b := range []byte(command) {
-		if b < 0x20 || b == 0x7f {
-			return fmt.Errorf("command contains control characters and was not sent")
-		}
+	if hasControlCharacters(command) {
+		return fmt.Errorf("command contains control characters and was not sent")
 	}
 	return nil
+}
+
+// hasControlCharacters reports whether s contains a control character
+// (0x00-0x1f) or DEL.
+func hasControlCharacters(s string) bool {
+	for _, b := range []byte(s) {
+		if b < 0x20 || b == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 // markLost records that the session can no longer be used, and why. From
@@ -705,6 +765,9 @@ func (c *Client) execute(command string) (string, error) {
 	if c.disconnected {
 		return "", c.lostError()
 	}
+	if err := c.drainPendingIfTelnet(); err != nil {
+		return "", err
+	}
 
 	// Send the command.
 	if _, err := fmt.Fprintf(c.stdin, "%s\n", command); err != nil {
@@ -719,6 +782,10 @@ func (c *Client) execute(command string) (string, error) {
 
 	// Strip ANSI escape codes and terminal artifacts.
 	output = sanitizeOutput(output)
+
+	if err := c.verifyEchoIfTelnet(output, command); err != nil {
+		return "", err
+	}
 
 	// Strip the echoed command from the beginning of output.
 	output = stripEchoedCommand(output, command)
@@ -767,13 +834,20 @@ func (c *Client) readUntilPrompt() (string, error) {
 var initialPrompt = regexp.MustCompile(`[\w@\-]+(?:\s+\w+)?\s*[#>]\s*$`)
 
 // Login prompts a telnet session may print before the CLI prompt: FastIron
-// asks "User Name:" / "Password:" when local or AAA login is configured and
-// prints nothing at all when it is not. Matched on the current line only,
-// anchored, so a banner sentence mentioning a password is not mistaken for
-// one.
+// asks "User Name:" / "Password:" when local or AAA login is configured (older
+// Foundry/FastIron releases "Please Enter Login Name:" / "Please Enter
+// Password:") and prints nothing at all when it is not. Matched
+// case-insensitively on the end of the current, still unterminated line, so
+// any wording ending in "name:", "login:" or "password:" is answered, while a
+// banner sentence that merely mentions a password (and is followed by a line
+// break or more text) is not.
 var (
-	usernamePrompt = regexp.MustCompile(`(?i)^\s*(?:user\s?name|login|username)\s*:\s*$`)
-	passwordPrompt = regexp.MustCompile(`(?i)^\s*password\s*:\s*$`)
+	// loginPromptSettle is how long a candidate login prompt must stand
+	// without further output before it is answered.
+	loginPromptSettle = 150 * time.Millisecond
+
+	usernamePrompt = regexp.MustCompile(`(?i)(?:name|login)\s*:\s*$`)
+	passwordPrompt = regexp.MustCompile(`(?i)password\s*:\s*$`)
 )
 
 // readUntilPromptInitial reads until we see either > or # at the end of a
@@ -787,9 +861,18 @@ func (c *Client) readUntilPromptInitial(handleLogin bool) (string, error) {
 	var buf strings.Builder
 	deadline := time.Now().Add(time.Duration(c.options.TimeoutSeconds) * time.Second)
 	usernameSent, passwordSent := false, false
+	// A byte read while checking that a login prompt had settled, to be
+	// processed next. Only ever set when handleLogin is.
+	var pushback *byte
 
 	for {
-		b, err := c.readByteWithDeadline(deadline)
+		var b byte
+		var err error
+		if pushback != nil {
+			b, pushback = *pushback, nil
+		} else {
+			b, err = c.readByteWithDeadline(deadline)
+		}
 		if err != nil {
 			bufStr := buf.String()
 			if errors.Is(err, errDeadlineExceeded) {
@@ -810,14 +893,34 @@ func (c *Client) readUntilPromptInitial(handleLogin bool) (string, error) {
 
 		lines := strings.Split(content, "\n")
 		lastLine := strings.TrimRight(sanitizePromptLine(lines[len(lines)-1]), "\r ")
+		wantUser := !usernameSent && usernamePrompt.MatchString(lastLine)
+		wantPass := !passwordSent && passwordPrompt.MatchString(lastLine)
+		if wantUser || wantPass {
+			// The prompt patterns match a line suffix, so a banner line such
+			// as "Last login: ..." matches mid-line. A real prompt waits for
+			// input; a banner keeps coming. Answer only once the switch has
+			// gone quiet.
+			settle := time.Now().Add(loginPromptSettle)
+			if settle.After(deadline) {
+				settle = deadline
+			}
+			nb, nerr := c.readByteWithDeadline(settle)
+			if nerr == nil {
+				pushback = &nb
+				continue
+			}
+			if !errors.Is(nerr, errDeadlineExceeded) {
+				return content, fmt.Errorf("read: %w", nerr)
+			}
+		}
 		switch {
-		case !usernameSent && usernamePrompt.MatchString(lastLine):
+		case wantUser:
 			if _, err := fmt.Fprintf(c.stdin, "%s\n", c.options.Username); err != nil {
 				return content, fmt.Errorf("send username: %w", err)
 			}
 			usernameSent = true
 			buf.WriteByte('\n') // the answer is not echoed back; start a fresh line
-		case !passwordSent && passwordPrompt.MatchString(lastLine):
+		case wantPass:
 			if _, err := fmt.Fprintf(c.stdin, "%s\n", c.options.Password); err != nil {
 				return content, fmt.Errorf("send password: %w", err)
 			}
@@ -984,4 +1087,151 @@ func stripEchoedCommand(output, command string) string {
 		return lines[1]
 	}
 	return output
+}
+
+// drainQuietIfTelnet reads and discards everything the switch sends until it
+// has been silent for telnetQuietWindow, bounded by the session timeout. Over
+// telnet it runs at points where nothing further is expected, so whatever
+// arrives — a second prompt answering a doubled line ending, a repeated
+// banner — is stray and must not be mistaken for the next command's output.
+// A no-op over SSH.
+func (c *Client) drainQuietIfTelnet() error {
+	if !c.telnet {
+		return nil
+	}
+	deadline := time.Now().Add(time.Duration(c.options.TimeoutSeconds) * time.Second)
+	for {
+		quiet := time.Now().Add(telnetQuietWindow)
+		if quiet.After(deadline) {
+			quiet = deadline
+		}
+		_, err := c.readByteWithDeadline(quiet)
+		switch {
+		case err == nil:
+			continue
+		case errors.Is(err, errDeadlineExceeded):
+			if time.Now().Before(deadline) {
+				return nil // quiet for the whole window
+			}
+			return fmt.Errorf("telnet session never went quiet within the timeout")
+		default:
+			return fmt.Errorf("read: %w", err)
+		}
+	}
+}
+
+// resync re-establishes command/response alignment on a telnet session after
+// start-up: one empty line, read up to its prompt, then a quiet drain. Any
+// stray prompts the start-up dialogue provoked are consumed here rather than
+// by the first real command.
+func (c *Client) resync() error {
+	if _, err := io.WriteString(c.stdin, "\n"); err != nil {
+		return fmt.Errorf("telnet resync: write: %w", err)
+	}
+	if _, err := c.readUntilPrompt(); err != nil {
+		return fmt.Errorf("telnet resync: %w", err)
+	}
+	if err := c.drainQuietIfTelnet(); err != nil {
+		return fmt.Errorf("telnet resync: %w", err)
+	}
+	return nil
+}
+
+// drainPendingIfTelnet discards whatever a telnet switch has already sent
+// before the next command is written: the client is strictly request/response
+// and has read up to the previous prompt, so nothing pending can be the
+// answer to the command about to be sent. Pending blank lines and prompts —
+// the signature of a doubled Enter — are dropped silently. Anything else
+// means the previous read ended early and its output was incomplete, so the
+// session is marked out of sync. Blocks only when stray output is already
+// arriving, until it stops (telnetQuietWindow). A no-op over SSH.
+func (c *Client) drainPendingIfTelnet() error {
+	if !c.telnet {
+		return nil
+	}
+	var pending strings.Builder
+	for done := false; !done; {
+		select {
+		case res, ok := <-c.byteCh:
+			if !ok {
+				return fmt.Errorf("read: %w", io.EOF)
+			}
+			if res.err != nil {
+				return fmt.Errorf("read: %w", res.err)
+			}
+			pending.WriteByte(res.b)
+		default:
+			done = true
+		}
+	}
+	if pending.Len() > 0 {
+		// Something stray is arriving; let it finish (a prompt may be only
+		// partly here) before judging it.
+		deadline := time.Now().Add(time.Duration(c.options.TimeoutSeconds) * time.Second)
+		for {
+			quiet := time.Now().Add(telnetQuietWindow)
+			if quiet.After(deadline) {
+				quiet = deadline
+			}
+			b, err := c.readByteWithDeadline(quiet)
+			if errors.Is(err, errDeadlineExceeded) {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("read: %w", err)
+			}
+			pending.WriteByte(b)
+		}
+	}
+	for _, line := range strings.Split(sanitizeOutput(pending.String()), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || (c.promptRegex != nil && c.promptRegex.MatchString(line)) {
+			continue
+		}
+		c.markLost(ErrTelnetOutOfSync)
+		return fmt.Errorf("unexpected output %q before the next command: %w", truncate(line, 80), ErrTelnetOutOfSync)
+	}
+	return nil
+}
+
+// verifyEchoIfTelnet checks that a telnet command's (sanitized) output starts
+// with the switch's echo of that command. The first command on the session
+// decides whether the switch echoes at all; a switch that does not cannot be
+// checked this way and relies on the drains alone. Only the command's first
+// word is required on the echo line, so an echo the switch wraps or redraws
+// for a narrow terminal still passes, while a shifted read — whose first line
+// is empty or a bare prompt — does not. A no-op over SSH.
+func (c *Client) verifyEchoIfTelnet(output, command string) error {
+	if !c.telnet {
+		return nil
+	}
+	first := strings.SplitN(output, "\n", 2)[0]
+	echoed := strings.Contains(first, command)
+	if fields := strings.Fields(command); !echoed && len(fields) > 0 {
+		echoed = strings.Contains(first, fields[0])
+	}
+	switch c.telnetEcho {
+	case echoUnknown:
+		if echoed {
+			c.telnetEcho = echoOn
+		} else {
+			c.telnetEcho = echoOff
+		}
+		return nil
+	case echoOn:
+		if echoed || strings.TrimSpace(command) == "" {
+			return nil
+		}
+		c.markLost(ErrTelnetOutOfSync)
+		return fmt.Errorf("command %q: output began with %q instead of its echo: %w",
+			command, truncate(strings.TrimSpace(first), 80), ErrTelnetOutOfSync)
+	}
+	return nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

@@ -76,16 +76,19 @@ func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest
 			"username": schema.StringAttribute{
 				Description: "Login username. Required unless allow_empty_credentials is set. Can also be set with the FASTIRON_USERNAME environment variable.",
 				Optional:    true,
+				Validators:  []validator.String{noControlCharacters{}},
 			},
 			"password": schema.StringAttribute{
 				Description: "Login password. Required unless allow_empty_credentials is set. Can also be set with the FASTIRON_PASSWORD environment variable.",
 				Optional:    true,
 				Sensitive:   true,
+				Validators:  []validator.String{noControlCharacters{}},
 			},
 			"enable_password": schema.StringAttribute{
 				Description: "Enable mode password. Required if the switch requires enable authentication. Can also be set with the FASTIRON_ENABLE_PASSWORD environment variable.",
 				Optional:    true,
 				Sensitive:   true,
+				Validators:  []validator.String{noControlCharacters{}},
 			},
 			"timeout": schema.Int64Attribute{
 				Description: "Connection and per-command read timeout in seconds. Defaults to 30.",
@@ -199,14 +202,28 @@ func resolveConnection(s connectionSettings) (sshclient.Options, diag.Diagnostic
 			"and remove allow_empty_credentials once they exist."
 		diags.AddWarning("Connecting with empty credentials", detail)
 	} else {
+		// The first sentence of each is the pre-telnet wording, unchanged.
 		if s.Username == "" {
-			diags.AddError("Missing username", "The username must be set in the provider configuration or the FASTIRON_USERNAME environment variable "+
-				"(or set allow_empty_credentials = true for a factory-fresh switch with no users — lab use only).")
+			diags.AddError("Missing username", "The username must be set in the provider configuration or the FASTIRON_USERNAME environment variable."+
+				emptyCredentialsHint)
 			return sshclient.Options{}, diags
 		}
 		if s.Password == "" {
-			diags.AddError("Missing password", "The password must be set in the provider configuration or the FASTIRON_PASSWORD environment variable "+
-				"(or set allow_empty_credentials = true for a factory-fresh switch with no users — lab use only).")
+			diags.AddError("Missing password", "The password must be set in the provider configuration or the FASTIRON_PASSWORD environment variable."+
+				emptyCredentialsHint)
+			return sshclient.Options{}, diags
+		}
+	}
+
+	// The schema validators cover values set in the configuration; this
+	// covers the environment variables too. Credentials are written to the
+	// switch verbatim (over telnet, as typed input), so a control character
+	// could inject a command. The value is never included in the message.
+	for _, f := range []struct{ name, value string }{
+		{"username", s.Username}, {"password", s.Password}, {"enable_password", s.EnablePassword},
+	} {
+		if hasControlCharacters(f.value) {
+			diags.AddError("Invalid "+f.name, f.name+" contains control characters (0x00-0x1f or 0x7f), which are not allowed.")
 			return sshclient.Options{}, diags
 		}
 	}
@@ -274,6 +291,42 @@ func resolveConnection(s connectionSettings) (sshclient.Options, diag.Diagnostic
 	}, diags
 }
 
+// emptyCredentialsHint follows the original "Missing username/password"
+// detail as a separate sentence.
+const emptyCredentialsHint = " For a factory-fresh switch with no users, set allow_empty_credentials = true instead (lab use only)."
+
+// hasControlCharacters reports whether s contains a control character
+// (0x00-0x1f) or DEL.
+func hasControlCharacters(s string) bool {
+	for _, b := range []byte(s) {
+		if b < 0x20 || b == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// noControlCharacters rejects strings containing control characters. Unlike
+// stringvalidator.RegexMatches its diagnostic never echoes the value, so it
+// is safe on sensitive attributes.
+type noControlCharacters struct{}
+
+func (noControlCharacters) Description(context.Context) string {
+	return "must not contain control characters (0x00-0x1f or 0x7f)"
+}
+
+func (v noControlCharacters) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (v noControlCharacters) ValidateString(ctx context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() || !hasControlCharacters(req.ConfigValue.ValueString()) {
+		return
+	}
+	resp.Diagnostics.AddAttributeError(req.Path, "Invalid "+req.Path.String(),
+		req.Path.String()+" "+v.Description(ctx)+".")
+}
+
 // boolValue returns a known bool attribute's value, false otherwise.
 func boolValue(v types.Bool) bool {
 	return !v.IsNull() && !v.IsUnknown() && v.ValueBool()
@@ -323,8 +376,12 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 
 	client, err := sshclient.Connect(opts)
 	if err != nil {
-		resp.Diagnostics.AddError("Connection failed",
-			fmt.Sprintf("Unable to connect to the ICX switch over %s: %s", opts.Transport, err.Error()))
+		if opts.Transport == sshclient.TransportTelnet {
+			resp.Diagnostics.AddError("Telnet connection failed", "Unable to connect to the ICX switch over telnet: "+err.Error())
+		} else {
+			// Unchanged from before the telnet transport existed.
+			resp.Diagnostics.AddError("SSH connection failed", "Unable to connect to the ICX switch: "+err.Error())
+		}
 		return
 	}
 
