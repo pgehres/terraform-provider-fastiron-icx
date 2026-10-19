@@ -16,8 +16,8 @@ The `fastiron-icx` provider manages Brocade/Ruckus ICX switches running FastIron
 - ICX 7150-C12P (12-port PoE compact, optical-monitor)
 - ICX 7150-C10ZP (10-port PoE compact, no global-stp, ISP VLANs)
 
-**Experimental / untested models:**
-- ICX 6430-C12 (EOL, FastIron 08.0.30, switch image only — L2, no stacking). Parser support for its stackless config format (bare top-level `module` lines) is in place but has only been exercised against a synthetic fixture, not a real device. Its very old SSH stack requires `legacy_ssh_algorithms = true` (see below). Expect rough edges until a real device has been tested.
+**Experimental models (read path verified on real hardware; resource operations untested):**
+- ICX 6430-C12 (EOL, FastIron 08.0.30 switch image — L2 only, non-stackable) and ICX 6450-C12PD (08.0.30 router image). SSH connectivity and config parsing are verified against live devices — their SSH stacks offer only legacy key exchange, so `legacy_ssh_algorithms = true` is required (see below) — and the parser test fixtures are sanitized real captures (which, notably, do use the `stack unit` wrapper despite the models being non-stackable; tolerance for bare top-level `module` lines is retained and tested separately as robustness). Managing resources on 08.0.30 is NOT yet validated, and known dialect gaps exist: trunk untagged membership uses `dual-mode` on the interface (unsupported by `icx_interface_ethernet`), and the 6430 disables its DHCP client via `no ip dhcp-client enable`, which `icx_system` does not emit. Expect rough edges beyond read-only use.
 
 ## SSH and Host Key Verification
 
