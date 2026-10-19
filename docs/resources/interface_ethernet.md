@@ -61,8 +61,8 @@ resource "icx_interface_ethernet" "trunk_all" {
 - `port_name` (String) - Descriptive port label. Names containing spaces are automatically quoted when sent to the switch.
 - `spanning_tree_pt2pt_mac` (Boolean) - Enable `spanning-tree 802-1w admin-pt2pt-mac` on this interface. Defaults to `false`.
 - `optical_monitor` (Boolean) - Enable optical monitoring on this interface. Set to `false` to send `no optical-monitor`. Defaults to `true`.
-- `untagged_vlan` (Number) - VLAN ID for untagged traffic. The port is added as an `untagged ethe` member of this VLAN.
-- `tagged_vlans` (Set of Number) - Set of VLAN IDs for tagged traffic. The port is added as a `tagged ethe` member of each listed VLAN. Mutually exclusive with `tag_all_vlans`.
+- `untagged_vlan` (Number) - VLAN ID for untagged traffic. The port is added as an `untagged ethe` member of this VLAN. On FastIron releases before 08.0.80 a port that also has tagged VLANs is instead configured with the interface-level `dual-mode` command — see [FastIron 08.0.30 `dual-mode` dialect](#fastiron-08030-dual-mode-dialect).
+- `tagged_vlans` (Set of Number) - Set of VLAN IDs for tagged traffic. The port is added as a `tagged ethe` member of each listed VLAN. Mutually exclusive with `tag_all_vlans`. Do not list `untagged_vlan` here; on `dual-mode` firmware the provider adds that membership itself.
 - `tag_all_vlans` (Boolean) - When `true`, tag all VLANs on the switch (excluding `untagged_vlan` and VLAN 1) on this port. Expanded to an explicit per-VLAN list at apply time. Defaults to `false`.
 - `raw_config` (List of String) - Additional raw CLI commands within the interface context (`interface ethernet N ... exit`). On destroy each command is prefixed with `no`. Use `icx_raw_config` with explicit `destroy_commands` for context-entering commands.
 
@@ -81,6 +81,38 @@ resource "icx_interface_ethernet" "trunk_all" {
 
 If auditable membership is needed — where drift surfaces as a plan diff — use an explicit `tagged_vlans` list instead.
 
+## FastIron 08.0.30 `dual-mode` dialect
+
+FastIron releases **before 08.0.80** (the 08.0.30 train on the EOL ICX 6430/6450, and 08.0.5x/08.0.7x) express a trunk port's untagged VLAN differently from 08.0.9x. On those releases a port that is tagged in any VLAN cannot also be made `untagged` in VLAN context — the CLI rejects it. Instead the port is made a **tagged** member of the untagged VLAN as well, and the interface-level `dual-mode <vlan-id>` command selects which of its VLANs carries untagged frames ("only tagged ports can be configured as dual-mode ports"). A bare `dual-mode` with no argument means the default VLAN 1, and `no dual-mode` returns the port to tagged-only. Access ports (`untagged_vlan` with no tagged VLANs) use the ordinary VLAN-context `untagged ethe` form on every release. The command was deprecated in 08.0.80, where the VLAN-context form used by this resource on 08.0.9x became the only one.
+
+The running config on such a device shows the two halves in two places:
+
+```text
+vlan 102 name management by port
+ tagged ethe 1/2/1
+!
+interface ethernet 1/2/1
+ dual-mode  102
+```
+
+The provider handles this transparently; **your configuration is the same on both dialects**:
+
+```terraform
+resource "icx_interface_ethernet" "uplink" {
+  port          = "1/2/1"
+  untagged_vlan = 102
+  tagged_vlans  = [101, 107, 109, 110, 120, 200]
+}
+```
+
+- **Dialect selection** is by the firmware version on the device's `ver` line: releases below 08.0.80 use `dual-mode`; 08.0.80 and later (including 08.0.95) use the VLAN-context form unchanged. A running config that already contains `dual-mode` lines is treated as the `dual-mode` dialect regardless of version. On firmware without the command, `dual-mode` is never sent.
+- **Read** reports `untagged_vlan` from the interface's `dual-mode` line when present, and leaves that VLAN out of `tagged_vlans` even though the switch lists the port as tagged in it. Ports without a `dual-mode` line are read from VLAN context as on 08.0.9x. The configuration above therefore plans clean against the running config shown.
+- **Apply** on `dual-mode` firmware tags the port in `tagged_vlans` **and** in `untagged_vlan`, then issues `dual-mode <untagged_vlan>` in interface context (bare `dual-mode` for VLAN 1). Changing `untagged_vlan` on an existing trunk re-issues `dual-mode` with the new VLAN directly — there is no intermediate `no dual-mode`, which would briefly drop the untagged VLAN and, on a management uplink, the provider's own SSH session — and only then removes the old VLAN's tagged membership. Removing `untagged_vlan` from a trunk sends `no dual-mode`. Converting an access port to a trunk (or back) necessarily passes through a moment where the port is in neither form; avoid doing that on the switch's management path.
+- **Destroy** sends `no dual-mode` before stripping the port's VLAN memberships.
+- **Drift:** the device's actual `dual-mode` line is the source of truth, so a port whose `dual-mode` was removed by hand is re-asserted on the next apply that changes the resource (a pure drift with no other change is visible to `plan` as an `untagged_vlan` diff, because Read reports the VLAN-context state).
+
+~> Resource operations on 08.0.30 are generated from the FastIron 08.0.30–08.0.60 Layer 2 guides and command references and are covered by unit tests against real sanitized captures from an ICX 6430-C12 and an ICX 6450-C12PD, but they have not yet been exercised against a live 08.0.30 device. Validate on a non-production port first.
+
 ## Import
 
 Import by port identifier:
@@ -89,4 +121,4 @@ Import by port identifier:
 terraform import icx_interface_ethernet.uplink 1/1/24
 ```
 
-After import, `tag_all_vlans` will be `false` and `tagged_vlans` will reflect the port's actual tagged membership at import time.
+After import, `tag_all_vlans` will be `false` and `tagged_vlans` will reflect the port's actual tagged membership at import time. On `dual-mode` firmware the dual-mode VLAN is imported as `untagged_vlan` and omitted from `tagged_vlans`.

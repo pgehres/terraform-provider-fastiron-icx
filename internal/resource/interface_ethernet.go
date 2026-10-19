@@ -247,7 +247,7 @@ func (r *InterfaceEthernetResource) Read(ctx context.Context, req resource.ReadR
 	}
 
 	// Read VLAN membership from config.
-	r.readVLANMembership(ctx, port, config, &state, &resp.Diagnostics)
+	r.readVLANMembership(ctx, port, iface, config, &state, &resp.Diagnostics)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
@@ -477,7 +477,17 @@ func (r *InterfaceEthernetResource) resolveTaggedVLANs(ctx context.Context, plan
 
 // buildVLANMembershipCommands generates VLAN commands for port membership.
 // If oldState is nil, this is a create operation; otherwise it's an update.
+//
+// On FastIron releases that have the `dual-mode` interface command (08.0.30
+// through 08.0.7x — see parser.FirmwareHasDualMode) the trunk-untagged case is
+// expressed differently and is handled by buildDualModeMembershipCommands.
+// On 08.0.80+ (the ICX 7000-series fleet on 08.0.95) this function's
+// VLAN-context-only form is used unchanged.
 func (r *InterfaceEthernetResource) buildVLANMembershipCommands(ctx context.Context, plan *InterfaceEthernetResourceModel, oldState *InterfaceEthernetResourceModel, config *parser.RunningConfig, diags *diag.Diagnostics) []string {
+	if config.UsesDualMode() {
+		return r.buildDualModeMembershipCommands(ctx, plan, oldState, config, diags)
+	}
+
 	port := plan.Port.ValueString()
 	var commands []string
 
@@ -543,9 +553,188 @@ func (r *InterfaceEthernetResource) buildVLANMembershipCommands(ctx context.Cont
 	return commands
 }
 
+// dualModeCommand returns the interface-context command that makes port's
+// untagged VLAN vlanID on dual-mode firmware. FastIron documents the bare form
+// (`dual-mode`, no argument) as "untagged in the default VLAN", so VLAN 1 is
+// emitted that way rather than as `dual-mode 1`.
+func dualModeCommand(vlanID int) string {
+	if vlanID == 1 {
+		return "dual-mode"
+	}
+	return fmt.Sprintf("dual-mode %d", vlanID)
+}
+
+// buildDualModeMembershipCommands is the FastIron 08.0.30-era counterpart of
+// buildVLANMembershipCommands.
+//
+// Dialect (FastIron 08.0.30–08.0.7x Layer 2 guide / command reference):
+//
+//   - An access port (untagged_vlan only) is an `untagged ethe` member in VLAN
+//     context, exactly as on 08.0.95.
+//   - A port that is tagged in some VLANs cannot also be made `untagged` in
+//     VLAN context — the CLI rejects it. Instead the port is made a *tagged*
+//     member of the untagged VLAN too, and `dual-mode <vlan-id>` under
+//     `interface ethernet` selects which of its VLANs carries untagged frames.
+//     "Only tagged ports can be configured as dual-mode ports." Bare
+//     `dual-mode` means the default VLAN (1), which needs no tagged entry.
+//   - `no dual-mode` returns the port to tagged-only.
+//
+// So on this firmware the VLAN-context tagged set for a trunk with an untagged
+// VLAN is tagged_vlans ∪ {untagged_vlan}, and Read mirrors that by excluding
+// the dual-mode VLAN from tagged_vlans (see readVLANMembership).
+//
+// Command ordering matters for a live trunk, so the sequence is:
+//
+//  1. `no dual-mode` when the port is leaving dual-mode (device had it, plan
+//     does not need it) — before any tagged membership it depends on is removed.
+//  2. Remove a VLAN-context untagged membership that is going away (a port
+//     untagged in a non-default VLAN cannot be tagged elsewhere until then).
+//  3. Add new tagged memberships, including the new dual-mode VLAN.
+//  4. `dual-mode <id>` when the plan needs dual-mode and the device's current
+//     dual-mode VLAN differs. Re-issued directly, without `no dual-mode` first:
+//     the intermediate `no dual-mode` would momentarily drop the untagged VLAN
+//     (on a management uplink, that severs the provider's own SSH session).
+//  5. Remove tagged memberships no longer wanted (the old dual-mode VLAN
+//     among them, now that dual-mode no longer points at it).
+//  6. Add a new VLAN-context untagged membership (access port).
+//
+// The device's actual `dual-mode` line (read from the running config on every
+// operation) is the source of truth for steps 1 and 4, so an interface whose
+// dual-mode drifted by hand is healed on the next apply that touches it.
+func (r *InterfaceEthernetResource) buildDualModeMembershipCommands(ctx context.Context, plan *InterfaceEthernetResourceModel, oldState *InterfaceEthernetResourceModel, config *parser.RunningConfig, diags *diag.Diagnostics) []string {
+	port := plan.Port.ValueString()
+	var commands []string
+
+	// Desired membership.
+	newTagged := r.resolveTaggedVLANs(ctx, plan, config, diags)
+	if diags.HasError() {
+		return nil
+	}
+	var newUntagged int
+	if !plan.UntaggedVLAN.IsNull() {
+		newUntagged = int(plan.UntaggedVLAN.ValueInt64())
+	}
+	newDual := newUntagged != 0 && len(newTagged) > 0
+	newVLANTagged, newVLANUntagged := dualModeVLANContextSets(newTagged, newUntagged, newDual)
+
+	// Previous membership, as recorded in state.
+	var oldVLANTagged []int
+	var oldVLANUntagged int
+	if oldState != nil {
+		oldTagged := r.resolveTaggedVLANs(ctx, oldState, config, diags)
+		if diags.HasError() {
+			return nil
+		}
+		var oldUntagged int
+		if !oldState.UntaggedVLAN.IsNull() {
+			oldUntagged = int(oldState.UntaggedVLAN.ValueInt64())
+		}
+		oldDual := oldUntagged != 0 && len(oldTagged) > 0
+		oldVLANTagged, oldVLANUntagged = dualModeVLANContextSets(oldTagged, oldUntagged, oldDual)
+	}
+
+	// The device's current dual-mode VLAN, if any.
+	var deviceDual *int
+	if iface := config.FindEthernetInterface(port); iface != nil {
+		deviceDual = iface.DualModeVLAN
+	}
+
+	// 1. Leave dual-mode.
+	if !newDual && deviceDual != nil {
+		commands = append(commands,
+			fmt.Sprintf("interface ethernet %s", port),
+			"no dual-mode",
+			"exit",
+		)
+	}
+
+	// 2. Remove old VLAN-context untagged membership.
+	if oldVLANUntagged != 0 && oldVLANUntagged != newVLANUntagged {
+		commands = append(commands,
+			fmt.Sprintf("vlan %d", oldVLANUntagged),
+			fmt.Sprintf("no untagged ethe %s", port),
+			"exit",
+		)
+	}
+
+	// 3. Add new tagged membership (including the dual-mode VLAN).
+	for _, vlanID := range newVLANTagged {
+		if !intSliceContains(oldVLANTagged, vlanID) {
+			commands = append(commands,
+				fmt.Sprintf("vlan %d", vlanID),
+				fmt.Sprintf("tagged ethe %s", port),
+				"exit",
+			)
+		}
+	}
+
+	// 4. Set dual-mode to the untagged VLAN.
+	if newDual && (deviceDual == nil || *deviceDual != newUntagged) {
+		commands = append(commands,
+			fmt.Sprintf("interface ethernet %s", port),
+			dualModeCommand(newUntagged),
+			"exit",
+		)
+	}
+
+	// 5. Remove old tagged membership no longer wanted.
+	for _, vlanID := range oldVLANTagged {
+		if !intSliceContains(newVLANTagged, vlanID) {
+			commands = append(commands,
+				fmt.Sprintf("vlan %d", vlanID),
+				fmt.Sprintf("no tagged ethe %s", port),
+				"exit",
+			)
+		}
+	}
+
+	// 6. Add new VLAN-context untagged membership (access port).
+	if newVLANUntagged != 0 && newVLANUntagged != oldVLANUntagged {
+		commands = append(commands,
+			fmt.Sprintf("vlan %d", newVLANUntagged),
+			fmt.Sprintf("untagged ethe %s", port),
+			"exit",
+		)
+	}
+
+	return commands
+}
+
+// dualModeVLANContextSets maps a resource's (tagged_vlans, untagged_vlan) to
+// the VLAN-context memberships the switch must hold on dual-mode firmware: a
+// dual-mode port is a tagged member of its untagged VLAN (unless that is the
+// default VLAN 1, which needs no entry) and has no VLAN-context untagged
+// membership; an access port is the reverse. The returned tagged list is
+// sorted.
+func dualModeVLANContextSets(tagged []int, untagged int, dual bool) (vlanTagged []int, vlanUntagged int) {
+	vlanTagged = append(vlanTagged, tagged...)
+	if dual {
+		if untagged != 1 && !intSliceContains(vlanTagged, untagged) {
+			vlanTagged = append(vlanTagged, untagged)
+		}
+		sort.Ints(vlanTagged)
+		return vlanTagged, 0
+	}
+	sort.Ints(vlanTagged)
+	return vlanTagged, untagged
+}
+
 // buildVLANRemovalCommands removes all VLAN membership for a port.
+//
+// On dual-mode firmware the port's `dual-mode` line is cleared first, so the
+// subsequent `no tagged ethe` for the dual-mode VLAN is not rejected for a
+// port that still depends on it. The check is on the device's own config line,
+// so it needs no firmware gating: only firmware that has the command prints it.
 func (r *InterfaceEthernetResource) buildVLANRemovalCommands(ctx context.Context, port string, state *InterfaceEthernetResourceModel, config *parser.RunningConfig, diags *diag.Diagnostics) []string {
 	var commands []string
+
+	if iface := config.FindEthernetInterface(port); iface != nil && iface.DualModeVLAN != nil {
+		commands = append(commands,
+			fmt.Sprintf("interface ethernet %s", port),
+			"no dual-mode",
+			"exit",
+		)
+	}
 
 	// Remove from all VLANs that have this port.
 	for _, vlan := range config.VLANs {
@@ -578,9 +767,23 @@ func (r *InterfaceEthernetResource) buildVLANRemovalCommands(ctx context.Context
 }
 
 // readVLANMembership reads VLAN membership for a port from the running config.
-func (r *InterfaceEthernetResource) readVLANMembership(ctx context.Context, port string, config *parser.RunningConfig, state *InterfaceEthernetResourceModel, diags *diag.Diagnostics) {
+//
+// When the interface carries a `dual-mode [vlan]` line (FastIron 08.0.30-era
+// trunk-untagged dialect), that VLAN is the port's untagged VLAN regardless of
+// the VLAN-context lists, and it is excluded from tagged_vlans even though the
+// VLAN context lists the port as tagged in it — mirroring what
+// buildDualModeMembershipCommands writes, so a dual-mode trunk plans clean.
+// Interfaces without the line (every port on 08.0.95, and access ports on
+// 08.0.30) are read from VLAN context exactly as before.
+func (r *InterfaceEthernetResource) readVLANMembership(ctx context.Context, port string, iface *parser.EthernetInterface, config *parser.RunningConfig, state *InterfaceEthernetResourceModel, diags *diag.Diagnostics) {
 	var taggedVLANs []int64
 	var untaggedVLAN int
+
+	var dualModeVLAN int
+	if iface != nil && iface.DualModeVLAN != nil {
+		dualModeVLAN = *iface.DualModeVLAN
+		untaggedVLAN = dualModeVLAN
+	}
 
 	for _, vlan := range config.VLANs {
 		if vlan.ID == 1 {
@@ -588,9 +791,14 @@ func (r *InterfaceEthernetResource) readVLANMembership(ctx context.Context, port
 		}
 		for _, p := range vlan.TaggedPorts {
 			if p == port {
-				taggedVLANs = append(taggedVLANs, int64(vlan.ID))
+				if vlan.ID != dualModeVLAN {
+					taggedVLANs = append(taggedVLANs, int64(vlan.ID))
+				}
 				break
 			}
+		}
+		if dualModeVLAN != 0 {
+			continue // dual-mode decides the untagged VLAN
 		}
 		for _, p := range vlan.UntaggedPorts {
 			if p == port {

@@ -13,7 +13,13 @@ type EthernetInterface struct {
 	PortName              string
 	SpanningTreePt2PtMac  bool
 	OpticalMonitorDisable bool // true if "no optical-monitor" is set
-	RawLines              []string
+	// DualModeVLAN is set when the interface carries a `dual-mode [vlan-id]`
+	// line — the FastIron 08.0.30-era (pre-08.0.80) way of making a tagged
+	// port also carry untagged traffic for one VLAN. The VLAN context lists
+	// such a port only as *tagged*; the untagged VLAN lives here. A bare
+	// `dual-mode` means the default VLAN (1). Nil when not configured.
+	DualModeVLAN *int
+	RawLines     []string
 }
 
 // VEInterface represents a parsed virtual ethernet interface configuration.
@@ -26,6 +32,8 @@ type VEInterface struct {
 var (
 	ethIfRe = regexp.MustCompile(`^interface ethernet (\d+/\d+/\d+)`)
 	veIfRe  = regexp.MustCompile(`^interface ve (\d+)`)
+	// FastIron prints the dual-mode VLAN with two spaces: ` dual-mode  102`.
+	dualModeRe = regexp.MustCompile(`^dual-mode(?:\s+(\d+))?$`)
 )
 
 func (c *RunningConfig) parseEthernetStanza(lines []string) error {
@@ -55,6 +63,18 @@ func (c *RunningConfig) parseEthernetStanza(lines []string) error {
 
 		case trimmed == "no optical-monitor":
 			iface.OpticalMonitorDisable = true
+
+		case dualModeRe.MatchString(trimmed):
+			dm := dualModeRe.FindStringSubmatch(trimmed)
+			vlanID := 1 // bare `dual-mode` = untagged in the default VLAN
+			if dm[1] != "" {
+				id, err := strconv.Atoi(dm[1])
+				if err != nil {
+					return fmt.Errorf("interface %s dual-mode: %w", iface.Port, err)
+				}
+				vlanID = id
+			}
+			iface.DualModeVLAN = &vlanID
 
 		default:
 			iface.RawLines = append(iface.RawLines, trimmed)
