@@ -42,6 +42,7 @@ type FastIronICXProviderModel struct {
 	HostKey                   types.String `tfsdk:"host_key"`
 	InsecureSkipHostKeyVerify types.Bool   `tfsdk:"insecure_skip_host_key_verify"`
 	LegacySSHAlgorithms       types.Bool   `tfsdk:"legacy_ssh_algorithms"`
+	NativeBulkTagging         types.Bool   `tfsdk:"native_bulk_tagging"`
 	Transport                 types.String `tfsdk:"transport"`
 	AllowEmptyCredentials     types.Bool   `tfsdk:"allow_empty_credentials"`
 	InsecureTransportAck      types.Bool   `tfsdk:"insecure_transport_ack"`
@@ -116,6 +117,17 @@ func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest
 					"Modern algorithms remain preferred, so switches that support them are unaffected. " +
 					"WARNING: these algorithms are cryptographically weak; enable only for EOL devices " +
 					"on trusted networks. Defaults to false.",
+				Optional: true,
+			},
+			"native_bulk_tagging": schema.BoolAttribute{
+				Description: "EXPERIMENTAL. If true, icx_interface_ethernet applies tag_all_vlans with the single " +
+					"interface command `vlan-config add all-tagged` on FastIron 08.0.50+ instead of one `tagged ethe` " +
+					"per VLAN. Off by default until validated on hardware: the command's effect on VLAN 1 and on a " +
+					"port's untagged VLAN is undocumented. Even when enabled it is only used on tagged-only trunks — " +
+					"never on a port with an untagged_vlan (or any untagged membership on the device), never on the " +
+					"port the provider detects as the switch's management path (or when that path cannot be " +
+					"determined), and never on firmware without the command or of unknown version. " +
+					"Defaults to false, which sends exactly the per-VLAN commands.",
 				Optional: true,
 			},
 			"transport": schema.StringAttribute{
@@ -391,7 +403,9 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 		Client:   client,
 		Username: username,
 		Dialect:  dialect.Detect("", parser.ImageTypeUnknown),
-		Ports:    providerdata.NewPortRegistry(),
+		// Unset means false: bulk tagging is strictly opt-in.
+		NativeBulkTagging: config.NativeBulkTagging.ValueBool(),
+		Ports:             providerdata.NewPortRegistry(),
 	}
 
 	// Detect the firmware dialect (release + image type) once per provider

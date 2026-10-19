@@ -203,3 +203,30 @@ func TestReadUntilPromptReturnsOnPrompt(t *testing.T) {
 		t.Errorf("unexpected output: %q", out)
 	}
 }
+
+// detectCLIError must catch the lower-case "error - ..." the bulk
+// `vlan-config` commands print, as well as the capitalised forms, and must
+// pass the commands' informational chatter through.
+func TestDetectCLIError(t *testing.T) {
+	bad := []string{
+		"Invalid input -> foo",
+		"Error: port 1/1/1 is tagged",
+		"Error - something",
+		"INFO : Command may take approximately 0 Seconds\nerror - IP routing, vrf, ip policy, route-only, rpf-mode, ip-mac or ip tcp mss was configured on ports  1/1/1",
+	}
+	for _, out := range bad {
+		if detectCLIError(out) == "" {
+			t.Errorf("detectCLIError(%q) = \"\", want the error", out)
+		}
+	}
+	good := []string{
+		"",
+		"INFO : Command may take approximately 0 Seconds\n VLAN : [  82] Port(s) ethe 1/1/1  add to 2 vlan(s) complete.....",
+		"Added tagged port(s) ethe 1/1/8 to port-vlan 10.",
+	}
+	for _, out := range good {
+		if got := detectCLIError(out); got != "" {
+			t.Errorf("detectCLIError(%q) = %q, want \"\"", out, got)
+		}
+	}
+}

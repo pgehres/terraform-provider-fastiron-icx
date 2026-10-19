@@ -34,3 +34,9 @@ func (d Dialect) DualMode(vlanID int) string {
 
 // NoDualMode renders the command returning a port to tagged-only.
 func (d Dialect) NoDualMode() string { return "no dual-mode" }
+
+// VlanConfigAddAllTagged renders the interface-context command that tags the
+// port in every VLAN on the device at once. Only meaningful when
+// d.Has(CapVlanConfigAllTagged); callers must otherwise spell the membership
+// out per VLAN.
+func (d Dialect) VlanConfigAddAllTagged() string { return "vlan-config add all-tagged" }

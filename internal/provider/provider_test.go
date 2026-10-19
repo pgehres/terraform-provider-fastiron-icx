@@ -7,6 +7,8 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/provider"
+	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
@@ -215,5 +217,23 @@ func TestNoControlCharactersValidator(t *testing.T) {
 	noControlCharacters{}.ValidateString(context.Background(), validator.StringRequest{Path: path.Root("password"), ConfigValue: types.StringNull()}, &resp)
 	if resp.Diagnostics.HasError() {
 		t.Error("null must pass")
+	}
+}
+
+// native_bulk_tagging is an experimental opt-in: optional, never required,
+// and unset means false (the per-VLAN expansion).
+func TestProviderSchema_NativeBulkTaggingIsOptIn(t *testing.T) {
+	var resp provider.SchemaResponse
+	New("test")().Schema(context.Background(), provider.SchemaRequest{}, &resp)
+	attr, ok := resp.Schema.Attributes["native_bulk_tagging"].(schema.BoolAttribute)
+	if !ok {
+		t.Fatalf("native_bulk_tagging missing or not a bool: %T", resp.Schema.Attributes["native_bulk_tagging"])
+	}
+	if !attr.Optional || attr.Required {
+		t.Errorf("native_bulk_tagging must be optional, got Optional=%v Required=%v", attr.Optional, attr.Required)
+	}
+	var m FastIronICXProviderModel
+	if m.NativeBulkTagging.ValueBool() {
+		t.Error("an unset native_bulk_tagging must read as false")
 	}
 }

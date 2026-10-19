@@ -11,12 +11,16 @@ var _ CommandExecutor = &MockClient{}
 // MockClient implements CommandExecutor for unit testing.
 // It records commands sent and returns pre-configured responses.
 type MockClient struct {
-	mu               sync.Mutex
-	Commands         []string
-	Responses        map[string]string
-	RunningConfig    string
-	WriteMemoryCalls int
-	ErrorOnCommand   map[string]error
+	mu            sync.Mutex
+	Commands      []string
+	Responses     map[string]string
+	RunningConfig string
+	// RunningConfigQueue, when non-empty, is consumed one entry per
+	// GetRunningConfig call before RunningConfig is used, so a test can make
+	// a re-read after an apply show a changed device.
+	RunningConfigQueue []string
+	WriteMemoryCalls   int
+	ErrorOnCommand     map[string]error
 
 	// PromptRedetects counts ExecutePromptChanging calls; PromptChangingCommands
 	// records which commands went through that path (they also appear in
@@ -159,6 +163,11 @@ func (m *MockClient) GetRunningConfig() (string, error) {
 		return "", m.lostError()
 	}
 	m.Commands = append(m.Commands, "show running-config")
+	if len(m.RunningConfigQueue) > 0 {
+		cfg := m.RunningConfigQueue[0]
+		m.RunningConfigQueue = m.RunningConfigQueue[1:]
+		return cfg, nil
+	}
 	return m.RunningConfig, nil
 }
 

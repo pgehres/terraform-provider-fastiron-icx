@@ -1067,6 +1067,9 @@ func detectCLIError(output string) string {
 		"Invalid input ->",
 		"Error:",
 		"Error -",
+		// Lower-case form printed by the bulk `vlan-config` commands, e.g.
+		// "error - IP routing, vrf, ... was configured on ports 1/1/1".
+		"error -",
 		"Not authorized",
 		"Incomplete command",
 		"Ambiguous input",

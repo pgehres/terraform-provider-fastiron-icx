@@ -17,6 +17,12 @@ type ProviderData struct {
 	// unsupported operations before any commands are sent and render
 	// dialect-specific syntax. The zero value is an unknown, permissive dialect.
 	Dialect dialect.Dialect
+	// NativeBulkTagging is the provider's experimental, default-off
+	// native_bulk_tagging setting: whether icx_interface_ethernet may spell a
+	// tag_all_vlans apply as `vlan-config add all-tagged` (tagged-only,
+	// non-management trunks on FastIron 08.0.50+ only). When false every
+	// command stream is the per-VLAN expansion.
+	NativeBulkTagging bool
 	// Ports records the ethernet ports claimed by icx_interface_ethernet
 	// resources during the current operation, so a port declared by two
 	// resources is rejected at plan time. See PortRegistry.

@@ -49,10 +49,25 @@ const (
 	// 6430); the 08.0.30 router image (ICX 6450) already uses the 08.0.9x form.
 	// Use DHCPClientDisable rather than branching on this directly.
 	CapLegacyDHCPClient Capability = "legacy_dhcp_client"
+	// CapVlanConfigAllTagged is a syntax form: the interface-context
+	// `vlan-config add all-tagged` command tags a port in every VLAN on the
+	// device in one operation (introduced in FastIron 08.0.50 per the command
+	// reference; present on the 08.0.9x ICX 7000s). Without it, tag_all_vlans
+	// is spelled out as one VLAN-context `tagged ethe` per VLAN. It is a
+	// one-shot, non-savable command whose effect is ordinary per-VLAN tagged
+	// membership — it does not subscribe the port to VLANs created later.
+	// Unknown firmware falls back to the per-VLAN spelling, which exists
+	// everywhere, so a command that might not exist is never sent. Having the
+	// capability is necessary but not sufficient: icx_interface_ethernet only
+	// uses the command when the provider opts in (native_bulk_tagging,
+	// experimental, default off) and the port is a tagged-only,
+	// non-management trunk.
+	CapVlanConfigAllTagged Capability = "vlan_config_all_tagged"
 )
 
 var (
-	// v08050 added the europe/australia regions to `clock timezone`.
+	// v08050 added the europe/australia regions to `clock timezone` and
+	// introduced the interface-context `vlan-config` commands.
 	v08050 = Version{Major: 8, Minor: 0, Patch: 50}
 	// v08080 is the first release with the 08.0.9x-style VLAN/L2 dialect
 	// (dual-mode deprecated) and the minimum SmartZone-manageable release.
@@ -155,6 +170,10 @@ var table = map[Capability]rule{
 		kind: form,
 		has:  func(d Dialect) bool { return d.before(v08080) && d.switchImage() },
 	},
+	CapVlanConfigAllTagged: {
+		kind: form,
+		has:  func(d Dialect) bool { return d.Known && !d.Version.Less(v08050) },
+	},
 }
 
 // Capabilities lists every capability in display order.
@@ -162,6 +181,7 @@ func Capabilities() []Capability {
 	return []Capability{
 		CapVEInterfaces, CapRouterInterface, CapGlobalSTP, CapGlobalManagementIP,
 		CapManager, CapOpticalMonitor, CapClockTimezoneRegions, CapDualMode, CapLegacyDHCPClient,
+		CapVlanConfigAllTagged,
 	}
 }
 

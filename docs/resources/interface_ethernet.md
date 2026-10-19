@@ -116,6 +116,43 @@ The plugin protocol does not tell a resource its own address, so the check works
 
 The fix is the same as before the check existed: keep one resource per port, and `terraform state rm` the redundant one before deleting it from configuration.
 
+### Experimental bulk tagging (`native_bulk_tagging`)
+
+FastIron 08.0.50 added an interface-level command that tags a port in every VLAN at once. The provider can use it in place of one `tagged ethe` per VLAN, but **only when the provider block opts in**, and it is **off by default** until it has been validated on hardware:
+
+```terraform
+provider "icx" {
+  # ...
+  native_bulk_tagging = true # experimental
+}
+```
+
+With the option on, an eligible apply sends:
+
+```text
+interface ethernet 1/1/22
+ vlan-config add all-tagged
+ exit
+```
+
+- **Default off means unchanged.** With `native_bulk_tagging` unset or `false`, every command the resource sends is identical to the per-VLAN expansion, and nothing extra (such as `show arp`) is read.
+- **Tagged-only trunks only.** Even when opted in, the bulk command is used only for the VLANs a `tag_all_vlans = true` apply has to *add* on a port that is a pure tagged trunk. The per-VLAN form is used instead when any of these holds:
+  - the port has an `untagged_vlan`, or the running config shows it as an untagged member of any VLAN;
+  - the port is the switch's management path, judged from `show arp` for the management next hop the same way as the `enabled = false` check (see the warning at the top of this page), or that path cannot be determined;
+  - the firmware lacks the command (before 08.0.50), uses the `dual-mode` dialect (before 08.0.80), or its version is unknown;
+  - membership is an explicit `tagged_vlans` list.
+
+  Removals always stay per VLAN, and an apply with nothing to add sends nothing.
+- **Why so narrow.** The command's documentation does not say what it does to the default VLAN 1 or to the port's own untagged VLAN. If it converted an uplink's untagged management VLAN to tagged, the provider's SSH session would drop before any read-back could correct it. That is the same class of outage as replacing a live trunk.
+- **Same result as the per-VLAN form.** The command is a one-shot. What `write memory` saves is ordinary per-VLAN `tagged ethe` membership. It is **not** a setting that tags future VLANs automatically: a VLAN created later is still tagged onto trunk-all ports by `icx_vlan.Create`, and `Read`, import and destroy still work per VLAN.
+- **Verified afterwards, best-effort on VLAN 1.** After sending the command the provider re-reads the running config and removes a VLAN 1 tag if one appeared (`no tagged ethe` under `vlan 1`). That correction is **best-effort**: the command's VLAN 1 behaviour is still unverified on hardware.
+- **Failures are saved, not hidden.** The switch can refuse the command part-way. It prints `error - ...` on a port with IP configuration, and the command is not allowed on private-VLAN, MCT, GVRP, port-extender or flex-auth ports. Some VLANs may already have been tagged when that happens. The provider still re-reads and corrects the config, then saves what succeeded with `write memory` and reports the error, so the running and startup configs do not silently diverge.
+  - On an update, state records the port's actual membership with `tag_all_vlans = false`, so the next plan shows the remaining VLANs as an additive change.
+  - On a create no state is recorded. A failed create that recorded state would be tainted, and the replace that follows strips the trunk. The next apply re-runs the create, which is additive.
+  - Remove the conflicting configuration, or set `native_bulk_tagging = false`.
+
+~> The bulk path is generated from the Ruckus FastIron 08.0.50–08.0.90 command references and unit-tested against the real 08.0.95 captures and a membership simulator, but has **not** yet been run against a live device. The acceptance harness should confirm on a tagged-only scratch port that after `tag_all_vlans = true` the port is tagged in every VLAN except 1, that `show running-config` lists no tagged member under `vlan 1`, that re-running the command on an already fully tagged port is accepted, and that the saved config survives a reload.
+
 ## FastIron 08.0.30 `dual-mode` dialect
 
 FastIron releases **before 08.0.80** (the 08.0.30 train on the EOL ICX 6430/6450, and 08.0.5x/08.0.7x) express a trunk port's untagged VLAN differently from 08.0.9x. On those releases a port that is tagged in any VLAN cannot also be made `untagged` in VLAN context — the CLI rejects it. Instead the port is made a **tagged** member of the untagged VLAN as well, and the interface-level `dual-mode <vlan-id>` command selects which of its VLANs carries untagged frames ("only tagged ports can be configured as dual-mode ports"). A bare `dual-mode` with no argument means the default VLAN 1, and `no dual-mode` returns the port to tagged-only. Access ports (`untagged_vlan` with no tagged VLANs) use the ordinary VLAN-context `untagged ethe` form on every release. The command was deprecated in 08.0.80, where the VLAN-context form used by this resource on 08.0.9x became the only one.
