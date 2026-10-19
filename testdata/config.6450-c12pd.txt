@@ -1,0 +1,97 @@
+Current configuration:
+!
+ver 08.0.30uT313
+!
+stack unit 1
+  module 1 icx6450c-12pd-port-management-module
+  module 2 icx6450c-copper-2port-2g-module
+  module 3 icx6450c-fiber-2port-2g-module
+!
+!
+!
+!
+vlan 1 name DEFAULT-VLAN by port
+ router-interface ve 1
+!
+vlan 101 by port
+ tagged ethe 1/1/1 to 1/1/2 ethe 1/1/5 ethe 1/1/8 ethe 1/1/12 ethe 1/2/1 to 1/2/2 
+!
+vlan 102 by port
+ tagged ethe 1/1/1 to 1/1/2 ethe 1/1/5 ethe 1/1/8 ethe 1/1/12 ethe 1/2/1 to 1/2/2 
+ untagged ethe 1/1/3 to 1/1/4 ethe 1/1/6 
+!
+vlan 103 by port
+ tagged ethe 1/1/12 ethe 1/2/1 to 1/2/2 
+!
+vlan 107 by port
+ tagged ethe 1/1/1 to 1/1/2 ethe 1/1/5 ethe 1/1/8 ethe 1/1/12 ethe 1/2/1 to 1/2/2 
+!
+vlan 109 by port
+ tagged ethe 1/1/1 to 1/1/2 ethe 1/1/5 ethe 1/1/8 ethe 1/1/12 ethe 1/2/1 to 1/2/2 
+ untagged ethe 1/1/7 ethe 1/3/2 
+!
+vlan 110 by port
+ tagged ethe 1/1/1 to 1/1/2 ethe 1/1/5 ethe 1/1/8 ethe 1/1/12 ethe 1/2/1 to 1/2/2 
+!
+vlan 120 by port
+ tagged ethe 1/1/1 to 1/1/2 ethe 1/1/5 ethe 1/1/8 ethe 1/1/12 ethe 1/2/1 to 1/2/2 
+!
+vlan 200 name iot by port
+ tagged ethe 1/1/1 to 1/1/2 ethe 1/1/5 ethe 1/1/8 ethe 1/1/12 ethe 1/2/1 to 1/2/2 
+!
+!
+!
+!
+!
+aaa authentication login default local
+ip dhcp-client disable
+ip route 0.0.0.0/0 10.0.20.1
+!
+username admin password .....
+!
+!
+!
+!
+!
+interface ethernet 1/1/1
+ port-name ap-1
+ dual-mode  102
+ inline power
+!
+interface ethernet 1/1/2
+ port-name ap-2
+ dual-mode  102
+ inline power
+!
+interface ethernet 1/1/3
+ port-name camera-1
+ inline power
+!
+interface ethernet 1/1/4
+ port-name camera-2
+ inline power
+!
+interface ethernet 1/1/5
+ port-name trunk-1
+!
+interface ethernet 1/1/6
+ port-name access-switch-1
+!
+interface ethernet 1/1/8
+ dual-mode  102
+!
+interface ethernet 1/1/12
+ dual-mode  102
+!
+interface ve 1
+ ip address 10.0.20.7 255.255.255.0
+!
+!
+!
+!
+!
+!
+!
+!
+!
+end

@@ -97,6 +97,91 @@ func TestParseRunningConfig6430C12(t *testing.T) {
 	}
 }
 
+// The 6450-C12PD fixture is a sanitized capture from a real ICX 6450-C12PD
+// running FastIron 08.0.30uT313 (router image) — the router-image counterpart
+// to the 6430 switch-image fixture. It exercises multi-range tagged lines
+// (`tagged ethe 1/1/1 to 1/1/2 ethe 1/1/5 ...`), `dual-mode`, `inline power`,
+// and a VE interface on 08.0.30.
+func TestParseRunningConfig6450C12PD(t *testing.T) {
+	text := loadTestConfig(t, "../../testdata/config.6450-c12pd.txt")
+	config, err := ParseRunningConfig(text)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	if config.Global.Version != "08.0.30uT313" {
+		t.Errorf("version: %q", config.Global.Version)
+	}
+
+	if len(config.StackUnits) != 1 {
+		t.Fatalf("expected 1 stack unit, got %d", len(config.StackUnits))
+	}
+	if n := len(config.StackUnits[0].Modules); n != 3 {
+		t.Errorf("expected 3 modules, got %d", n)
+	}
+
+	// Router image: VE interface with addr+mask, no global IP/gateway.
+	if len(config.VEInterfaces) != 1 {
+		t.Fatalf("expected 1 VE interface, got %d", len(config.VEInterfaces))
+	}
+	ve := config.VEInterfaces[0]
+	if ve.ID != 1 {
+		t.Errorf("VE ID: %d", ve.ID)
+	}
+	if ve.IPAddress != "10.0.20.7 255.255.255.0" {
+		t.Errorf("VE IP: %q", ve.IPAddress)
+	}
+	if config.Global.IPAddress != "" || config.Global.DefaultGateway != "" {
+		t.Errorf("router image must not set global IP/gateway, got %q / %q",
+			config.Global.IPAddress, config.Global.DefaultGateway)
+	}
+
+	// VLAN 1 carries the router interface.
+	v1 := config.FindVLAN(1)
+	if v1 == nil {
+		t.Fatal("VLAN 1 not found")
+	}
+	if v1.RouterInterface == nil || *v1.RouterInterface != 1 {
+		t.Errorf("VLAN 1 router-interface: %v", v1.RouterInterface)
+	}
+
+	// Multi-range membership: tagged ethe 1/1/1 to 1/1/2 ethe 1/1/5 ethe 1/1/8
+	// ethe 1/1/12 ethe 1/2/1 to 1/2/2 expands to 7 ports; untagged
+	// ethe 1/1/3 to 1/1/4 ethe 1/1/6 expands to 3.
+	if len(config.VLANs) != 9 {
+		t.Fatalf("expected 9 VLANs, got %d", len(config.VLANs))
+	}
+	v102 := config.FindVLAN(102)
+	if v102 == nil {
+		t.Fatal("VLAN 102 not found")
+	}
+	if len(v102.TaggedPorts) != 7 {
+		t.Errorf("VLAN 102 tagged ports: expected 7, got %v", v102.TaggedPorts)
+	}
+	if len(v102.UntaggedPorts) != 3 {
+		t.Errorf("VLAN 102 untagged ports: expected 3, got %v", v102.UntaggedPorts)
+	}
+
+	// Interface parsing survives dual-mode and inline power sub-lines.
+	eth := config.FindEthernetInterface("1/1/1")
+	if eth == nil {
+		t.Fatal("interface 1/1/1 not found")
+	}
+	if eth.PortName != "ap-1" {
+		t.Errorf("1/1/1 port-name: %q", eth.PortName)
+	}
+
+	// Unlike the 6430's `no ip dhcp-client enable`, the 6450 router image uses
+	// the 08.0.95-style `ip dhcp-client disable`, which the parser interprets.
+	if !config.Global.DHCPClientDisable {
+		t.Error("expected DHCPClientDisable to be parsed true")
+	}
+
+	if len(config.Users) != 1 || config.Users[0].Username != "admin" {
+		t.Errorf("users: %+v", config.Users)
+	}
+}
+
 // Bare top-level module lines (no `stack unit` wrapper) do not occur in the
 // real 6430-C12 capture, but very old FastIron output has been reported
 // without the wrapper — keep the tolerance and its tests as robustness.
