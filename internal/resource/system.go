@@ -6,6 +6,7 @@ import (
 	"regexp"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -14,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
@@ -33,9 +35,49 @@ var (
 var reManagerPortList = regexp.MustCompile(`^[0-9to/, ]+$`)
 
 type SystemResource struct {
-	client          sshclient.CommandExecutor
-	imageType       parser.ImageType
-	firmwareVersion string
+	client  sshclient.CommandExecutor
+	dialect dialect.Dialect
+}
+
+// systemCapabilityGuards maps each firmware- or image-dependent icx_system
+// attribute to the dialect capability it needs. A guard fires only when the
+// attribute is set to a value that would send its command (true / non-null),
+// so defaults never block. To gate another attribute, add a row here and the
+// capability in internal/dialect.
+var systemCapabilityGuards = []struct {
+	capability dialect.Capability
+	feature    string
+	set        func(m *SystemResourceModel) bool
+}{
+	{dialect.CapGlobalSTP, "The global_stp attribute of icx_system",
+		func(m *SystemResourceModel) bool { return m.GlobalSTP.ValueBool() }},
+	{dialect.CapManager, "The manager_registrar attribute of icx_system",
+		func(m *SystemResourceModel) bool { return m.ManagerRegistrar.ValueBool() }},
+	{dialect.CapManager, "The manager_disable attribute of icx_system",
+		func(m *SystemResourceModel) bool { return m.ManagerDisable.ValueBool() }},
+	{dialect.CapManager, "The manager_port_list attribute of icx_system",
+		func(m *SystemResourceModel) bool {
+			return !m.ManagerPortList.IsNull() && !m.ManagerPortList.IsUnknown()
+		}},
+	{dialect.CapOpticalMonitor, "The optical_monitor attribute of icx_system",
+		func(m *SystemResourceModel) bool { return m.OpticalMonitor.ValueBool() }},
+	{dialect.CapOpticalMonitor, "The optical_monitor_non_ruckus attribute of icx_system",
+		func(m *SystemResourceModel) bool { return m.OpticalMonitorNonRuckus.ValueBool() }},
+}
+
+// checkCapabilities records a diagnostic for every planned attribute the
+// device's dialect cannot accept and reports whether all passed. Only the
+// plan side is checked: a value present solely in state (e.g. left behind by
+// a router→switch reimage) is necessarily absent on the device, so removing
+// it must not error.
+func (r *SystemResource) checkCapabilities(plan *SystemResourceModel, diags *diag.Diagnostics) bool {
+	ok := true
+	for _, g := range systemCapabilityGuards {
+		if g.set(plan) && !requireCapability(r.dialect, g.capability, g.feature, diags) {
+			ok = false
+		}
+	}
+	return ok
 }
 
 type SystemResourceModel struct {
@@ -137,27 +179,24 @@ func (r *SystemResource) Configure(_ context.Context, req resource.ConfigureRequ
 		return
 	}
 	r.client = data.Client
-	r.imageType = data.ImageType
-	r.firmwareVersion = data.FirmwareVersion
+	r.dialect = data.Dialect
 }
 
-// ModifyPlan rejects a planned global_stp = true at plan time when the device is
-// known to run the switch image. Destroy plans and a null, unknown, or false
-// value pass; the apply-time guard in Create/Update still backstops a value
-// that only becomes known during apply.
+// ModifyPlan rejects, at plan time, any attribute the device's dialect cannot
+// accept (e.g. global_stp = true on the switch image, manager_* on FastIron
+// 08.0.30) — see systemCapabilityGuards. Destroy plans and null, unknown, or
+// false values pass; the apply-time guard in Create/Update still backstops a
+// value that only becomes known during apply.
 func (r *SystemResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
 		return
 	}
-	var globalSTP types.Bool
-	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("global_stp"), &globalSTP)...)
+	var plan SystemResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if !globalSTP.ValueBool() {
-		return
-	}
-	requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics)
+	r.checkCapabilities(&plan, &resp.Diagnostics)
 }
 
 func (r *SystemResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -167,8 +206,7 @@ func (r *SystemResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 
-	if plan.GlobalSTP.ValueBool() &&
-		!requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics) {
+	if !r.checkCapabilities(&plan, &resp.Diagnostics) {
 		return
 	}
 
@@ -237,8 +275,7 @@ func (r *SystemResource) Update(ctx context.Context, req resource.UpdateRequest,
 	// Guard only the plan side: global_stp=true solely in state (left behind
 	// by a router→switch reimage) is necessarily absent on a switch image, so
 	// turning it off must not error — the `no global-stp` is skipped instead.
-	if plan.GlobalSTP.ValueBool() &&
-		!requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics) {
+	if !r.checkCapabilities(&plan, &resp.Diagnostics) {
 		return
 	}
 
@@ -247,7 +284,7 @@ func (r *SystemResource) Update(ctx context.Context, req resource.UpdateRequest,
 	if plan.GlobalSTP.ValueBool() != state.GlobalSTP.ValueBool() {
 		if plan.GlobalSTP.ValueBool() {
 			commands = append(commands, "global-stp")
-		} else if r.imageType != parser.ImageTypeSwitch {
+		} else if r.dialect.Has(dialect.CapGlobalSTP) {
 			commands = append(commands, "no global-stp")
 		}
 	}
@@ -261,11 +298,7 @@ func (r *SystemResource) Update(ctx context.Context, req resource.UpdateRequest,
 	}
 
 	if plan.DHCPClientDisable.ValueBool() != state.DHCPClientDisable.ValueBool() {
-		if plan.DHCPClientDisable.ValueBool() {
-			commands = append(commands, "ip dhcp-client disable")
-		} else {
-			commands = append(commands, "no ip dhcp-client disable")
-		}
+		commands = append(commands, r.dialect.DHCPClientDisable(plan.DHCPClientDisable.ValueBool()))
 	}
 
 	if plan.OpticalMonitor.ValueBool() != state.OpticalMonitor.ValueBool() {
@@ -338,14 +371,14 @@ func (r *SystemResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	// configured (and `no global-stp` does not exist), so a true value in
 	// stale state is skipped rather than blocking the singleton's delete.
 	var commands []string
-	if state.GlobalSTP.ValueBool() && r.imageType != parser.ImageTypeSwitch {
+	if state.GlobalSTP.ValueBool() && r.dialect.Has(dialect.CapGlobalSTP) {
 		commands = append(commands, "no global-stp")
 	}
 	if !state.TelnetServer.ValueBool() {
 		commands = append(commands, "telnet server")
 	}
 	if state.DHCPClientDisable.ValueBool() {
-		commands = append(commands, "no ip dhcp-client disable")
+		commands = append(commands, r.dialect.DHCPClientDisable(false))
 	}
 	if state.OpticalMonitor.ValueBool() {
 		commands = append(commands, "no optical-monitor")
@@ -385,7 +418,7 @@ func (r *SystemResource) buildCommands(plan *SystemResourceModel) []string {
 		commands = append(commands, "no telnet server")
 	}
 	if plan.DHCPClientDisable.ValueBool() {
-		commands = append(commands, "ip dhcp-client disable")
+		commands = append(commands, r.dialect.DHCPClientDisable(true))
 	}
 	if plan.OpticalMonitor.ValueBool() {
 		commands = append(commands, "optical-monitor")

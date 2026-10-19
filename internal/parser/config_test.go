@@ -2,6 +2,7 @@ package parser
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -297,5 +298,33 @@ func TestParseRunningConfig_AllConfigs(t *testing.T) {
 				t.Errorf("parse error: %v", err)
 			}
 		})
+	}
+}
+
+// Both DHCP-client dialects map onto DHCPClientDisable: the 08.0.9x
+// `ip dhcp-client disable` and the 08.0.30 switch-image `[no] ip dhcp-client enable`.
+func TestParseDHCPClientForms(t *testing.T) {
+	tests := []struct {
+		line string
+		want bool
+	}{
+		{"ip dhcp-client disable", true},
+		{"no ip dhcp-client enable", true},
+		{"ip dhcp-client enable", false},
+		{"hostname x", false},
+	}
+	for _, tt := range tests {
+		config, err := ParseRunningConfig("ver 08.0.30uT311\n" + tt.line + "\n!\n")
+		if err != nil {
+			t.Fatalf("%q: parse error: %v", tt.line, err)
+		}
+		if config.Global.DHCPClientDisable != tt.want {
+			t.Errorf("%q: DHCPClientDisable = %v, want %v", tt.line, config.Global.DHCPClientDisable, tt.want)
+		}
+		for _, l := range config.RawLines {
+			if strings.Contains(l, "dhcp-client") {
+				t.Errorf("%q: must not be left as a raw line", tt.line)
+			}
+		}
 	}
 }

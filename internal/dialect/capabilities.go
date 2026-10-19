@@ -1,0 +1,167 @@
+package dialect
+
+import "fmt"
+
+// Capability names one firmware- or image-dependent behaviour.
+type Capability string
+
+const (
+	// CapVEInterfaces: `interface ve N`. Router image only.
+	CapVEInterfaces Capability = "ve_interfaces"
+	// CapRouterInterface: `router-interface ve N` in VLAN context. Router image only.
+	CapRouterInterface Capability = "router_interface"
+	// CapGlobalSTP: the global `global-stp` command. Router image only — the
+	// switch image runs STP per VLAN and has no such command.
+	CapGlobalSTP Capability = "global_stp"
+	// CapManager: the SmartZone/Unleashed `manager ...` commands
+	// (registrar, disable, port-list). Absent on FastIron 08.0.30 (ICX
+	// 6430/6450); SmartZone documents 08.0.80 as the minimum release for ICX
+	// management.
+	CapManager Capability = "manager"
+	// CapOpticalMonitor: the global `optical-monitor` commands behind
+	// icx_system's optical_monitor and optical_monitor_non_ruckus attributes.
+	// (Per-interface `optical-monitor` on icx_interface_ethernet is not
+	// gated.) Present in every known dialect; whether a given optic or
+	// platform reports DOM data is a hardware question left to the switch.
+	CapOpticalMonitor Capability = "optical_monitor"
+
+	// CapDualMode is a syntax form, not a feature: trunk ports that also carry
+	// an untagged VLAN are expressed with `dual-mode <vlan>` under the
+	// interface (FastIron 08.0.30 through 08.0.7x) instead of a VLAN-context
+	// `untagged ethe` alongside `tagged ethe` (08.0.80+). The 08.0.80 release
+	// notes deprecate `dual-mode`; the 08.0.90 L2 guide says it is gone.
+	CapDualMode Capability = "dual_mode"
+	// CapLegacyDHCPClient is a syntax form: the DHCP client is controlled with
+	// `[no] ip dhcp-client enable` (enabled by default) instead of
+	// `[no] ip dhcp-client disable`. Observed on the 08.0.30 switch image (ICX
+	// 6430); the 08.0.30 router image (ICX 6450) already uses the 08.0.9x form.
+	// Use DHCPClientDisable rather than branching on this directly.
+	CapLegacyDHCPClient Capability = "legacy_dhcp_client"
+)
+
+var (
+	// v08080 is the first release with the 08.0.9x-style VLAN/L2 dialect
+	// (dual-mode deprecated) and the minimum SmartZone-manageable release.
+	v08080 = Version{Major: 8, Minor: 0, Patch: 80}
+)
+
+// kind distinguishes feature capabilities (permissive when unknown) from
+// syntax forms (08.0.9x spelling when unknown). Both are encoded in the
+// predicate itself; kind is used for documentation and tests.
+type kind int
+
+const (
+	feature kind = iota
+	form
+)
+
+// rule is one row of the capability table.
+type rule struct {
+	kind kind
+	// has decides the capability. Feature predicates must return true when
+	// the axis they depend on is unknown; form predicates must return false.
+	has func(d Dialect) bool
+	// title is the diagnostic summary when a feature is unavailable.
+	title string
+	// why explains, as a clause following the feature name, why the feature
+	// is unavailable on d. Only consulted when has(d) is false.
+	why func(d Dialect) string
+	// docs points the user at the relevant documentation section.
+	docs string
+}
+
+const (
+	docsRouterImage = `See the "Router Image vs. Switch Image" section of the provider documentation ` +
+		`(docs/index.md#router-image-vs-switch-image).`
+	docsDialects = `See the "Firmware dialects and capabilities" section of the provider documentation ` +
+		`(docs/index.md#firmware-dialects-and-capabilities).`
+)
+
+var routerImageRule = rule{
+	kind:  feature,
+	has:   func(d Dialect) bool { return !d.switchImage() },
+	title: "Router image required",
+	why: func(d Dialect) string {
+		return fmt.Sprintf("is only available on the FastIron router image, but this device runs "+
+			"the switch image (firmware %s)", d.Firmware())
+	},
+	docs: docsRouterImage,
+}
+
+// table is the capability matrix. To support a new model or firmware, add or
+// adjust rows here — never add version/image checks in resources.
+var table = map[Capability]rule{
+	CapVEInterfaces:    routerImageRule,
+	CapRouterInterface: routerImageRule,
+	CapGlobalSTP:       routerImageRule,
+	CapManager: {
+		kind:  feature,
+		has:   func(d Dialect) bool { return !d.before(v08080) },
+		title: "Not supported by this firmware",
+		why: func(d Dialect) string {
+			return fmt.Sprintf("is not available on FastIron %s (firmware %s); the manager commands "+
+				"require FastIron 08.0.80 or later", d.Version.Family(), d.Firmware())
+		},
+		docs: docsDialects,
+	},
+	CapOpticalMonitor: {
+		kind: feature,
+		has:  func(Dialect) bool { return true },
+	},
+	CapDualMode: {
+		kind: form,
+		has:  func(d Dialect) bool { return d.dualModeSeen || d.before(v08080) },
+	},
+	CapLegacyDHCPClient: {
+		kind: form,
+		has:  func(d Dialect) bool { return d.before(v08080) && d.switchImage() },
+	},
+}
+
+// Capabilities lists every capability in display order.
+func Capabilities() []Capability {
+	return []Capability{
+		CapVEInterfaces, CapRouterInterface, CapGlobalSTP, CapManager,
+		CapOpticalMonitor, CapDualMode, CapLegacyDHCPClient,
+	}
+}
+
+// IsSyntaxForm reports whether c selects between two spellings rather than
+// gating a feature.
+func IsSyntaxForm(c Capability) bool { return table[c].kind == form }
+
+// Has reports whether d has capability c. An unregistered capability is
+// reported as present, consistent with the never-block rule.
+func (d Dialect) Has(c Capability) bool {
+	r, ok := table[c]
+	if !ok {
+		return true
+	}
+	return r.has(d)
+}
+
+// Why returns a clause explaining why d lacks c, suitable for following the
+// feature name: "<feature> " + Why(c). It returns "" when d has c.
+func (d Dialect) Why(c Capability) string {
+	r, ok := table[c]
+	if !ok || r.has(d) || r.why == nil {
+		return ""
+	}
+	return r.why(d)
+}
+
+// Title returns the diagnostic summary for a missing c.
+func Title(c Capability) string {
+	if t := table[c].title; t != "" {
+		return t
+	}
+	return "Not supported by this firmware"
+}
+
+// Docs returns the documentation pointer for a missing c.
+func Docs(c Capability) string {
+	if s := table[c].docs; s != "" {
+		return s
+	}
+	return docsDialects
+}

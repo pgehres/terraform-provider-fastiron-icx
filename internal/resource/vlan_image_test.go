@@ -7,6 +7,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
 )
@@ -14,9 +15,8 @@ import (
 func newSwitchImageVLANResource() (*VLANResource, *sshclient.MockClient) {
 	mock := sshclient.NewMockClient("")
 	return &VLANResource{
-		client:          mock,
-		imageType:       parser.ImageTypeSwitch,
-		firmwareVersion: "08.0.95rT211",
+		client:  mock,
+		dialect: dialect.Detect("08.0.95rT211", parser.ImageTypeSwitch),
 	}, mock
 }
 
@@ -106,7 +106,7 @@ func TestVLANUpdate_SwitchImageStateOnlyRouterInterfaceSkips(t *testing.T) {
 // On a router image the same removal sends `no router-interface ve N`.
 func TestVLANUpdate_RouterImageRemovesRouterInterface(t *testing.T) {
 	r, mock := newSwitchImageVLANResource()
-	r.imageType = parser.ImageTypeRouter
+	r.dialect = dialect.Detect(r.dialect.Version.Raw, parser.ImageTypeRouter)
 	state, plan := vlanStateAndPlan(t, r, vlanModel(types.Int64Value(20)), vlanModel(types.Int64Null()))
 
 	resp := resource.UpdateResponse{State: state}

@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
@@ -25,9 +26,8 @@ var (
 )
 
 type InterfaceVEResource struct {
-	client          sshclient.CommandExecutor
-	imageType       parser.ImageType
-	firmwareVersion string
+	client  sshclient.CommandExecutor
+	dialect dialect.Dialect
 }
 
 type InterfaceVEResourceModel struct {
@@ -82,8 +82,7 @@ func (r *InterfaceVEResource) Configure(_ context.Context, req resource.Configur
 		return
 	}
 	r.client = data.Client
-	r.imageType = data.ImageType
-	r.firmwareVersion = data.FirmwareVersion
+	r.dialect = data.Dialect
 }
 
 // ModifyPlan rejects creating or updating a VE at plan time when the device is
@@ -94,7 +93,7 @@ func (r *InterfaceVEResource) ModifyPlan(_ context.Context, req resource.ModifyP
 	if req.Plan.Raw.IsNull() {
 		return
 	}
-	requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics)
+	requireCapability(r.dialect, dialect.CapVEInterfaces, "icx_interface_ve", &resp.Diagnostics)
 }
 
 func (r *InterfaceVEResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -104,7 +103,7 @@ func (r *InterfaceVEResource) Create(ctx context.Context, req resource.CreateReq
 		return
 	}
 
-	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
+	if !requireCapability(r.dialect, dialect.CapVEInterfaces, "icx_interface_ve", &resp.Diagnostics) {
 		return
 	}
 
@@ -147,7 +146,7 @@ func (r *InterfaceVEResource) Read(ctx context.Context, req resource.ReadRequest
 	// A switch-image device cannot have VE interfaces. Treat that as the VE
 	// being absent rather than erroring, so state left behind by a
 	// router→switch reimage can still be refreshed away and destroyed.
-	if r.imageType == parser.ImageTypeSwitch {
+	if !r.dialect.Has(dialect.CapVEInterfaces) {
 		resp.State.RemoveResource(ctx)
 		return
 	}
@@ -188,7 +187,7 @@ func (r *InterfaceVEResource) Update(ctx context.Context, req resource.UpdateReq
 		return
 	}
 
-	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
+	if !requireCapability(r.dialect, dialect.CapVEInterfaces, "icx_interface_ve", &resp.Diagnostics) {
 		return
 	}
 
@@ -265,7 +264,7 @@ func (r *InterfaceVEResource) Delete(ctx context.Context, req resource.DeleteReq
 	// On a switch image the VE necessarily does not exist; succeed without
 	// sending commands so stale state from a router→switch reimage can be
 	// destroyed.
-	if r.imageType == parser.ImageTypeSwitch {
+	if !r.dialect.Has(dialect.CapVEInterfaces) {
 		return
 	}
 
@@ -286,7 +285,7 @@ func (r *InterfaceVEResource) ImportState(ctx context.Context, req resource.Impo
 	// Read treats a VE on a switch image as absent, which would surface as the
 	// framework's generic "Cannot import non-existent remote object". Fail
 	// with the specific reason instead.
-	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
+	if !requireCapability(r.dialect, dialect.CapVEInterfaces, "icx_interface_ve", &resp.Diagnostics) {
 		return
 	}
 

@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
@@ -38,7 +39,8 @@ var rePort = regexp.MustCompile(`^\d+/\d+/\d+$`)
 var rePortName = regexp.MustCompile(`^[^"\x00-\x1f]+$`)
 
 type InterfaceEthernetResource struct {
-	client sshclient.CommandExecutor
+	client  sshclient.CommandExecutor
+	dialect dialect.Dialect
 }
 
 type InterfaceEthernetResourceModel struct {
@@ -161,6 +163,14 @@ func (r *InterfaceEthernetResource) Configure(_ context.Context, req resource.Co
 		return
 	}
 	r.client = data.Client
+	r.dialect = data.Dialect
+}
+
+// dialectFor returns the dialect to use against config: the Configure-time
+// detection, refined with evidence from config itself (its version when the
+// provider could not detect one, and any `dual-mode` lines it contains).
+func (r *InterfaceEthernetResource) dialectFor(config *parser.RunningConfig) dialect.Dialect {
+	return r.dialect.Observe(config)
 }
 
 func (r *InterfaceEthernetResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -479,12 +489,12 @@ func (r *InterfaceEthernetResource) resolveTaggedVLANs(ctx context.Context, plan
 // If oldState is nil, this is a create operation; otherwise it's an update.
 //
 // On FastIron releases that have the `dual-mode` interface command (08.0.30
-// through 08.0.7x — see parser.FirmwareHasDualMode) the trunk-untagged case is
+// through 08.0.7x — dialect.CapDualMode) the trunk-untagged case is
 // expressed differently and is handled by buildDualModeMembershipCommands.
 // On 08.0.80+ (the ICX 7000-series fleet on 08.0.95) this function's
 // VLAN-context-only form is used unchanged.
 func (r *InterfaceEthernetResource) buildVLANMembershipCommands(ctx context.Context, plan *InterfaceEthernetResourceModel, oldState *InterfaceEthernetResourceModel, config *parser.RunningConfig, diags *diag.Diagnostics) []string {
-	if config.UsesDualMode() {
+	if r.dialectFor(config).Has(dialect.CapDualMode) {
 		return r.buildDualModeMembershipCommands(ctx, plan, oldState, config, diags)
 	}
 
@@ -553,17 +563,6 @@ func (r *InterfaceEthernetResource) buildVLANMembershipCommands(ctx context.Cont
 	return commands
 }
 
-// dualModeCommand returns the interface-context command that makes port's
-// untagged VLAN vlanID on dual-mode firmware. FastIron documents the bare form
-// (`dual-mode`, no argument) as "untagged in the default VLAN", so VLAN 1 is
-// emitted that way rather than as `dual-mode 1`.
-func dualModeCommand(vlanID int) string {
-	if vlanID == 1 {
-		return "dual-mode"
-	}
-	return fmt.Sprintf("dual-mode %d", vlanID)
-}
-
 // buildDualModeMembershipCommands is the FastIron 08.0.30-era counterpart of
 // buildVLANMembershipCommands.
 //
@@ -602,6 +601,7 @@ func dualModeCommand(vlanID int) string {
 // operation) is the source of truth for steps 1 and 4, so an interface whose
 // dual-mode drifted by hand is healed on the next apply that touches it.
 func (r *InterfaceEthernetResource) buildDualModeMembershipCommands(ctx context.Context, plan *InterfaceEthernetResourceModel, oldState *InterfaceEthernetResourceModel, config *parser.RunningConfig, diags *diag.Diagnostics) []string {
+	d := r.dialectFor(config)
 	port := plan.Port.ValueString()
 	var commands []string
 
@@ -643,7 +643,7 @@ func (r *InterfaceEthernetResource) buildDualModeMembershipCommands(ctx context.
 	if !newDual && deviceDual != nil {
 		commands = append(commands,
 			fmt.Sprintf("interface ethernet %s", port),
-			"no dual-mode",
+			d.NoDualMode(),
 			"exit",
 		)
 	}
@@ -672,7 +672,7 @@ func (r *InterfaceEthernetResource) buildDualModeMembershipCommands(ctx context.
 	if newDual && (deviceDual == nil || *deviceDual != newUntagged) {
 		commands = append(commands,
 			fmt.Sprintf("interface ethernet %s", port),
-			dualModeCommand(newUntagged),
+			d.DualMode(newUntagged),
 			"exit",
 		)
 	}
@@ -731,7 +731,7 @@ func (r *InterfaceEthernetResource) buildVLANRemovalCommands(ctx context.Context
 	if iface := config.FindEthernetInterface(port); iface != nil && iface.DualModeVLAN != nil {
 		commands = append(commands,
 			fmt.Sprintf("interface ethernet %s", port),
-			"no dual-mode",
+			r.dialectFor(config).NoDualMode(),
 			"exit",
 		)
 	}

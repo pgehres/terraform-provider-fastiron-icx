@@ -9,6 +9,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
 )
@@ -18,9 +19,8 @@ import (
 func newSwitchImageVEResource() (*InterfaceVEResource, *sshclient.MockClient) {
 	mock := sshclient.NewMockClient("")
 	return &InterfaceVEResource{
-		client:          mock,
-		imageType:       parser.ImageTypeSwitch,
-		firmwareVersion: "08.0.30uT311",
+		client:  mock,
+		dialect: dialect.Detect("08.0.30uT311", parser.ImageTypeSwitch),
 	}, mock
 }
 

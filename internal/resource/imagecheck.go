@@ -4,35 +4,27 @@ import (
 	"fmt"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
-	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 )
 
-// requireRouterImage records an error diagnostic and returns false when the
-// device is known to run the FastIron switch image, which lacks the Layer 3
-// commands behind router-image-only features. ImageTypeUnknown passes, so a
-// device whose image could not be detected is never blocked — the switch's
-// own CLI error still backstops those.
+// requireCapability records an error diagnostic and returns false when the
+// device's dialect positively lacks capability c (see internal/dialect). A
+// dialect that could not be detected never blocks — the switch's own CLI
+// error still backstops those.
 //
 // The same helper backs both the plan-time checks (each guarded resource's
-// ModifyPlan, so a misconfiguration against a detected switch image fails
-// `terraform plan` before any resource is applied) and the apply-time CRUD
-// guards, which remain as a backstop for paths that skip ModifyPlan. Both
-// therefore emit identical "Router image required" diagnostics.
-func requireRouterImage(imageType parser.ImageType, firmwareVersion, feature string, diags *diag.Diagnostics) bool {
-	if imageType != parser.ImageTypeSwitch {
+// ModifyPlan, so a misconfiguration fails `terraform plan` before any
+// resource is applied) and the apply-time CRUD guards, which remain as a
+// backstop for paths that skip ModifyPlan. Both therefore emit identical
+// diagnostics; for the router-image capabilities that is the
+// "Router image required" error.
+func requireCapability(d dialect.Dialect, c dialect.Capability, feature string, diags *diag.Diagnostics) bool {
+	if d.Has(c) {
 		return true
 	}
-
-	version := firmwareVersion
-	if version == "" {
-		version = "unknown"
-	}
 	diags.AddError(
-		"Router image required",
-		fmt.Sprintf("%s is only available on the FastIron router image, but this device runs "+
-			"the switch image (firmware %s). No commands were sent to the switch. "+
-			"See the \"Router Image vs. Switch Image\" section of the provider documentation "+
-			"(docs/index.md#router-image-vs-switch-image).", feature, version),
+		dialect.Title(c),
+		fmt.Sprintf("%s %s. No commands were sent to the switch. %s", feature, d.Why(c), dialect.Docs(c)),
 	)
 	return false
 }

@@ -30,10 +30,10 @@ resource "icx_system" "this" {
 
 - `global_stp` (Boolean) - Enable global 802.1w spanning tree. Defaults to `false`. Router image only — see the switch-image note above; on a switch-image device (any model) this command does not exist, and setting `true` against a detected switch image is rejected at plan time (an undetected image degrades to an apply-time CLI error).
 - `telnet_server` (Boolean) - Enable the telnet server. Set to `false` to disable (sends `no telnet server`). Defaults to `true`.
-- `dhcp_client_disable` (Boolean) - Disable the DHCP client globally. Defaults to `false`.
+- `dhcp_client_disable` (Boolean) - Disable the DHCP client globally. Defaults to `false`. Rendered as `ip dhcp-client disable` on most firmware, and as `no ip dhcp-client enable` on the FastIron 08.0.30 switch image (ICX 6430); both spellings are read back as `true` (see [Firmware dialects and capabilities](../index.md#firmware-dialects-and-capabilities)). **Migration:** on FastIron 08.0.30 switch-image devices the DHCP client is reported correctly as disabled starting with this version (earlier versions read it as `false`). Set `dhcp_client_disable = true` to match before applying; otherwise the one-time plan diff `true -> false` would send `ip dhcp-client enable` to a device that uses a static management IP.
 - `optical_monitor` (Boolean) - Enable optical monitoring globally. Defaults to `false`.
 - `optical_monitor_non_ruckus` (Boolean) - Enable optical monitoring for non-Ruckus optics. Defaults to `false`.
-- `manager_registrar` (Boolean) - Enable the manager registrar. Defaults to `false`.
+- `manager_registrar` (Boolean) - Enable the manager registrar. Defaults to `false`. The `manager_*` attributes require FastIron 08.0.80 or later; setting them on an older release (e.g. 08.0.30 on the ICX 6430/6450) is rejected at plan time.
 - `manager_disable` (Boolean) - Disable the manager. Defaults to `false`.
 - `manager_port_list` (String) - Manager port list string (e.g. `"987"`).
 
