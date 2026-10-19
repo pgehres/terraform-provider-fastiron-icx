@@ -54,23 +54,41 @@ var ErrSessionLostAfterHostname = errors.New("SSH session lost after a hostname 
 // ">" and adopt "-" as the prompt.
 var anyPrompt = regexp.MustCompile(`^\s*([\w@.\-]+(?:\s+\w+)?)\s*(?:\([^\)]*\))?[#>]\s*$`)
 
-// Client manages an interactive SSH shell session to an ICX switch.
+// Client manages an interactive CLI session to an ICX switch. The session
+// layer — prompt detection, enable mode, paging, the byte pump with its
+// deadlines, control-character rejection — is transport-agnostic: it reads
+// from and writes to whatever interactive terminal newSessionClient was
+// handed. NewClient supplies an SSH shell, NewTelnetClient a telnet
+// connection; Connect picks one from Options.Transport.
 type Client struct {
-	mu           sync.Mutex
-	sshClient    *ssh.Client
-	session      *ssh.Session
-	stdin        io.WriteCloser
-	byteCh       chan byteResult // pumped by the background reader goroutine
-	promptRegex  *regexp.Regexp
-	promptString string // The exact detected prompt (e.g., "ICX7250-24 Router#")
-	inConfigMode bool
-	disconnected bool  // set once the session is known to be unusable; see markLost
-	lostErr      error // why; returned by every later call (ErrSessionSevered if unset)
-	options      Options
+	mu             sync.Mutex
+	stdin          io.Writer       // the terminal's input: SSH stdin pipe or telnet connection
+	closeTransport func() error    // releases the SSH session + connection, or the TCP socket
+	byteCh         chan byteResult // pumped by the background reader goroutine
+	promptRegex    *regexp.Regexp
+	promptString   string // The exact detected prompt (e.g., "ICX7250-24 Router#")
+	inConfigMode   bool
+	disconnected   bool  // set once the session is known to be unusable; see markLost
+	lostErr        error // why; returned by every later call (ErrSessionSevered if unset)
+	options        Options
 }
 
-// NewClient connects to the switch, starts an interactive shell, disables paging,
-// enters enable mode if needed, and returns a ready-to-use Client.
+// Connect opens a session over the transport named in opts.Transport ("ssh",
+// the default when empty, or "telnet") and returns a ready-to-use Client.
+func Connect(opts Options) (*Client, error) {
+	switch opts.Transport {
+	case "", TransportSSH:
+		return NewClient(opts)
+	case TransportTelnet:
+		return NewTelnetClient(opts)
+	default:
+		return nil, fmt.Errorf("unknown transport %q (want %q or %q)", opts.Transport, TransportSSH, TransportTelnet)
+	}
+}
+
+// NewClient connects to the switch over SSH, starts an interactive shell,
+// disables paging, enters enable mode if needed, and returns a ready-to-use
+// Client.
 func NewClient(opts Options) (*Client, error) {
 	if opts.Port == 0 {
 		opts.Port = 22
@@ -85,10 +103,8 @@ func NewClient(opts Options) (*Client, error) {
 	}
 
 	config := &ssh.ClientConfig{
-		User: opts.Username,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(opts.Password),
-		},
+		User:            opts.Username,
+		Auth:            authMethods(opts),
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         time.Duration(opts.TimeoutSeconds) * time.Second,
 	}
@@ -138,21 +154,80 @@ func NewClient(opts Options) (*Client, error) {
 		return nil, fmt.Errorf("start shell: %w", err)
 	}
 
-	c := &Client{
-		sshClient: sshClient,
-		session:   session,
-		stdin:     stdin,
-		byteCh:    make(chan byteResult, 256),
-		options:   opts,
+	closeTransport := func() error {
+		var errs []string
+		if err := session.Close(); err != nil {
+			errs = append(errs, fmt.Sprintf("session close: %v", err))
+		}
+		if err := sshClient.Close(); err != nil {
+			errs = append(errs, fmt.Sprintf("client close: %v", err))
+		}
+		if len(errs) > 0 {
+			return fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
+		return nil
 	}
 
-	// Background goroutine: pump bytes from stdout into byteCh.
-	// Closes byteCh when the pipe errors or reaches EOF (including on session close).
+	c := newSessionClient(stdout, stdin, closeTransport, opts)
+
+	// SSH authenticated already, so the shell opens straight at a CLI prompt.
+	initialOutput, err := c.readUntilPromptInitial(false)
+	if err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("waiting for initial prompt: %w", err)
+	}
+	if err := c.start(initialOutput); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// authMethods returns the SSH authentication methods offered for opts. The
+// x/crypto client always tries the "none" method first (RFC 4252 §5.2) and
+// only then the methods listed here, in the order the server suggests them —
+// so a switch with no credentials configured is already covered when it
+// accepts "none". Password authentication is always offered. With
+// AllowEmptyCredentials the password (empty or not) is additionally given as
+// the answer to every keyboard-interactive question, which is how some SSH
+// stacks present their (possibly empty) password prompt instead of the
+// "password" method; it is gated so that the default connection behaviour —
+// a single password attempt — does not change for anyone else.
+func authMethods(opts Options) []ssh.AuthMethod {
+	methods := []ssh.AuthMethod{ssh.Password(opts.Password)}
+	if opts.AllowEmptyCredentials {
+		methods = append(methods, ssh.KeyboardInteractive(
+			func(_, _ string, questions []string, _ []bool) ([]string, error) {
+				answers := make([]string, len(questions))
+				for i := range answers {
+					answers[i] = opts.Password
+				}
+				return answers, nil
+			}))
+	}
+	return methods
+}
+
+// newSessionClient wraps an already-connected interactive terminal — the SSH
+// shell's stdout/stdin pipes, or a telnet connection — in a Client and starts
+// the background byte pump. closeTransport releases the underlying
+// connection; Close calls it. The caller then reads the login/initial prompt
+// and calls start.
+func newSessionClient(r io.Reader, w io.Writer, closeTransport func() error, opts Options) *Client {
+	c := &Client{
+		stdin:          w,
+		closeTransport: closeTransport,
+		byteCh:         make(chan byteResult, 256),
+		options:        opts,
+	}
+
+	// Background goroutine: pump bytes from the terminal into byteCh.
+	// Closes byteCh when the reader errors or reaches EOF (including on close).
 	go func() {
 		buf := make([]byte, 1)
 		defer close(c.byteCh)
 		for {
-			_, err := stdout.Read(buf)
+			_, err := r.Read(buf)
 			if err != nil {
 				// Surface non-EOF transport errors (e.g. connection reset) to the
 				// reader instead of collapsing them into a generic EOF. The send is
@@ -169,43 +244,42 @@ func NewClient(opts Options) (*Client, error) {
 		}
 	}()
 
-	// Wait for the initial prompt.
-	initialOutput, err := c.readUntilPromptInitial()
-	if err != nil {
-		_ = c.Close()
-		return nil, fmt.Errorf("waiting for initial prompt: %w", err)
-	}
+	return c
+}
 
+// start brings a freshly connected session to a usable state: it enters
+// enable mode when the switch landed in user mode (a ">" prompt), learns the
+// exact prompt, and disables paging. initialOutput is everything read up to
+// and including the first CLI prompt. The caller closes the client on error.
+func (c *Client) start(initialOutput string) error {
 	// Detect if we're in user mode (>) and need to enable.
 	if strings.HasSuffix(strings.TrimSpace(initialOutput), ">") {
-		if opts.EnablePassword == "" {
-			_ = c.Close()
-			return nil, fmt.Errorf("switch requires enable password but none was provided")
+		// A switch with no enable password configured answers `enable` with
+		// "No password has been assigned yet" and a "#" prompt, which
+		// enterEnableMode handles; and if it does prompt, an empty line is
+		// sent. Both are only acceptable when the caller opted in.
+		if c.options.EnablePassword == "" && !c.options.AllowEmptyCredentials {
+			return fmt.Errorf("switch requires enable password but none was provided")
 		}
 		if err := c.enterEnableMode(); err != nil {
-			_ = c.Close()
-			return nil, fmt.Errorf("enter enable mode: %w", err)
+			return fmt.Errorf("enter enable mode: %w", err)
 		}
 	}
 
 	// Build the prompt regex now that we're in privileged mode.
 	if err := c.detectPrompt(); err != nil {
-		_ = c.Close()
-		return nil, fmt.Errorf("detect prompt: %w", err)
+		return fmt.Errorf("detect prompt: %w", err)
 	}
 
 	// Disable paging and verify the command succeeded.
 	output, err := c.Execute("skip-page-display")
 	if err != nil {
-		_ = c.Close()
-		return nil, fmt.Errorf("disable paging: %w", err)
+		return fmt.Errorf("disable paging: %w", err)
 	}
 	if errMsg := detectCLIError(output); errMsg != "" {
-		_ = c.Close()
-		return nil, fmt.Errorf("disable paging: %s", errMsg)
+		return fmt.Errorf("disable paging: %s", errMsg)
 	}
-
-	return c, nil
+	return nil
 }
 
 // buildHostKeyCallback constructs the ssh.HostKeyCallback from Options.
@@ -567,8 +641,9 @@ func (c *Client) GetRunningConfig() (string, error) {
 	return c.execute("show running-config")
 }
 
-// Close exits config mode, closes the SSH session and connection.
-// Closing the session causes the reader goroutine to exit, so Close never deadlocks.
+// Close exits config mode and closes the underlying transport (SSH session
+// and connection, or telnet socket). Closing the transport causes the reader
+// goroutine to exit, so Close never deadlocks.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -581,15 +656,11 @@ func (c *Client) Close() error {
 		}
 		c.inConfigMode = false
 	}
-	if c.session != nil {
-		if err := c.session.Close(); err != nil {
-			errs = append(errs, fmt.Sprintf("session close: %v", err))
+	if c.closeTransport != nil {
+		if err := c.closeTransport(); err != nil {
+			errs = append(errs, err.Error())
 		}
-	}
-	if c.sshClient != nil {
-		if err := c.sshClient.Close(); err != nil {
-			errs = append(errs, fmt.Sprintf("client close: %v", err))
-		}
+		c.closeTransport = nil
 	}
 
 	if len(errs) > 0 {
@@ -691,12 +762,31 @@ func (c *Client) readUntilPrompt() (string, error) {
 	}
 }
 
-// readUntilPromptInitial reads until we see either > or # at the end of a line.
-// Used before prompt detection is set up.
-func (c *Client) readUntilPromptInitial() (string, error) {
+// initialPrompt matches a CLI prompt of either mode (">" or "#") at the end
+// of the buffer, before the exact prompt is known.
+var initialPrompt = regexp.MustCompile(`[\w@\-]+(?:\s+\w+)?\s*[#>]\s*$`)
+
+// Login prompts a telnet session may print before the CLI prompt: FastIron
+// asks "User Name:" / "Password:" when local or AAA login is configured and
+// prints nothing at all when it is not. Matched on the current line only,
+// anchored, so a banner sentence mentioning a password is not mistaken for
+// one.
+var (
+	usernamePrompt = regexp.MustCompile(`(?i)^\s*(?:user\s?name|login|username)\s*:\s*$`)
+	passwordPrompt = regexp.MustCompile(`(?i)^\s*password\s*:\s*$`)
+)
+
+// readUntilPromptInitial reads until we see either > or # at the end of a
+// line. Used before prompt detection is set up. With handleLogin set (telnet,
+// where the transport has not authenticated anything) a "User Name:" or
+// "Password:" line is answered with the configured username or password —
+// each at most once, so a rejected login fails by timeout with the switch's
+// output in the error instead of retrying forever — and reading continues
+// until the CLI prompt appears.
+func (c *Client) readUntilPromptInitial(handleLogin bool) (string, error) {
 	var buf strings.Builder
 	deadline := time.Now().Add(time.Duration(c.options.TimeoutSeconds) * time.Second)
-	initialPrompt := regexp.MustCompile(`[\w@\-]+(?:\s+\w+)?\s*[#>]\s*$`)
+	usernameSent, passwordSent := false, false
 
 	for {
 		b, err := c.readByteWithDeadline(deadline)
@@ -709,9 +799,30 @@ func (c *Client) readUntilPromptInitial() (string, error) {
 		}
 
 		buf.WriteByte(b)
+		content := buf.String()
 
-		if initialPrompt.MatchString(buf.String()) {
-			return buf.String(), nil
+		if initialPrompt.MatchString(content) {
+			return content, nil
+		}
+		if !handleLogin {
+			continue
+		}
+
+		lines := strings.Split(content, "\n")
+		lastLine := strings.TrimRight(sanitizePromptLine(lines[len(lines)-1]), "\r ")
+		switch {
+		case !usernameSent && usernamePrompt.MatchString(lastLine):
+			if _, err := fmt.Fprintf(c.stdin, "%s\n", c.options.Username); err != nil {
+				return content, fmt.Errorf("send username: %w", err)
+			}
+			usernameSent = true
+			buf.WriteByte('\n') // the answer is not echoed back; start a fresh line
+		case !passwordSent && passwordPrompt.MatchString(lastLine):
+			if _, err := fmt.Fprintf(c.stdin, "%s\n", c.options.Password); err != nil {
+				return content, fmt.Errorf("send password: %w", err)
+			}
+			passwordSent = true
+			buf.WriteByte('\n')
 		}
 	}
 }
