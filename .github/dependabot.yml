@@ -10,3 +10,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # init and analyze must run the same CodeQL version; bumping them in
+      # separate PRs fails CodeQL ("Loaded a configuration file for version
+      # X, but running version Y"). Keep them in one PR.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
