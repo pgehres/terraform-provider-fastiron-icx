@@ -1,13 +1,15 @@
 # terraform-provider-fastiron-icx
 
-Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.0.95. Communicates via SSH CLI — no REST API available on this firmware version.
+Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.0.95. Communicates via an interactive CLI session — SSH by default, plaintext telnet as an explicit opt-in for lab/competition switches — no REST API available on this firmware version.
 
 ## Architecture
 
-### SSH Client (`internal/sshclient/`)
-- Single persistent SSH shell session per provider instance
+### CLI Client (`internal/sshclient/`)
+- Single persistent interactive CLI session per provider instance. The package name is historical: the session layer is transport-agnostic and `CommandExecutor` is the one abstraction resources see.
+- **Transports.** `newSessionClient(r, w, closeTransport, opts)` wraps any reader/writer pair in a `Client` and starts the byte pump; `start(initialOutput)` then does enable mode → `detectPrompt` → `skip-page-display`. `NewClient` (SSH shell pipes) and `NewTelnetClient` (`telnet.go`, a hand-written NVT layer over a TCP conn: refuses every option like Python's telnetlib — DO→WONT, WILL→DONT, never answers DONT/WONT, skips SB…SE, unescapes IAC IAC, sends CR LF for `\n`) both build on it; `Connect(opts)` dispatches on `Options.Transport`. Telnet alone runs the login loop in `readUntilPromptInitial(true)`, answering `User Name:`/`Password:` once each if the switch presents them. Tests drive both paths over `net.Pipe` against the scripted `fakeSwitch` in `session_test.go`.
+- **Empty credentials** (`Options.AllowEmptyCredentials`): relaxes the "user-mode prompt but no enable password" error (an empty line is sent if `enable` does prompt) and over SSH adds a keyboard-interactive method answered with the password; x/crypto always tries the `none` method first regardless. Never a default.
 - Mutex-serialized command execution (FastIron doesn't support concurrent config sessions)
-- Prompt detection handles `SSH@HOSTNAME Router#` format with `@` prefix
+- Prompt detection handles `SSH@HOSTNAME Router#` / `telnet@HOSTNAME Router#` format with `@` prefix
 - Enable mode: sends `enable`, watches for `Password:` prompt (exact match, not substring), handles "No password has been assigned yet" gracefully
 - `skip-page-display` sent on connect to disable `--More--` paging
 - ANSI escape codes stripped from output via `sanitizeOutput()`
@@ -44,7 +46,8 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 ### Provider Config
 - Uses provider aliases for multi-switch management (one alias per switch)
 - No default provider needed if all resources specify `provider = icx.<alias>`
-- Env vars: `FASTIRON_HOST`, `FASTIRON_USERNAME`, `FASTIRON_PASSWORD`, `FASTIRON_ENABLE_PASSWORD`
+- Env vars: `FASTIRON_HOST`, `FASTIRON_USERNAME`, `FASTIRON_PASSWORD`, `FASTIRON_ENABLE_PASSWORD`, `FASTIRON_HOST_KEY`, `FASTIRON_PORT`, `FASTIRON_TRANSPORT`
+- Connection policy lives in `resolveConnection` (provider.go), a pure function unit-tested in provider_test.go: credentials required unless `allow_empty_credentials` (warns); SSH needs `host_key` or `insecure_skip_host_key_verify`; `transport = "telnet"` needs `insecure_transport_ack` (error without, plaintext warning with, and SSH-only settings warn as ignored). Port 0 lets the transport pick 22/23.
 
 ## Key Decisions & Gotchas
 
@@ -69,8 +72,10 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 
 14. **`enabled = false` on the management-path port severs the session** (same class as #9). `icx_interface_ethernet` ModifyPlan — and Create/Update as a backstop — resolves the switch's management next hop from the running config (`ip default-gateway` on the switch image, default `ip route` next hop on the router image), runs one read-only `show arp`, and refuses to disable the port that next hop is learned on. When the hop is not resolvable (no default route, hop absent from ARP, `show arp` unparseable) it warns instead of erroring; a Terraform host on the switch's own subnet is not detected because the provider does not know its own address. `arpPorts` parsing is lenient (any line with the IP and a `u/s/p` or `lgN` token) because the exact `show arp` column layout differs between images and has not been captured live. Never add `disable` to a `raw_config` to get around the guard.
 
+15. **Telnet and empty credentials are opt-in, loud, and unvalidated live.** Competition/factory-fresh switches (the SWCCDC fleet is provisioned by an Ansible `ansible.netcommon.telnet` playbook with user "" / password "") expose only telnet, land at `>`, and `enable` needs no password. `transport = "telnet"` + `insecure_transport_ack = true` + `allow_empty_credentials = true` covers that; each is refused or warned about otherwise, and defaults never change for SSH users. The telnet writer sends CR LF per line (NVT / PuTTY default; Ansible's telnetlib sends LF) — if a live switch shows doubled prompts or an extra empty echo, that is the first thing to check. `cmd/debug-ssh -transport telnet -allow-empty-credentials` connects exactly as the provider does. Nothing in this path has touched real hardware yet.
+
 ## Testing
-- `go test ./...` — unit tests (parser against real config fixtures, resources against the mock executor, harness helpers). Never needs a switch; the acceptance tests skip without `TF_ACC`.
+- `go test ./...` — unit tests (parser against real config fixtures, resources against the mock executor, the session layer and telnet transport against a scripted fake switch over `net.Pipe`, the provider connection policy, harness helpers). Never needs a switch; the acceptance tests skip without `TF_ACC`.
 - `make build` / `make install` — build and install locally
 - `make testacc` — acceptance tests in `internal/acctest` against a **live lab switch**, e.g. `FASTIRON_HOST=192.168.2.240 FASTIRON_USERNAME=pgehres FASTIRON_PASSWORD=... FASTIRON_ENABLE_PASSWORD=... FASTIRON_HOST_KEY=SHA256:... FASTIRON_LEGACY_SSH=true TF_ACC_SCRATCH_PORT=1/1/11 make testacc` (`TESTARGS='-run TestAccVLAN'` to narrow). README "Acceptance Tests" has the full environment, pre-flight checklist and per-test table. The harness rules: only `TF_ACC_SCRATCH_PORT` is ever configured; the scratch VLANs (`TF_ACC_SCRATCH_VLAN`/`_2`, default 3999/3998) must not exist, so VLAN 1 and the management VLAN are never touched; the management IP and gateway are never changed (`TestAccManagementIP` changes `dns_servers` only — address/gateway changes, including the off-subnet-gateway question, are manual console-attended lab tests); the scratch user is `tfacc-test`, never the login user. Every test snapshots the running config first, fails (not skips) if a scratch resource is in use, enforces an empty plan after every apply, and requires the running config to match the snapshot line for line after destroy. Only the user runs these; never run them from an automated session.
   - **Harness mechanics worth knowing.** The provider is served in-process and terraform-plugin-testing asks for a fresh instance per `terraform` command without ever closing the old one, so `Env.ProviderFactories` closes the previous instance (`FastIronICXProvider.Close`) before creating the next — otherwise leaked SSH sessions hit FastIron's concurrent-session limit a few commands in. `TestAccSystemHostname` renders every other `icx_system` attribute from the device (a default-valued singleton would "fix" real settings — re-enable the DHCP client on a 6430) and forgets the resource with a `removed` block instead of destroying it (destroy resets all owned settings); `t.Cleanup` restores the original hostname even on failure, via `no hostname` when the device ran its default name. VLAN-creating tests skip when `icx_vlan.Create` would tag the new VLAN onto trunk-all ports (`resource.FindTrunkAllPorts`), unless `TF_ACC_ALLOW_TRUNK_RECONCILE=true`.
@@ -86,6 +91,7 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 - **Reconcile `tagged_vlans` in Read when `tag_all_vlans` is set.** v0.1.1 fixed the create path; Read still skips reconciliation, so any drift not caused by `icx_vlan.Create` remains undetectable (gotcha #8). Comparing actual membership against the expanded set would turn a silent outage into a plan diff.
 - **Detect duplicate port ownership** — two `icx_interface_ethernet` resources on one port currently produce permanent, silent plan churn (gotcha #10). A validation error would catch it at plan time.
 - **Validate the 08.0.30 `dual-mode` dialect live** (gotcha #11): whether re-issuing `dual-mode <new>` on a port that already has dual-mode is accepted or needs `no dual-mode` first, and how a bare `dual-mode` is printed in the running config.
+- **Validate telnet + empty credentials live** (gotcha #15): a no-credential switch over telnet (which IAC options the switch sends, CR LF vs LF line ending, echo handling, `telnet@` prompt) and over SSH (`none` / empty password / keyboard-interactive acceptance, `enable` with no password), plus a switch that does present a `User Name:`/`Password:` telnet login.
 - **Validate `icx_management_ip` live** (gotcha #13): whether the switch image accepts `ip address <new>` as a direct replacement, whether the queued `write memory` survives the session drop, and the exact `no ip dns server-address` syntax. Needs console access.
 - LAG / Port Channel support
 - Telnet transport

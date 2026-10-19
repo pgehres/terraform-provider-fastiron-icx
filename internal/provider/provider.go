@@ -4,11 +4,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	icxdatasource "github.com/pgehres/terraform-provider-fastiron-icx/internal/datasource"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
@@ -38,6 +42,9 @@ type FastIronICXProviderModel struct {
 	HostKey                   types.String `tfsdk:"host_key"`
 	InsecureSkipHostKeyVerify types.Bool   `tfsdk:"insecure_skip_host_key_verify"`
 	LegacySSHAlgorithms       types.Bool   `tfsdk:"legacy_ssh_algorithms"`
+	Transport                 types.String `tfsdk:"transport"`
+	AllowEmptyCredentials     types.Bool   `tfsdk:"allow_empty_credentials"`
+	InsecureTransportAck      types.Bool   `tfsdk:"insecure_transport_ack"`
 }
 
 func New(version string) func() provider.Provider {
@@ -55,22 +62,23 @@ func (p *FastIronICXProvider) Metadata(_ context.Context, _ provider.MetadataReq
 
 func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware. Communicates via SSH CLI.",
+		Description: "Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware. " +
+			"Communicates via the switch CLI over SSH (default) or, for lab and competition switches that expose nothing else, telnet.",
 		Attributes: map[string]schema.Attribute{
 			"host": schema.StringAttribute{
 				Description: "Hostname or IP address of the ICX switch. Can also be set with the FASTIRON_HOST environment variable.",
 				Optional:    true,
 			},
 			"port": schema.Int64Attribute{
-				Description: "SSH port. Defaults to 22. Can also be set with the FASTIRON_PORT environment variable.",
+				Description: "TCP port of the CLI transport. Defaults to 22 for SSH and 23 for telnet. Can also be set with the FASTIRON_PORT environment variable.",
 				Optional:    true,
 			},
 			"username": schema.StringAttribute{
-				Description: "SSH username. Can also be set with the FASTIRON_USERNAME environment variable.",
+				Description: "Login username. Required unless allow_empty_credentials is set. Can also be set with the FASTIRON_USERNAME environment variable.",
 				Optional:    true,
 			},
 			"password": schema.StringAttribute{
-				Description: "SSH password. Can also be set with the FASTIRON_PASSWORD environment variable.",
+				Description: "Login password. Required unless allow_empty_credentials is set. Can also be set with the FASTIRON_PASSWORD environment variable.",
 				Optional:    true,
 				Sensitive:   true,
 			},
@@ -80,7 +88,7 @@ func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest
 				Sensitive:   true,
 			},
 			"timeout": schema.Int64Attribute{
-				Description: "SSH connection timeout in seconds. Defaults to 30.",
+				Description: "Connection and per-command read timeout in seconds. Defaults to 30.",
 				Optional:    true,
 			},
 			"host_key": schema.StringAttribute{
@@ -107,8 +115,168 @@ func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest
 					"on trusted networks. Defaults to false.",
 				Optional: true,
 			},
+			"transport": schema.StringAttribute{
+				Description: "CLI transport: \"ssh\" (default) or \"telnet\". Telnet is PLAINTEXT: credentials and every " +
+					"command cross the network unencrypted and the switch's identity is never verified. It exists only for " +
+					"factory-fresh or competition switches that expose no SSH, and requires insecure_transport_ack = true. " +
+					"Can also be set with the FASTIRON_TRANSPORT environment variable.",
+				Optional:   true,
+				Validators: []validator.String{stringvalidator.OneOf(sshclient.TransportSSH, sshclient.TransportTelnet)},
+			},
+			"allow_empty_credentials": schema.BoolAttribute{
+				Description: "If true, permit an empty username, password and/or enable_password, as a factory-fresh switch " +
+					"with no local users accepts. Over SSH the provider then also offers keyboard-interactive authentication " +
+					"answered with the (empty) password. WARNING: a switch that accepts this is open to anyone who can reach " +
+					"it; lab and competition use only. A warning is emitted on every plan while this is set. Defaults to false.",
+				Optional: true,
+			},
+			"insecure_transport_ack": schema.BoolAttribute{
+				Description: "Required (true) when transport = \"telnet\": acknowledges that the connection is plaintext " +
+					"and unauthenticated — anyone on the path can read the credentials and configuration or alter the " +
+					"commands. Lab and competition use only. Has no effect over SSH. Defaults to false.",
+				Optional: true,
+			},
 		},
 	}
+}
+
+// connectionSettings is the provider configuration with environment
+// variables applied and nothing validated yet.
+type connectionSettings struct {
+	Host, Username, Password, EnablePassword string
+	HostKey, Transport                       string
+	Port, Timeout                            int
+	InsecureSkipHostKeyVerify                bool
+	LegacySSHAlgorithms                      bool
+	AllowEmptyCredentials                    bool
+	InsecureTransportAck                     bool
+}
+
+// resolveConnection applies the provider's connection policy to the settings
+// and returns the sshclient options to connect with. Errors stop Configure;
+// warnings are shown on every plan and apply, so the insecure opt-ins are
+// never silent. The rules:
+//
+//   - host is required;
+//   - username and password are required unless allow_empty_credentials,
+//     which warns;
+//   - over SSH one of host_key / insecure_skip_host_key_verify is required;
+//   - telnet requires insecure_transport_ack, warns that it is plaintext,
+//     and warns about SSH-only settings it ignores.
+func resolveConnection(s connectionSettings) (sshclient.Options, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	transport := s.Transport
+	if transport == "" {
+		transport = sshclient.TransportSSH
+	}
+	if transport != sshclient.TransportSSH && transport != sshclient.TransportTelnet {
+		diags.AddError("Invalid transport",
+			fmt.Sprintf("transport must be %q or %q, got %q.", sshclient.TransportSSH, sshclient.TransportTelnet, transport))
+		return sshclient.Options{}, diags
+	}
+
+	if s.Host == "" {
+		diags.AddError("Missing host", "The host must be set in the provider configuration or the FASTIRON_HOST environment variable.")
+		return sshclient.Options{}, diags
+	}
+
+	if s.AllowEmptyCredentials {
+		var empty []string
+		for _, f := range []struct{ name, value string }{
+			{"username", s.Username}, {"password", s.Password}, {"enable_password", s.EnablePassword},
+		} {
+			if f.value == "" {
+				empty = append(empty, f.name)
+			}
+		}
+		detail := "allow_empty_credentials is set. "
+		if len(empty) > 0 {
+			detail += "The provider will log in to " + s.Host + " with an empty " + strings.Join(empty, ", ") + ". "
+		}
+		detail += "A switch that accepts this is fully controllable by anyone who can reach it. " +
+			"Configure local users and an enable password as soon as the switch is provisioned, " +
+			"and remove allow_empty_credentials once they exist."
+		diags.AddWarning("Connecting with empty credentials", detail)
+	} else {
+		if s.Username == "" {
+			diags.AddError("Missing username", "The username must be set in the provider configuration or the FASTIRON_USERNAME environment variable "+
+				"(or set allow_empty_credentials = true for a factory-fresh switch with no users — lab use only).")
+			return sshclient.Options{}, diags
+		}
+		if s.Password == "" {
+			diags.AddError("Missing password", "The password must be set in the provider configuration or the FASTIRON_PASSWORD environment variable "+
+				"(or set allow_empty_credentials = true for a factory-fresh switch with no users — lab use only).")
+			return sshclient.Options{}, diags
+		}
+	}
+
+	switch transport {
+	case sshclient.TransportSSH:
+		if s.HostKey == "" && !s.InsecureSkipHostKeyVerify {
+			diags.AddError(
+				"Missing SSH host key",
+				fmt.Sprintf(
+					"Set host_key to the switch's SSH public key or SHA256 fingerprint, "+
+						"or set insecure_skip_host_key_verify = true for trusted lab networks only. "+
+						"Obtain the host key with: ssh-keyscan %s (if that prints nothing — common on older "+
+						"FastIron SSH stacks — use the provider repo's debug tool: go run ./cmd/debug-ssh -print-host-key)",
+					s.Host,
+				),
+			)
+			return sshclient.Options{}, diags
+		}
+		if s.InsecureTransportAck {
+			diags.AddWarning("insecure_transport_ack has no effect over SSH",
+				"insecure_transport_ack only acknowledges the plaintext telnet transport; the connection to "+s.Host+" uses SSH.")
+		}
+	case sshclient.TransportTelnet:
+		if !s.InsecureTransportAck {
+			diags.AddError("Telnet transport requires insecure_transport_ack",
+				"transport = \"telnet\" sends credentials and every command to "+s.Host+" in PLAINTEXT, with no verification "+
+					"of the switch's identity. Set insecure_transport_ack = true to acknowledge this. "+
+					"Telnet is intended only for factory-fresh or competition switches that expose no SSH; "+
+					"enable SSH (crypto key generate) and switch the provider back to SSH as soon as the switch is provisioned.")
+			return sshclient.Options{}, diags
+		}
+		diags.AddWarning("Plaintext telnet transport",
+			"The connection to "+s.Host+" uses telnet: credentials and the full configuration cross the network "+
+				"unencrypted and the switch's identity is not verified. Anyone on the path can read or alter them. "+
+				"Lab and competition networks only.")
+		var ignored []string
+		if s.HostKey != "" {
+			ignored = append(ignored, "host_key")
+		}
+		if s.InsecureSkipHostKeyVerify {
+			ignored = append(ignored, "insecure_skip_host_key_verify")
+		}
+		if s.LegacySSHAlgorithms {
+			ignored = append(ignored, "legacy_ssh_algorithms")
+		}
+		if len(ignored) > 0 {
+			diags.AddWarning("SSH settings ignored with telnet",
+				strings.Join(ignored, ", ")+" only apply to the SSH transport and are ignored while transport = \"telnet\".")
+		}
+	}
+
+	return sshclient.Options{
+		Host:                      s.Host,
+		Port:                      s.Port, // 0 lets the transport pick its default (22 / 23)
+		Username:                  s.Username,
+		Password:                  s.Password,
+		EnablePassword:            s.EnablePassword,
+		TimeoutSeconds:            s.Timeout,
+		HostKey:                   s.HostKey,
+		InsecureSkipHostKeyVerify: s.InsecureSkipHostKeyVerify,
+		LegacySSHAlgorithms:       s.LegacySSHAlgorithms,
+		Transport:                 transport,
+		AllowEmptyCredentials:     s.AllowEmptyCredentials,
+	}, diags
+}
+
+// boolValue returns a known bool attribute's value, false otherwise.
+func boolValue(v types.Bool) bool {
+	return !v.IsNull() && !v.IsUnknown() && v.ValueBool()
 }
 
 func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
@@ -118,72 +286,45 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 		return
 	}
 
-	host := stringValueOrEnv(config.Host, "FASTIRON_HOST")
-	username := stringValueOrEnv(config.Username, "FASTIRON_USERNAME")
-	password := stringValueOrEnv(config.Password, "FASTIRON_PASSWORD")
-	enablePassword := stringValueOrEnv(config.EnablePassword, "FASTIRON_ENABLE_PASSWORD")
-	hostKey := stringValueOrEnv(config.HostKey, "FASTIRON_HOST_KEY")
-	insecureSkip := !config.InsecureSkipHostKeyVerify.IsNull() &&
-		!config.InsecureSkipHostKeyVerify.IsUnknown() &&
-		config.InsecureSkipHostKeyVerify.ValueBool()
-	legacySSH := !config.LegacySSHAlgorithms.IsNull() &&
-		!config.LegacySSHAlgorithms.IsUnknown() &&
-		config.LegacySSHAlgorithms.ValueBool()
+	settings := connectionSettings{
+		Host:                      stringValueOrEnv(config.Host, "FASTIRON_HOST"),
+		Username:                  stringValueOrEnv(config.Username, "FASTIRON_USERNAME"),
+		Password:                  stringValueOrEnv(config.Password, "FASTIRON_PASSWORD"),
+		EnablePassword:            stringValueOrEnv(config.EnablePassword, "FASTIRON_ENABLE_PASSWORD"),
+		HostKey:                   stringValueOrEnv(config.HostKey, "FASTIRON_HOST_KEY"),
+		Transport:                 stringValueOrEnv(config.Transport, "FASTIRON_TRANSPORT"),
+		Timeout:                   30,
+		InsecureSkipHostKeyVerify: boolValue(config.InsecureSkipHostKeyVerify),
+		LegacySSHAlgorithms:       boolValue(config.LegacySSHAlgorithms),
+		AllowEmptyCredentials:     boolValue(config.AllowEmptyCredentials),
+		InsecureTransportAck:      boolValue(config.InsecureTransportAck),
+	}
 
-	port := 22
+	// Port 0 means "the transport's default": 22 for SSH, 23 for telnet.
 	if !config.Port.IsNull() && !config.Port.IsUnknown() {
-		port = int(config.Port.ValueInt64())
+		settings.Port = int(config.Port.ValueInt64())
 	} else if envPort := os.Getenv("FASTIRON_PORT"); envPort != "" {
 		var p int
 		if _, err := fmt.Sscanf(envPort, "%d", &p); err == nil && p > 0 {
-			port = p
+			settings.Port = p
 		}
 	}
 
-	timeout := 30
 	if !config.Timeout.IsNull() && !config.Timeout.IsUnknown() {
-		timeout = int(config.Timeout.ValueInt64())
+		settings.Timeout = int(config.Timeout.ValueInt64())
 	}
 
-	if host == "" {
-		resp.Diagnostics.AddError("Missing host", "The host must be set in the provider configuration or the FASTIRON_HOST environment variable.")
+	opts, diags := resolveConnection(settings)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
-	if username == "" {
-		resp.Diagnostics.AddError("Missing username", "The username must be set in the provider configuration or the FASTIRON_USERNAME environment variable.")
-		return
-	}
-	if password == "" {
-		resp.Diagnostics.AddError("Missing password", "The password must be set in the provider configuration or the FASTIRON_PASSWORD environment variable.")
-		return
-	}
-	if hostKey == "" && !insecureSkip {
-		resp.Diagnostics.AddError(
-			"Missing SSH host key",
-			fmt.Sprintf(
-				"Set host_key to the switch's SSH public key or SHA256 fingerprint, "+
-					"or set insecure_skip_host_key_verify = true for trusted lab networks only. "+
-					"Obtain the host key with: ssh-keyscan %s (if that prints nothing — common on older "+
-					"FastIron SSH stacks — use the provider repo's debug tool: go run ./cmd/debug-ssh -print-host-key)",
-				host,
-			),
-		)
-		return
-	}
+	username := opts.Username
 
-	client, err := sshclient.NewClient(sshclient.Options{
-		Host:                      host,
-		Port:                      port,
-		Username:                  username,
-		Password:                  password,
-		EnablePassword:            enablePassword,
-		TimeoutSeconds:            timeout,
-		HostKey:                   hostKey,
-		InsecureSkipHostKeyVerify: insecureSkip,
-		LegacySSHAlgorithms:       legacySSH,
-	})
+	client, err := sshclient.Connect(opts)
 	if err != nil {
-		resp.Diagnostics.AddError("SSH connection failed", "Unable to connect to the ICX switch: "+err.Error())
+		resp.Diagnostics.AddError("Connection failed",
+			fmt.Sprintf("Unable to connect to the ICX switch over %s: %s", opts.Transport, err.Error()))
 		return
 	}
 
