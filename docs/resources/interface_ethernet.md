@@ -14,7 +14,7 @@ Manages an ethernet interface on an ICX switch, including port-level configurati
 
 ~> **`enabled = false` on the wrong port cuts you off.** Administratively disabling the port that carries the management VLAN to the Terraform host severs the provider's SSH session mid-apply — the same class of outage as `-replace` on a live trunk — and the switch is reachable only by console. The provider refuses, at plan time, to disable the port through which the switch reaches its management next hop (its `ip default-gateway` on the switch image, its default-route next hop on the router image, located with one read-only `show arp`). That covers the usual fleet case of Terraform on another subnet. It does **not** cover a Terraform host on the switch's own subnet, a next hop missing from the ARP table, or a device without a default route: in those cases the plan carries a warning instead of an error. Check `show arp` / `show mac-address` for the path to the Terraform host before disabling any uplink.
 
-~> **Never manage the same port with two resources.** Two `icx_interface_ethernet` resources for the same port make each apply clobber the other — Terraform never converges and `plan` always shows pending changes. Remove the duplicate with `terraform state rm` **before** deleting it from config, so the destroy does not strip membership the remaining resource still owns.
+~> **Never manage the same port with two resources.** Two `icx_interface_ethernet` resources for the same port make each apply clobber the other — Terraform never converges and `plan` always shows pending changes. The provider rejects this at plan time when the two declarations differ (see [Duplicate port detection](#duplicate-port-detection)). Remove the duplicate with `terraform state rm` **before** deleting it from config, so the destroy does not strip membership the remaining resource still owns.
 
 ## Example Usage
 
@@ -42,7 +42,7 @@ resource "icx_interface_ethernet" "uplink" {
 
 ### tag_all_vlans trunk
 
-`tag_all_vlans = true` is a Terraform-only convenience that expands to all non-default VLANs on the switch at apply time. It cannot be read back from the switch; `Read` preserves whatever the state contains. See [tag_all_vlans semantics](#tag_all_vlans-semantics) for caveats.
+`tag_all_vlans = true` is a Terraform-only convenience that expands to all non-default VLANs on the switch at apply time. The flag itself cannot be read back from the switch, but the membership it promises can: `Read` checks the port against that expansion and reports a missing VLAN as a plan diff. See [tag_all_vlans semantics](#tag_all_vlans-semantics).
 
 ```terraform
 resource "icx_interface_ethernet" "trunk_all" {
@@ -66,7 +66,7 @@ resource "icx_interface_ethernet" "trunk_all" {
 - `enabled` (Boolean) - Administrative state of the port. `false` sends `disable` (the running config then shows ` disable` under the interface); `true` sends `enable`. **When omitted, the port's current admin state is kept and recorded in state**, so adding this provider version to an existing fleet is a zero-diff change and a port someone disabled by hand stays disabled until you set the attribute explicitly. Destroying the resource re-enables a port it recorded as disabled (enabled is the default every other attribute is returned to). Disabling the switch's management-path port is refused at plan time — see the warning above.
 - `untagged_vlan` (Number) - VLAN ID for untagged traffic. The port is added as an `untagged ethe` member of this VLAN. On FastIron releases before 08.0.80 a port that also has tagged VLANs is instead configured with the interface-level `dual-mode` command — see [FastIron 08.0.30 `dual-mode` dialect](#fastiron-08030-dual-mode-dialect).
 - `tagged_vlans` (Set of Number) - Set of VLAN IDs for tagged traffic. The port is added as a `tagged ethe` member of each listed VLAN. Mutually exclusive with `tag_all_vlans`. Do not list `untagged_vlan` here; on `dual-mode` firmware the provider adds that membership itself.
-- `tag_all_vlans` (Boolean) - When `true`, tag all VLANs on the switch (excluding `untagged_vlan` and VLAN 1) on this port. Expanded to an explicit per-VLAN list at apply time. Defaults to `false`.
+- `tag_all_vlans` (Boolean) - When `true`, tag all VLANs on the switch (excluding `untagged_vlan` and VLAN 1) on this port. Expanded to an explicit per-VLAN list at apply time, and checked against the switch on every refresh. Defaults to `false`.
 - `raw_config` (List of String) - Additional raw CLI commands within the interface context (`interface ethernet N ... exit`). On destroy each command is prefixed with `no`. Use `icx_raw_config` with explicit `destroy_commands` for context-entering commands. Entries beginning with `hostname`, `ip address` or `ip default-gateway` (or their `no` forms) are rejected at plan time; use the dedicated attributes instead.
 
 ### Read-Only
@@ -79,10 +79,42 @@ resource "icx_interface_ethernet" "trunk_all" {
 
 - **At apply time:** the port is tagged on every VLAN that exists at that moment (excluding `untagged_vlan` and VLAN 1).
 - **When a new VLAN is created:** `icx_vlan.Create` (>= v0.1.1) detects trunk-all ports and automatically tags the new VLAN onto them.
-- **Read does not reconcile.** `Read` skips re-reading `tagged_vlans` when `tag_all_vlans = true`. Drift that occurs after the initial apply (e.g. a hand-run `no tagged ethe`) stays invisible to `terraform plan`.
+- **Read reconciles.** On every refresh the provider compares the port's actual tagged membership with the same expansion the apply path uses. When they match, state is left exactly as it was (`tagged_vlans` stays null), so a healthy trunk plans with no changes. When a VLAN is missing — a hand-run `no tagged ethe`, a VLAN that predates Terraform on that switch, an apply that died halfway — Read records what the switch actually has (`tag_all_vlans = false`, `tagged_vlans = <actual set>`) and emits a warning naming the missing VLANs:
+
+  ```text
+  Warning: tag_all_vlans trunk 1/3/2 has drifted
+
+  Port 1/3/2 is declared tag_all_vlans = true, but the switch does not tag it in
+  every VLAN. Missing from the port: VLAN 900, 901, 902. ...
+
+  # icx_interface_ethernet.trunk will be updated in-place
+    ~ tag_all_vlans = false -> true
+    - tagged_vlans  = [20, 30, 40, 50, 70] -> null
+  ```
+
+  That plan reads as if membership were being removed; it is not. Applying it issues `tagged ethe` for exactly the missing VLANs and removes nothing: the expansion is every VLAN except VLAN 1 and the untagged VLAN, and a FastIron port cannot be both tagged and untagged in one VLAN, so the switch's tagged set is always a subset of the expansion. The only removal a `tag_all_vlans` trunk ever sees is when `untagged_vlan` itself is changed in configuration. If a switch ever reported a tagged VLAN outside the expansion, the warning would name it, because the apply would drop that membership.
 - **On import:** `Read` sets `tag_all_vlans = false` because it cannot be inferred from the switch.
 
-If auditable membership is needed — where drift surfaces as a plan diff — use an explicit `tagged_vlans` list instead.
+Use an explicit `tagged_vlans` list when the membership should be visible in state and reviewed VLAN by VLAN; the trade-off is that every VLAN must be listed, and omitting one removes it from the trunk.
+
+## Duplicate port detection
+
+Declaring one port in two `icx_interface_ethernet` resources on the same provider instance (the same switch) is rejected during `terraform plan`:
+
+```text
+Error: Port 1/2/1 is managed by more than one icx_interface_ethernet resource
+
+Another icx_interface_ethernet resource using this provider instance also declares
+port 1/2/1, with a different tagged_vlans, untagged_vlan. ...
+```
+
+The plugin protocol does not tell a resource its own address, so the check works by recording, per provider instance and per plan, the configuration each resource claims for its port, and erroring when a second claim on the same port is *definitely* different: at least one attribute known on both sides and unequal. That rule is what keeps Terraform's own re-plans of a single resource (a replacement is planned twice; values that are unknown until apply are planned again once known) from being reported. Its limits:
+
+- Two resources with byte-identical configuration on one port are not detected. They also converge to the same device state and do not churn, but destroying one still strips the port, so remove it with `terraform state rm` first.
+- Destroy plans are not claims, so the error does not fire while the redundant resource is being removed from configuration.
+- The same port number on two switches (two provider aliases) is never a duplicate.
+
+The fix is the same as before the check existed: keep one resource per port, and `terraform state rm` the redundant one before deleting it from configuration.
 
 ## FastIron 08.0.30 `dual-mode` dialect
 
@@ -124,4 +156,4 @@ Import by port identifier:
 terraform import icx_interface_ethernet.uplink 1/1/24
 ```
 
-After import, `tag_all_vlans` will be `false`, `tagged_vlans` will reflect the port's actual tagged membership at import time, and `enabled` reflects the port's admin state. On `dual-mode` firmware the dual-mode VLAN is imported as `untagged_vlan` and omitted from `tagged_vlans`.
+After import, `tag_all_vlans` will be `false`, `tagged_vlans` will reflect the port's actual tagged membership at import time, and `enabled` reflects the port's admin state. Setting `tag_all_vlans = true` on the imported resource then plans as an in-place update that tags whatever the expansion still lacks. On `dual-mode` firmware the dual-mode VLAN is imported as `untagged_vlan` and omitted from `tagged_vlans`.

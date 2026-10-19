@@ -17,4 +17,8 @@ type ProviderData struct {
 	// unsupported operations before any commands are sent and render
 	// dialect-specific syntax. The zero value is an unknown, permissive dialect.
 	Dialect dialect.Dialect
+	// Ports records the ethernet ports claimed by icx_interface_ethernet
+	// resources during the current operation, so a port declared by two
+	// resources is rejected at plan time. See PortRegistry.
+	Ports *PortRegistry
 }
