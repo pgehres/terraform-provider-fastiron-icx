@@ -95,6 +95,29 @@ func TestParseRunningConfig6430C12(t *testing.T) {
 	if eth.PortName != "uplink-to-icx-7250" {
 		t.Errorf("1/2/1 port-name: %q", eth.PortName)
 	}
+	// `dual-mode  102` (two spaces, as the switch prints it) is captured; the
+	// VLAN context lists 1/2/1 only as *tagged* in 102.
+	if eth.DualModeVLAN == nil || *eth.DualModeVLAN != 102 {
+		t.Errorf("1/2/1 dual-mode: got %v, want 102", eth.DualModeVLAN)
+	}
+	if len(eth.RawLines) != 0 {
+		t.Errorf("1/2/1 dual-mode must not leak into RawLines: %v", eth.RawLines)
+	}
+	v102 := config.FindVLAN(102)
+	if v102 == nil || len(v102.TaggedPorts) != 1 || v102.TaggedPorts[0] != "1/2/1" || len(v102.UntaggedPorts) != 0 {
+		t.Errorf("VLAN 102 membership: %+v", v102)
+	}
+	eth22 := config.FindEthernetInterface("1/2/2")
+	if eth22 == nil || eth22.DualModeVLAN == nil || *eth22.DualModeVLAN != 109 {
+		t.Errorf("1/2/2 dual-mode: got %+v, want 109", eth22)
+	}
+	// Access ports carry no dual-mode; their untagged membership is purely in
+	// VLAN context (VLAN 109 untagged ethe 1/1/1 to 1/1/6).
+	for _, p := range []string{"1/1/1", "1/1/6", "1/1/9"} {
+		if e := config.FindEthernetInterface(p); e != nil && e.DualModeVLAN != nil {
+			t.Errorf("%s: access port must not have dual-mode, got %d", p, *e.DualModeVLAN)
+		}
+	}
 }
 
 // The 6450-C12PD fixture is a sanitized capture from a real ICX 6450-C12PD
@@ -169,6 +192,37 @@ func TestParseRunningConfig6450C12PD(t *testing.T) {
 	}
 	if eth.PortName != "ap-1" {
 		t.Errorf("1/1/1 port-name: %q", eth.PortName)
+	}
+	// Four dual-mode 102 ports (1/1/1, 1/1/2, 1/1/8, 1/1/12); VLAN 102 lists
+	// all of them as tagged and none as untagged.
+	for _, p := range []string{"1/1/1", "1/1/2", "1/1/8", "1/1/12"} {
+		e := config.FindEthernetInterface(p)
+		if e == nil || e.DualModeVLAN == nil || *e.DualModeVLAN != 102 {
+			t.Errorf("%s dual-mode: got %+v, want 102", p, e)
+			continue
+		}
+		tagged := false
+		for _, tp := range v102.TaggedPorts {
+			if tp == p {
+				tagged = true
+			}
+		}
+		if !tagged {
+			t.Errorf("%s should be listed tagged in VLAN 102", p)
+		}
+		for _, up := range v102.UntaggedPorts {
+			if up == p {
+				t.Errorf("%s must not be listed untagged in VLAN 102", p)
+			}
+		}
+	}
+	// `inline power` remains a raw line, `dual-mode` does not.
+	if len(eth.RawLines) != 1 || eth.RawLines[0] != "inline power" {
+		t.Errorf("1/1/1 RawLines: %v, want [inline power]", eth.RawLines)
+	}
+	// 1/1/5 (trunk-1) is tagged everywhere with no dual-mode: a pure tagged trunk.
+	if e := config.FindEthernetInterface("1/1/5"); e == nil || e.DualModeVLAN != nil {
+		t.Errorf("1/1/5 should exist without dual-mode, got %+v", e)
 	}
 
 	// Unlike the 6430's `no ip dhcp-client enable`, the 6450 router image uses
