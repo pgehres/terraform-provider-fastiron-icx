@@ -14,7 +14,26 @@ The `fastiron-icx` provider manages Brocade/Ruckus ICX switches running FastIron
 - ICX 7250-24 (2 modules, SFP+)
 - ICX 7150-24 (3 modules including SFP+)
 - ICX 7150-C12P (12-port PoE compact, optical-monitor)
-- ICX 7150-C10ZP (10-port PoE compact, no global-stp, ISP VLANs)
+- ICX 7150-C10ZP (10-port PoE compact, switch image, ISP VLANs)
+
+## Router Image vs. Switch Image
+
+Every FastIron release ships as two binaries per platform: the **switch image** (`SPS…`, version strings ending in codes like `T211`) and the **router image** (`SPR…`, codes like `T213`). The hardware is identical; the router image adds the Layer 3 plane. This distinction — not the switch model or series — determines which provider features work on a given device:
+
+| Capability | Switch image | Router image |
+|---|---|---|
+| VLANs, port membership, port names, LAGs, PoE | ✓ | ✓ |
+| `icx_user`, `icx_aaa`, users/SSH management | ✓ | ✓ |
+| Management IP | One global `ip address` + `ip default-gateway` | VE interfaces + `ip route` |
+| `icx_interface_ve` / `router_interface` on `icx_vlan` | ✗ (commands do not exist) | ✓ |
+| `global_stp` on `icx_system` | ✗ | ✓ |
+| Inter-VLAN routing, static routes | ✗ | ✓ |
+
+Identify the image from `show version` or the `ver` line at the top of the running config (e.g. `08.0.95rT211` = switch image, `08.0.95mT213` = router image).
+
+~> **The provider does not detect the image type.** Declaring a router-image-only resource or attribute against a switch-image device fails at **apply** time with a CLI error from the switch (`Invalid input`), not at plan time — and other commands in the same apply may already have been executed. Know which image each provider alias points at.
+
+-> **Reimaging changes your Terraform config.** Moving a switch between images requires flashing the other binary and rebooting, and the management addressing does not translate: a switch-image device's global `ip address` must be rebuilt as an `icx_vlan` `router_interface` + `icx_interface_ve` (or vice versa). Plan this as a deliberate config migration, not something the provider reconciles.
 
 ## SSH and Host Key Verification
 

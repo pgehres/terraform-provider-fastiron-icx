@@ -10,7 +10,7 @@ Manages global system settings on an ICX switch.
 
 This is a **singleton resource** — only one `icx_system` resource may exist per provider instance. Its Terraform ID is always `"system"`.
 
-~> **ICX 7150-C10ZP note:** This model does not support `global-stp`. Setting `global_stp = true` on that hardware will produce a CLI error. Keep `global_stp = false` (the default) for C10ZP switches.
+~> **Switch-image note:** `global-stp` is a FastIron **router image** command. On a device running the switch image (`SPS…`/`T211`-style versions — e.g. an ICX 7150-C10ZP shipped with the L2 image), setting `global_stp = true` produces a CLI error at apply time; keep it `false` (the default) there. See [Router Image vs. Switch Image](../index.md#router-image-vs-switch-image).
 
 ## Example Usage
 
@@ -28,7 +28,7 @@ resource "icx_system" "this" {
 
 ### Optional
 
-- `global_stp` (Boolean) - Enable global 802.1w spanning tree. Defaults to `false`. Not supported on ICX 7150-C10ZP.
+- `global_stp` (Boolean) - Enable global 802.1w spanning tree. Defaults to `false`. Router image only — see the switch-image note above; on a switch-image device (any model) this command does not exist and setting `true` fails at apply time.
 - `telnet_server` (Boolean) - Enable the telnet server. Set to `false` to disable (sends `no telnet server`). Defaults to `true`.
 - `dhcp_client_disable` (Boolean) - Disable the DHCP client globally. Defaults to `false`.
 - `optical_monitor` (Boolean) - Enable optical monitoring globally. Defaults to `false`.
