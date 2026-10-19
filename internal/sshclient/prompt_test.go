@@ -202,11 +202,16 @@ func TestExecuteExpectingDisconnectSevered(t *testing.T) {
 	}
 }
 
-// A CLI error inside the batch is reported while the session is still up.
+// A CLI error inside the batch is reported while the session is still up,
+// and the output of the lines after it is drained so the next command's
+// output is not polluted.
 func TestExecuteExpectingDisconnectCLIError(t *testing.T) {
 	stdin := &recordingStdin{}
-	output := "ip address 10.0.20.7 255.255.255.0\r\nError - duplicate ip address\r\nSSH@ICX7250-24 Router(config)#"
-	c := promptClient(feed(output, false), stdin)
+	output := "ip address 10.0.20.7 255.255.255.0\r\nError - duplicate ip address\r\nSSH@ICX7250-24 Router(config)#" +
+		"end\r\nSSH@ICX7250-24 Router#" +
+		"write memory\r\nWrite startup-config done.\r\nSSH@ICX7250-24 Router#"
+	ch := feed(output, false)
+	c := promptClient(ch, stdin)
 
 	err := c.ExecuteExpectingDisconnect([]string{"ip address 10.0.20.7 255.255.255.0"})
 	if err == nil || !strings.Contains(err.Error(), "duplicate ip address") || errors.Is(err, ErrSessionSevered) {
@@ -214,6 +219,12 @@ func TestExecuteExpectingDisconnectCLIError(t *testing.T) {
 	}
 	if c.disconnected {
 		t.Error("a CLI error is not a severed session")
+	}
+	if c.inConfigMode {
+		t.Error("the batch's `end` ran, so the shell is in EXEC mode")
+	}
+	if len(ch) != 0 {
+		t.Errorf("%d bytes of later output left unread", len(ch))
 	}
 }
 

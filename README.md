@@ -142,6 +142,18 @@ resource "icx_interface_ve" "mgmt" {
 }
 ```
 
+### icx_management_ip
+
+Manages the global management IP, default gateway and DNS servers of a **switch-image** device (singleton; router-image devices use `icx_interface_ve`). Changing `ip_address` severs the provider's own SSH session and is refused unless `allow_management_ip_change = true`; destroying the resource sends no commands. See [docs/resources/management_ip.md](docs/resources/management_ip.md) before changing an address.
+
+```hcl
+resource "icx_management_ip" "this" {
+  ip_address      = "10.0.20.5/24"
+  default_gateway = "10.0.20.1"
+  dns_servers     = ["10.0.20.1"]
+}
+```
+
 ### icx_user
 
 Manages local user accounts. Passwords are write-only (cannot be read from the switch).
@@ -234,6 +246,7 @@ data "icx_stack_unit" "this" {
 terraform import icx_vlan.mgmt 102
 terraform import icx_interface_ethernet.server1 1/1/1
 terraform import icx_interface_ve.mgmt 1
+terraform import icx_management_ip.this management
 terraform import icx_user.admin admin
 terraform import icx_system.this system
 terraform import icx_aaa.this aaa

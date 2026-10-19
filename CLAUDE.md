@@ -12,6 +12,7 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 - `skip-page-display` sent on connect to disable `--More--` paging
 - ANSI escape codes stripped from output via `sanitizeOutput()`
 - `CommandExecutor` interface enables mock testing
+- Two special execute paths exist because some commands break the session model: `ExecutePromptChanging` (for `hostname`: sends the command, then re-detects the prompt via `readNewPrompt` instead of waiting for the old one) and `ExecuteExpectingDisconnect` (for the switch image's global `ip address`: writes commands + `end` + `write memory` in ONE write so the save is queued before the session drops; a lost session sets `disconnected` and every later call fails fast with `ErrSessionSevered`). The any-hostname prompt regex `anyPrompt` is anchored to line start — matched byte by byte, an unanchored one adopts `-` as the prompt when FastIron's `Invalid input -> ...` line ends in `>`.
 
 ### Config Parser (`internal/parser/`)
 - Line-oriented state machine parser for `show running-config` output
@@ -22,7 +23,7 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 ### Firmware Dialects (`internal/dialect/`)
 - Version- and image-dependent behaviour lives in a single place. `dialect.Detect(ver, image)` / `FromConfig(cfg)` yields a `Dialect{Version, Image, Known}`, built once in `provider.Configure` and handed to resources as `ProviderData.Dialect`.
 - `d.Has(Cap...)` reads a declarative table in `capabilities.go`, where each capability maps to a predicate over the version and image. There are two kinds:
-  - **Features** (`CapVEInterfaces`, `CapRouterInterface`, `CapGlobalSTP`, `CapManager`, `CapOpticalMonitor`) gate commands. Resources call `requireCapability(d, cap, feature, diags)` in ModifyPlan and as a CRUD backstop. Its error text comes from `Title`/`Why`/`Docs`.
+  - **Features** (`CapVEInterfaces`, `CapRouterInterface`, `CapGlobalSTP`, `CapGlobalManagementIP`, `CapManager`, `CapOpticalMonitor`) gate commands. Resources call `requireCapability(d, cap, feature, diags)` in ModifyPlan and as a CRUD backstop. Its error text comes from `Title`/`Why`/`Docs`.
   - **Syntax forms** (`CapDualMode`, `CapLegacyDHCPClient`) choose a spelling. Resources use the named renderers (`DHCPClientDisable`, `DualMode`, `NoDualMode`) instead of branching on them.
 - **Never block on unknown.** An unparseable version makes version features true. An undetected image makes image features true. Forms fall back to the 08.0.9x spelling. The two axes are independent, so a detected switch image still blocks router-only features even without a version.
 - Hardware facts (PoE, optics, port layout) are deliberately not capabilities, because the firmware dialect does not determine them.
@@ -32,7 +33,8 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 - **VLAN resource (`icx_vlan`)**: Manages VLAN existence and properties ONLY (name, STP, multicast, router-interface). Does NOT manage port membership — that's exclusively handled by `icx_interface_ethernet`.
 - **Ethernet interface (`icx_interface_ethernet`)**: Manages port config AND VLAN membership. `tagged_vlans` is `Set(Int64)`. `tag_all_vlans` bool auto-tags all VLANs on the switch (excluding `untagged_vlan` and VLAN 1).
 - **All resources**: `raw_config` list attribute for escape-hatch CLI commands (auto `no` prefix on destroy).
-- **Singleton resources** (system, aaa): Use fixed IDs "system"/"aaa".
+- **Singleton resources** (system, aaa, management_ip): Use fixed IDs "system"/"aaa"/"management".
+- **Management IP (`icx_management_ip`)**: switch image only (`CapGlobalManagementIP`). `ip address` is only sent with `allow_management_ip_change = true`, always last, through `ExecuteExpectingDisconnect`; Delete sends nothing; omitted `default_gateway`/`dns_servers` are kept (Optional+Computed). Router-image devices use `icx_interface_ve`.
 - **`write memory`**: Called after every CRUD operation, but skipped if no CLI commands were actually sent.
 
 ### Provider Config
@@ -58,6 +60,9 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 
 11. **FastIron < 08.0.80 uses `dual-mode` for trunk-untagged.** On 08.0.30 (ICX 6430/6450) a tagged port cannot be `untagged` in VLAN context; it is tagged in the untagged VLAN too and ` dual-mode  <id>` (two spaces) under `interface ethernet` picks the untagged one. Bare `dual-mode` = VLAN 1; `no dual-mode` = tagged-only. Parser: `EthernetInterface.DualModeVLAN`; dialect gate: `dialect.CapDualMode` (version < 08.0.80, or any `dual-mode` line present via `Dialect.Observe`). `icx_interface_ethernet` Read takes `untagged_vlan` from dual-mode and drops that VLAN from `tagged_vlans`; `buildDualModeMembershipCommands` emits tagged-then-`dual-mode` on create, re-issues `dual-mode <new>` directly (never `no dual-mode` first — that drops the management VLAN on an uplink) when the untagged VLAN changes, and `no dual-mode` precedes membership removal on destroy. Never emit `dual-mode` on 08.0.9x; the per-command CLI error detection in `ExecuteInConfigMode` is the backstop. Not yet validated on a live 08.0.30 device.
 
+12. **`hostname` changes the CLI prompt the SSH client keys on.** The prompt is `SSH@<hostname> Router#`; `detectPrompt` learns it once at connect and `readUntilPrompt` waits for exactly that. Send `hostname X` through `ExecuteInConfigMode` and the call waits out the read timeout, and so does every command after it — including the `write memory` that would have saved the change. `icx_system` therefore emits `hostname` last and only via `ExecutePromptChanging`, which re-detects the prompt from the switch's reply. Never put `hostname`/`no hostname` in any `raw_config` or `icx_raw_config`. `hostname` on `icx_system` is Optional+Computed: omitted means "keep and record the device's name" (zero-diff adoption), and the provider never sends `no hostname` — not on destroy either, since state cannot tell a user-set name from a recorded one.
+13. **`icx_management_ip` manages the address the provider is connected through.** An `ip address` change severs the session, so it is refused without `allow_management_ip_change = true`; with it, the address is the last command and goes out with `end` + `write memory` in a single write (`ExecuteExpectingDisconnect`) so the save is at least queued — whether it ran is unknowable from the dead session, and the warning tells the user to verify the startup config. Address replacement is sent directly (`ip address <new>`), never `no ip address` first (the second line would never arrive). Delete sends no commands — removing the address or gateway would brick remote access. Not yet validated live; the first live test needs console access.
+
 ## Testing
 - `go test ./...` — runs parser tests against real config fixtures
 - `make build` / `make install` — build and install locally
@@ -74,6 +79,7 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 - **Reconcile `tagged_vlans` in Read when `tag_all_vlans` is set.** v0.1.1 fixed the create path; Read still skips reconciliation, so any drift not caused by `icx_vlan.Create` remains undetectable (gotcha #8). Comparing actual membership against the expanded set would turn a silent outage into a plan diff.
 - **Detect duplicate port ownership** — two `icx_interface_ethernet` resources on one port currently produce permanent, silent plan churn (gotcha #10). A validation error would catch it at plan time.
 - **Validate the 08.0.30 `dual-mode` dialect live** (gotcha #11): whether re-issuing `dual-mode <new>` on a port that already has dual-mode is accepted or needs `no dual-mode` first, and how a bare `dual-mode` is printed in the running config.
+- **Validate `icx_management_ip` live** (gotcha #13): whether the switch image accepts `ip address <new>` as a direct replacement, whether the queued `write memory` survives the session drop, and the exact `no ip dns server-address` syntax. Needs console access.
 - LAG / Port Channel support
 - Telnet transport
 - PoE Read from `show inline power` output

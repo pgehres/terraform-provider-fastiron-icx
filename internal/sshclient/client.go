@@ -490,6 +490,10 @@ func (c *Client) ExecuteExpectingDisconnect(commands []string) error {
 	if _, err := io.WriteString(c.stdin, strings.Join(batch, "\n")+"\n"); err != nil {
 		return fmt.Errorf("write command batch: %w", err)
 	}
+	// Every line of the batch produces a prompt, so every one must be read
+	// even after a CLI error — returning early would leave the output of the
+	// remaining lines in the pipe to be mistaken for the next command's.
+	var cliErr error
 	for _, cmd := range batch {
 		output, err := c.readUntilPrompt()
 		if err != nil {
@@ -497,16 +501,14 @@ func (c *Client) ExecuteExpectingDisconnect(commands []string) error {
 			return fmt.Errorf("after %q: %w (%v)", cmd, ErrSessionSevered, err)
 		}
 		output = stripEchoedCommand(sanitizeOutput(output), cmd)
-		if errMsg := detectCLIError(output); errMsg != "" {
-			// The switch rejected a command and is still talking to us. The
-			// rest of the batch has executed too (end + write memory), so the
-			// shell is back in privileged EXEC mode.
-			c.inConfigMode = false
-			return fmt.Errorf("command %q: %s", cmd, strings.TrimSpace(errMsg))
+		if errMsg := detectCLIError(output); errMsg != "" && cliErr == nil {
+			cliErr = fmt.Errorf("command %q: %s", cmd, strings.TrimSpace(errMsg))
 		}
 	}
+	// The batch ended with `end`, so the shell is back in privileged EXEC mode
+	// whether or not a command was rejected.
 	c.inConfigMode = false
-	return nil
+	return cliErr
 }
 
 // WriteMemory saves the running configuration to startup configuration.
