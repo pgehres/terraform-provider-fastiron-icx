@@ -27,6 +27,7 @@ import (
 var (
 	_ resource.Resource                = &VLANResource{}
 	_ resource.ResourceWithImportState = &VLANResource{}
+	_ resource.ResourceWithModifyPlan  = &VLANResource{}
 )
 
 // reVLANName matches valid FastIron VLAN names: no spaces, double quotes, or
@@ -152,6 +153,25 @@ func (r *VLANResource) Configure(_ context.Context, req resource.ConfigureReques
 	r.client = data.Client
 	r.imageType = data.ImageType
 	r.firmwareVersion = data.FirmwareVersion
+}
+
+// ModifyPlan rejects a planned router_interface at plan time when the device is
+// known to run the switch image. Destroy plans and plans where the value is
+// null or not yet known pass; the apply-time guard in Create/Update still
+// backstops a value that only becomes known during apply.
+func (r *VLANResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+	var routerInterface types.Int64
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("router_interface"), &routerInterface)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if routerInterface.IsNull() || routerInterface.IsUnknown() {
+		return
+	}
+	requireRouterImage(r.imageType, r.firmwareVersion, "The router_interface attribute of icx_vlan", &resp.Diagnostics)
 }
 
 func (r *VLANResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {

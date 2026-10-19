@@ -21,6 +21,7 @@ import (
 var (
 	_ resource.Resource                = &InterfaceVEResource{}
 	_ resource.ResourceWithImportState = &InterfaceVEResource{}
+	_ resource.ResourceWithModifyPlan  = &InterfaceVEResource{}
 )
 
 type InterfaceVEResource struct {
@@ -83,6 +84,17 @@ func (r *InterfaceVEResource) Configure(_ context.Context, req resource.Configur
 	r.client = data.Client
 	r.imageType = data.ImageType
 	r.firmwareVersion = data.FirmwareVersion
+}
+
+// ModifyPlan rejects creating or updating a VE at plan time when the device is
+// known to run the switch image, so the error surfaces in `terraform plan`
+// instead of mid-apply. A destroy plan (null) is allowed through: Delete
+// deliberately succeeds on a switch image so stale state can be cleared.
+func (r *InterfaceVEResource) ModifyPlan(_ context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+	requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics)
 }
 
 func (r *InterfaceVEResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
