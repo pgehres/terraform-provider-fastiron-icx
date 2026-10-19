@@ -246,6 +246,9 @@ func (p *FastIronICXProvider) Resources(_ context.Context) []func() resource.Res
 		icxresource.NewUserResource,
 		icxresource.NewAAAResource,
 		icxresource.NewSystemResource,
+		icxresource.NewNTPResource,
+		icxresource.NewSNMPResource,
+		icxresource.NewLoggingResource,
 		icxresource.NewPoEResource,
 		icxresource.NewRawConfigResource,
 	}

@@ -193,6 +193,44 @@ resource "icx_system" "this" {
 }
 ```
 
+### icx_ntp
+
+Singleton: NTP servers, client-only mode, time zone and summer time.
+
+```hcl
+resource "icx_ntp" "this" {
+  servers     = ["216.239.35.0", "216.239.35.4"]
+  serve       = false
+  timezone    = "us pacific"
+  summer_time = true
+}
+```
+
+### icx_snmp
+
+Singleton: SNMP community strings (write-only, Sensitive, redacted from errors), contact and location.
+
+```hcl
+resource "icx_snmp" "this" {
+  communities = [{ string = var.snmp_ro, mode = "ro", acl = "snmp-managers" }]
+  contact     = "Network Operations"
+  location    = "Rack 12"
+}
+```
+
+### icx_logging
+
+Singleton: syslog hosts, local buffer size, disabled buffered levels, facility.
+
+```hcl
+resource "icx_logging" "this" {
+  hosts            = ["10.0.20.50"]
+  buffered_entries = 1000
+  disabled_levels  = ["debugging"]
+  facility         = "local7"
+}
+```
+
 ### icx_poe
 
 Manages per-port Power over Ethernet settings.
@@ -250,6 +288,9 @@ terraform import icx_management_ip.this management
 terraform import icx_user.admin admin
 terraform import icx_system.this system
 terraform import icx_aaa.this aaa
+terraform import icx_ntp.this ntp
+terraform import icx_snmp.this snmp
+terraform import icx_logging.this logging
 ```
 
 **Important**: After importing, run `terraform plan` and verify **zero changes** before applying. User passwords will always show a diff (write-only) — this is expected and safe.
