@@ -70,14 +70,17 @@ func systemWithDialect(version string, image parser.ImageType) (*SystemResource,
 	return &SystemResource{client: mock, dialect: dialect.Detect(version, image)}, mock
 }
 
-// The DHCP client command is rendered per dialect on create, update, and delete.
+// The DHCP client command is rendered per dialect on create, update, and
+// delete. Each operation's full command stream is compared exactly, so a
+// stray extra command (or a second DHCP spelling) fails the test.
 func TestSystem_DHCPClientDialect(t *testing.T) {
 	tests := []struct {
 		name, version   string
 		image           parser.ImageType
 		disable, enable string
 	}{
-		{"08.0.95", "08.0.95qT213", parser.ImageTypeRouter, "ip dhcp-client disable", "no ip dhcp-client disable"},
+		{"08.0.95 router", "08.0.95qT213", parser.ImageTypeRouter, "ip dhcp-client disable", "no ip dhcp-client disable"},
+		{"08.0.95 switch", "08.0.95rT211", parser.ImageTypeSwitch, "ip dhcp-client disable", "no ip dhcp-client disable"},
 		{"6450 08.0.30 router", "08.0.30uT313", parser.ImageTypeRouter, "ip dhcp-client disable", "no ip dhcp-client disable"},
 		{"6430 08.0.30 switch", "08.0.30uT311", parser.ImageTypeSwitch, "no ip dhcp-client enable", "ip dhcp-client enable"},
 	}
@@ -92,28 +95,39 @@ func TestSystem_DHCPClientDialect(t *testing.T) {
 			state, plan := systemStateAndPlan(t, r, off, on)
 			cresp := resource.CreateResponse{State: state}
 			r.Create(context.Background(), resource.CreateRequest{Plan: plan}, &cresp)
-			if cresp.Diagnostics.HasError() || !mock.HasCommand(tt.disable) {
-				t.Errorf("create: want %q, got %v (%v)", tt.disable, mock.Commands, cresp.Diagnostics)
+			if cresp.Diagnostics.HasError() {
+				t.Fatalf("create: %v", cresp.Diagnostics)
 			}
+			assertCommands(t, "create", mock.Commands, []string{tt.disable, "write memory"})
 
 			// Update true -> false.
 			r, mock = systemWithDialect(tt.version, tt.image)
 			state, plan = systemStateAndPlan(t, r, on, off)
 			uresp := resource.UpdateResponse{State: state}
 			r.Update(context.Background(), resource.UpdateRequest{Plan: plan, State: state}, &uresp)
-			if uresp.Diagnostics.HasError() || !mock.HasCommand(tt.enable) {
-				t.Errorf("update: want %q, got %v (%v)", tt.enable, mock.Commands, uresp.Diagnostics)
+			if uresp.Diagnostics.HasError() {
+				t.Fatalf("update: %v", uresp.Diagnostics)
 			}
+			assertCommands(t, "update", mock.Commands, []string{tt.enable, "write memory"})
 
 			// Delete resets to enabled.
 			r, mock = systemWithDialect(tt.version, tt.image)
 			state, _ = systemStateAndPlan(t, r, on, nil)
 			dresp := resource.DeleteResponse{State: state}
 			r.Delete(context.Background(), resource.DeleteRequest{State: state}, &dresp)
-			if dresp.Diagnostics.HasError() || !mock.HasCommand(tt.enable) {
-				t.Errorf("delete: want %q, got %v (%v)", tt.enable, mock.Commands, dresp.Diagnostics)
+			if dresp.Diagnostics.HasError() {
+				t.Fatalf("delete: %v", dresp.Diagnostics)
 			}
+			assertCommands(t, "delete", mock.Commands, []string{tt.enable, "write memory"})
 		})
+	}
+}
+
+// assertCommands fails unless got is exactly want, in order.
+func assertCommands(t *testing.T, op string, got, want []string) {
+	t.Helper()
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("%s: commands = %q, want exactly %q", op, got, want)
 	}
 }
 
