@@ -10,6 +10,8 @@ Manages arbitrary CLI configuration lines on an ICX switch. Use this as an escap
 
 ~> **Destroy behavior — auto-`no` is dangerous for context-entering commands.** If `destroy_commands` is not set, each command in `commands` is prefixed with `no` on destroy. This works correctly for leaf commands (`snmp-server community public ro`) but **will fail** for context-entering sequences like `router ospf` / `area 0 range 10.0.0.0/8`. For those, always set explicit `destroy_commands`.
 
+~> **Some commands are rejected.** `hostname`, `ip address` and `ip default-gateway` — and their `no` forms and abbreviations — are refused at plan time in `commands` and `destroy_commands` (and in every resource's `raw_config`). They would bypass the safeguards of [`icx_system`](system.md)`.hostname` (which re-learns the CLI prompt after a rename) and [`icx_management_ip`](management_ip.md) / [`icx_interface_ve`](interface_ve.md)`.ip_address` (which guard changes to the address the provider is connected through); and the automatic `no` on destroy would remove the management address. `expect_in_config` may still mention these lines.
+
 ~> **`icx_raw_config` does not import.** This resource has no `ImportState` implementation.
 
 ## Example Usage

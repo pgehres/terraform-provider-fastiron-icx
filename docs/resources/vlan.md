@@ -50,7 +50,7 @@ resource "icx_vlan" "multicast_vlan" {
 - `stp_priority` (Number) - Spanning tree priority for this VLAN (e.g. `4096`). Only meaningful when `spanning_tree = true`.
 - `multicast_passive` (Boolean) - Enable IGMP snooping in passive mode on this VLAN. Defaults to `false`.
 - `multicast_version` (Number) - IGMP version (2 or 3). Only meaningful when `multicast_passive = true`.
-- `raw_config` (List of String) - Additional raw CLI commands to execute within the VLAN context (`vlan N ... exit`). On destroy, each command is prefixed with `no`. See [raw_config escape hatch](#raw_config-escape-hatch) below.
+- `raw_config` (List of String) - Additional raw CLI commands to execute within the VLAN context (`vlan N ... exit`). On destroy, each command is prefixed with `no`. See [raw_config escape hatch](#raw_config-escape-hatch) below. Entries beginning with `hostname`, `ip address` or `ip default-gateway` (or their `no` forms) are rejected at plan time; use the dedicated attributes instead.
 
 ### Read-Only
 

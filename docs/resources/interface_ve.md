@@ -38,7 +38,7 @@ resource "icx_interface_ve" "management" {
 ### Optional
 
 - `ip_address` (String) - IP address in CIDR notation (e.g. `"10.0.1.1/24"`). The provider converts this to the `address mask` format required by FastIron CLI (`ip address 10.0.1.1 255.255.255.0`).
-- `raw_config` (List of String) - Additional raw CLI commands within the VE interface context (`interface ve N ... exit`). On destroy each command is prefixed with `no`.
+- `raw_config` (List of String) - Additional raw CLI commands within the VE interface context (`interface ve N ... exit`). On destroy each command is prefixed with `no`. Entries beginning with `hostname`, `ip address` or `ip default-gateway` (or their `no` forms) are rejected at plan time; use the dedicated attributes instead.
 
 ### Read-Only
 
