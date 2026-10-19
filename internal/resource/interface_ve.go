@@ -7,11 +7,14 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
@@ -67,6 +70,19 @@ func (r *InterfaceVEResource) Schema(_ context.Context, _ resource.SchemaRequest
 				Description: "Additional raw CLI commands to execute within the VE interface context.",
 				Optional:    true,
 				ElementType: types.StringType,
+				Validators: []validator.List{
+					// One CLI command per element: embedded newlines would inject
+					// additional commands into the session.
+					listvalidator.ValueStringsAre(
+						stringvalidator.RegexMatches(
+							reNoNewlines,
+							`raw_config elements must not contain carriage returns or newlines`,
+						),
+					),
+					// `ip address` belongs in ip_address; hostname / default
+					// gateway have their own resources (see rawguard.go).
+					guardedRawConfigListValidator(),
+				},
 			},
 		},
 	}
@@ -311,6 +327,11 @@ func cidrToAddressMask(cidr string) (string, error) {
 	ip, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return "", fmt.Errorf("invalid CIDR %q: %w", cidr, err)
+	}
+	// An IPv4-mapped IPv6 prefix (::ffff:10.0.20.5/120) parses with a
+	// 16-byte mask that would render as an IPv6 mask: refuse it.
+	if ip.To4() == nil || len(ipNet.Mask) != net.IPv4len {
+		return "", fmt.Errorf("invalid CIDR %q: not an IPv4 prefix", cidr)
 	}
 	mask := net.IP(ipNet.Mask).String()
 	return fmt.Sprintf("%s %s", ip.String(), mask), nil

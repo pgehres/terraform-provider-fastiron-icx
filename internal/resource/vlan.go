@@ -135,6 +135,9 @@ func (r *VLANResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 							`raw_config elements must not contain carriage returns or newlines`,
 						),
 					),
+					// hostname / ip address / ip default-gateway bypass their
+					// dedicated attributes' safeguards (see rawguard.go).
+					guardedRawConfigListValidator(),
 				},
 			},
 		},
