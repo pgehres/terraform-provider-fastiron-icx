@@ -34,6 +34,14 @@ var (
 // via the `manager port-list %s` interpolation.
 var reManagerPortList = regexp.MustCompile(`^[0-9to/, ]+$`)
 
+// reHostname is the charset accepted for `hostname <name>`: letters, digits,
+// hyphen, underscore and dot, starting with a letter or digit. No whitespace,
+// quotes or control characters — the name is interpolated into a CLI command
+// and, more importantly, becomes part of the CLI prompt the SSH client has to
+// recognise ("SSH@<hostname> Router#"). The device enforces its own length
+// limit on top of the 64 characters allowed here.
+var reHostname = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
 type SystemResource struct {
 	client  sshclient.CommandExecutor
 	dialect dialect.Dialect
@@ -82,6 +90,7 @@ func (r *SystemResource) checkCapabilities(plan *SystemResourceModel, diags *dia
 
 type SystemResourceModel struct {
 	ID                      types.String `tfsdk:"id"`
+	Hostname                types.String `tfsdk:"hostname"`
 	GlobalSTP               types.Bool   `tfsdk:"global_stp"`
 	TelnetServer            types.Bool   `tfsdk:"telnet_server"`
 	DHCPClientDisable       types.Bool   `tfsdk:"dhcp_client_disable"`
@@ -108,6 +117,22 @@ func (r *SystemResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Computed: true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"hostname": schema.StringAttribute{
+				Description: "System hostname (`hostname <name>`), which also forms the CLI prompt. " +
+					"Letters, digits, '.', '-' and '_' only, 1-64 characters. When omitted the device's " +
+					"current hostname is kept and recorded in state; the provider never resets a hostname " +
+					"to the factory default.",
+				Optional: true,
+				Computed: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+				Validators: []validator.String{
+					stringvalidator.LengthBetween(1, 64),
+					stringvalidator.RegexMatches(reHostname,
+						"hostname may only contain letters, digits, '.', '-' and '_', and must start with a letter or digit"),
 				},
 			},
 			"global_stp": schema.BoolAttribute{
@@ -212,11 +237,37 @@ func (r *SystemResource) Create(ctx context.Context, req resource.CreateRequest,
 
 	commands := r.buildCommands(&plan)
 
+	// hostname omitted from config: adopt whatever the device has (and send
+	// nothing for it), so an existing fleet picks up the attribute with a
+	// zero-diff plan.
+	setHostname := !plan.Hostname.IsNull() && !plan.Hostname.IsUnknown()
+	if plan.Hostname.IsUnknown() {
+		config, err := r.getRunningConfig()
+		if err != nil {
+			resp.Diagnostics.AddError("Failed to read running config", err.Error())
+			return
+		}
+		plan.Hostname = hostnameValue(config.Global.Hostname)
+	}
+
 	if len(commands) > 0 {
 		if err := r.client.ExecuteInConfigMode(commands); err != nil {
 			resp.Diagnostics.AddError("Failed to configure system", err.Error())
 			return
 		}
+	}
+	// The hostname goes last, through the prompt re-detecting path: once it is
+	// sent the CLI prompt changes, and nothing else would be readable until the
+	// client has learned the new one.
+	sent := len(commands) > 0
+	if setHostname {
+		if err := r.client.ExecutePromptChanging("hostname " + plan.Hostname.ValueString()); err != nil {
+			resp.Diagnostics.AddError("Failed to set hostname", err.Error())
+			return
+		}
+		sent = true
+	}
+	if sent {
 		if err := r.client.WriteMemory(); err != nil {
 			resp.Diagnostics.AddError("Failed to save configuration", err.Error())
 			return
@@ -225,6 +276,15 @@ func (r *SystemResource) Create(ctx context.Context, req resource.CreateRequest,
 
 	plan.ID = types.StringValue("system")
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// hostnameValue maps the parser's hostname ("" = device default) to the
+// attribute value (null = device default).
+func hostnameValue(hostname string) types.String {
+	if hostname == "" {
+		return types.StringNull()
+	}
+	return types.StringValue(hostname)
 }
 
 func (r *SystemResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -240,6 +300,7 @@ func (r *SystemResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 
+	state.Hostname = hostnameValue(config.Global.Hostname)
 	state.GlobalSTP = types.BoolValue(config.Global.GlobalSTP)
 
 	// Telnet: if explicitly set in config, use that; otherwise default to true (enabled).
@@ -346,6 +407,24 @@ func (r *SystemResource) Update(ctx context.Context, req resource.UpdateRequest,
 			resp.Diagnostics.AddError("Failed to update system", err.Error())
 			return
 		}
+	}
+
+	// hostname: unknown means "not in config and nothing in state to keep"
+	// (the device runs its default name) — leave it alone. Null in plan cannot
+	// happen for an Optional+Computed attribute. A changed value goes last,
+	// through the prompt re-detecting path (see Create).
+	sent := len(commands) > 0
+	if plan.Hostname.IsUnknown() {
+		plan.Hostname = state.Hostname
+	}
+	if !plan.Hostname.IsNull() && !plan.Hostname.Equal(state.Hostname) {
+		if err := r.client.ExecutePromptChanging("hostname " + plan.Hostname.ValueString()); err != nil {
+			resp.Diagnostics.AddError("Failed to set hostname", err.Error())
+			return
+		}
+		sent = true
+	}
+	if sent {
 		if err := r.client.WriteMemory(); err != nil {
 			resp.Diagnostics.AddError("Failed to save configuration", err.Error())
 			return
@@ -370,6 +449,11 @@ func (r *SystemResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	// Reset all settings to defaults. On a switch image global-stp cannot be
 	// configured (and `no global-stp` does not exist), so a true value in
 	// stale state is skipped rather than blocking the singleton's delete.
+	//
+	// The hostname is deliberately NOT reset: state holds the device's name
+	// whether the user set it or the provider merely recorded it, so `no
+	// hostname` here would rename devices nobody asked to rename (and bounce
+	// the CLI prompt mid-destroy).
 	var commands []string
 	if state.GlobalSTP.ValueBool() && r.dialect.Has(dialect.CapGlobalSTP) {
 		commands = append(commands, "no global-stp")

@@ -88,42 +88,42 @@ func TestDetectHas(t *testing.T) {
 	}{
 		{"7250-24 router 08.0.95", "08.0.95mT213", parser.ImageTypeRouter, true, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
 		}},
 		{"7150-24/C12P router 08.0.95", "08.0.95qT213", parser.ImageTypeRouter, true, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
 		}},
 		{"C10ZP switch 08.0.95", "08.0.95rT211", parser.ImageTypeSwitch, true, caps{
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: true,
-			CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
 		}},
 		{"6430 switch 08.0.30", "08.0.30uT311", parser.ImageTypeSwitch, true, caps{
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: false,
-			CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: true,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: true,
 		}},
 		{"6450 router 08.0.30", "08.0.30uT313", parser.ImageTypeRouter, true, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: false,
-			CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: false,
 		}},
 		{"unparseable version, unknown image", "garbage", parser.ImageTypeUnknown, false, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
 		}},
 		{"empty version, empty image", "", "", false, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
 		}},
 		// The two axes are independent: a structurally detected switch image
 		// still blocks router-only features when the version is unparseable.
 		{"unparseable version, switch image", "", parser.ImageTypeSwitch, false, caps{
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: true,
-			CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
 		}},
 		// And an old version with an undetected image does not guess the
 		// image-dependent DHCP spelling.
 		{"08.0.30 unknown image", "08.0.30uT31x", parser.ImageTypeUnknown, true, caps{
-			CapVEInterfaces: true, CapManager: false, CapDualMode: true, CapLegacyDHCPClient: false,
+			CapVEInterfaces: true, CapGlobalManagementIP: true, CapManager: false, CapDualMode: true, CapLegacyDHCPClient: false,
 		}},
 	}
 	for _, tt := range tests {
@@ -181,6 +181,23 @@ func TestWhy(t *testing.T) {
 	}
 	if !strings.Contains(Docs(CapGlobalSTP), "#router-image-vs-switch-image") {
 		t.Errorf("Docs(GlobalSTP) = %q", Docs(CapGlobalSTP))
+	}
+
+	// The mirror image: the global management address exists only on the
+	// switch image, and the explanation names the router-image alternative.
+	router := Detect("08.0.95mT213", parser.ImageTypeRouter)
+	if got := router.Why(CapGlobalManagementIP); !strings.Contains(got, "router image (firmware 08.0.95mT213)") ||
+		!strings.Contains(got, "icx_interface_ve") {
+		t.Errorf("Why(GlobalManagementIP) = %q", got)
+	}
+	if Title(CapGlobalManagementIP) != "Switch image required" {
+		t.Errorf("Title(GlobalManagementIP) = %q", Title(CapGlobalManagementIP))
+	}
+	if !strings.Contains(Docs(CapGlobalManagementIP), "#router-image-vs-switch-image") {
+		t.Errorf("Docs(GlobalManagementIP) = %q", Docs(CapGlobalManagementIP))
+	}
+	if d.Why(CapGlobalManagementIP) != "" {
+		t.Errorf("switch image must have CapGlobalManagementIP, got Why = %q", d.Why(CapGlobalManagementIP))
 	}
 
 	if got := Detect("", parser.ImageTypeSwitch).Why(CapGlobalSTP); !strings.Contains(got, "firmware unknown") {

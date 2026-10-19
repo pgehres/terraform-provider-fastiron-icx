@@ -23,6 +23,7 @@ func newSwitchImageSystemResource() (*SystemResource, *sshclient.MockClient) {
 func systemModel(globalSTP, telnet bool) *SystemResourceModel {
 	return &SystemResourceModel{
 		ID:                      types.StringValue("system"),
+		Hostname:                types.StringNull(),
 		GlobalSTP:               types.BoolValue(globalSTP),
 		TelnetServer:            types.BoolValue(telnet),
 		DHCPClientDisable:       types.BoolValue(false),

@@ -22,7 +22,9 @@ type GlobalSettings struct {
 	StaticRoutes            []string
 	DefaultNetwork          string
 	DefaultGateway          string
-	IPAddress               string // Global IP (used on some models like c10zp)
+	IPAddress               string   // Global IP (used on some models like c10zp)
+	Hostname                string   // `hostname X`; empty when the device uses its default name
+	DNSServers              []string // `ip dns server-address A [B C D]`, in device order
 }
 
 // AAAConfig holds AAA authentication settings.
