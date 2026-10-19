@@ -66,7 +66,7 @@ func (d *StackUnitDataSource) Schema(_ context.Context, _ datasource.SchemaReque
 				ElementType: types.StringType,
 			},
 			"firmware_version": schema.StringAttribute{
-				Description: "FastIron firmware version string from the running config (e.g. \"08.0.95rT211\"). Device-wide, not per stack unit.",
+				Description: "FastIron firmware version string from the running config (e.g. \"08.0.95rT211\"), or null if the config has no ver line. Device-wide, not per stack unit.",
 				Computed:    true,
 			},
 			"image_type": schema.StringAttribute{
@@ -129,7 +129,11 @@ func (d *StackUnitDataSource) Read(ctx context.Context, req datasource.ReadReque
 
 	state.ID = types.StringValue(strconv.Itoa(unitID))
 	state.UnitID = types.Int64Value(int64(unitID))
-	state.FirmwareVersion = types.StringValue(config.Global.Version)
+	if config.Global.Version != "" {
+		state.FirmwareVersion = types.StringValue(config.Global.Version)
+	} else {
+		state.FirmwareVersion = types.StringNull()
+	}
 	state.ImageType = types.StringValue(string(config.ImageType()))
 
 	// Build modules list.

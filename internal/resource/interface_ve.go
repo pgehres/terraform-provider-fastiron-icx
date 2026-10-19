@@ -271,6 +271,13 @@ func (r *InterfaceVEResource) Delete(ctx context.Context, req resource.DeleteReq
 }
 
 func (r *InterfaceVEResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	// Read treats a VE on a switch image as absent, which would surface as the
+	// framework's generic "Cannot import non-existent remote object". Fail
+	// with the specific reason instead.
+	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
+		return
+	}
+
 	veID, err := strconv.ParseInt(req.ID, 10, 64)
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid VE ID", fmt.Sprintf("Expected numeric VE ID, got %q", req.ID))

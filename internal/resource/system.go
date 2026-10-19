@@ -214,7 +214,10 @@ func (r *SystemResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 
-	if (plan.GlobalSTP.ValueBool() || state.GlobalSTP.ValueBool()) &&
+	// Guard only the plan side: global_stp=true solely in state (left behind
+	// by a router→switch reimage) is necessarily absent on a switch image, so
+	// turning it off must not error — the `no global-stp` is skipped instead.
+	if plan.GlobalSTP.ValueBool() &&
 		!requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics) {
 		return
 	}
@@ -224,7 +227,7 @@ func (r *SystemResource) Update(ctx context.Context, req resource.UpdateRequest,
 	if plan.GlobalSTP.ValueBool() != state.GlobalSTP.ValueBool() {
 		if plan.GlobalSTP.ValueBool() {
 			commands = append(commands, "global-stp")
-		} else {
+		} else if r.imageType != parser.ImageTypeSwitch {
 			commands = append(commands, "no global-stp")
 		}
 	}
@@ -311,14 +314,11 @@ func (r *SystemResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		return
 	}
 
-	// Reset all settings to defaults.
-	if state.GlobalSTP.ValueBool() &&
-		!requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics) {
-		return
-	}
-
+	// Reset all settings to defaults. On a switch image global-stp cannot be
+	// configured (and `no global-stp` does not exist), so a true value in
+	// stale state is skipped rather than blocking the singleton's delete.
 	var commands []string
-	if state.GlobalSTP.ValueBool() {
+	if state.GlobalSTP.ValueBool() && r.imageType != parser.ImageTypeSwitch {
 		commands = append(commands, "no global-stp")
 	}
 	if !state.TelnetServer.ValueBool() {

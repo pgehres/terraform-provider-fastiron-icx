@@ -242,7 +242,11 @@ func (r *VLANResource) Update(ctx context.Context, req resource.UpdateRequest, r
 		return
 	}
 
-	if (!plan.RouterInterface.IsNull() || !state.RouterInterface.IsNull()) &&
+	// Guard only the plan side: a router_interface present solely in state
+	// (left behind by a router→switch reimage) is necessarily absent on a
+	// switch image, so removing it must not error — buildUpdateCommands skips
+	// the `no router-interface` command there instead.
+	if !plan.RouterInterface.IsNull() &&
 		!requireRouterImage(r.imageType, r.firmwareVersion, "The router_interface attribute of icx_vlan", &resp.Diagnostics) {
 		return
 	}
@@ -390,7 +394,9 @@ func (r *VLANResource) buildUpdateCommands(ctx context.Context, plan, state *VLA
 
 	// Router interface changes.
 	if !plan.RouterInterface.Equal(state.RouterInterface) {
-		if !state.RouterInterface.IsNull() {
+		// On a switch image the router-interface cannot exist (and the
+		// command does not), so there is nothing to remove.
+		if !state.RouterInterface.IsNull() && r.imageType != parser.ImageTypeSwitch {
 			commands = append(commands, fmt.Sprintf("no router-interface ve %d", state.RouterInterface.ValueInt64()))
 		}
 		if !plan.RouterInterface.IsNull() {

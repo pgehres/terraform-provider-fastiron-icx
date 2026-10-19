@@ -22,7 +22,7 @@ Every FastIron release ships as two binaries per platform: the **switch image** 
 
 | Capability | Switch image | Router image |
 |---|---|---|
-| VLANs, port membership, port names, LAGs, PoE | ✓ | ✓ |
+| VLANs, port membership, port names, PoE | ✓ | ✓ |
 | `icx_user`, `icx_aaa`, users/SSH management | ✓ | ✓ |
 | Management IP | One global `ip address` + `ip default-gateway` | VE interfaces + `ip route` |
 | `icx_interface_ve` / `router_interface` on `icx_vlan` | ✗ (commands do not exist) | ✓ |
@@ -31,9 +31,9 @@ Every FastIron release ships as two binaries per platform: the **switch image** 
 
 Identify the image from `show version` or the `ver` line at the top of the running config (e.g. `08.0.95rT211` = switch image, `08.0.95mT213` = router image).
 
--> **The provider detects the image type.** At connect time the provider reads the running config once and derives the image type, first from the version string's trailing T-code (`…T211` = switch image, `…T213` = router image) and, when that code is unrecognized, from structural signals (VE interfaces, `ip route`, or `global-stp` mean router image; a global `ip address`/`ip default-gateway` means switch image). Declaring a router-image-only resource or attribute against a switch-image device then fails with a clear **Router image required** error *before any commands are sent* — instead of a mid-apply `Invalid input` CLI error. Devices whose image cannot be determined are never blocked. The detected type is exposed as `image_type` (alongside `firmware_version`) on the [`icx_stack_unit`](data-sources/stack_unit.md) data source.
+-> **The provider detects the image type.** At connect time the provider reads the running config once and derives the image type, first from the version string's trailing T-code (`…T211` = switch image, `…T213` = router image) and, when that code is unrecognized, from structural signals (VE interfaces, `ip route`, a VLAN `router-interface`, or `global-stp` mean router image; a global `ip address`/`ip default-gateway` means switch image). Declaring a router-image-only resource or attribute against a switch-image device then fails with a clear **Router image required** error *before any commands are sent* — instead of a mid-apply `Invalid input` CLI error. Devices whose image cannot be determined are never blocked. The detected type is exposed as `image_type` (alongside `firmware_version`) on the [`icx_stack_unit`](data-sources/stack_unit.md) data source.
 
--> **Reimaging changes your Terraform config.** Moving a switch between images requires flashing the other binary and rebooting, and the management addressing does not translate: a switch-image device's global `ip address` must be rebuilt as an `icx_vlan` `router_interface` + `icx_interface_ve` (or vice versa). Plan this as a deliberate config migration, not something the provider reconciles.
+-> **Reimaging changes your Terraform config.** Moving a switch between images requires flashing the other binary and rebooting, and the management addressing does not translate: a switch-image device's global `ip address` must be rebuilt as an `icx_vlan` `router_interface` + `icx_interface_ve` (or vice versa). Plan this as a deliberate config migration: the provider does not rewrite your configuration. After a router→switch reimage, stale router-image state is cleared without errors — `icx_interface_ve` resources drop out of state on refresh (or destroy cleanly), and removing `router_interface`/`global_stp = true` from config applies without sending the non-existent `no` commands — but declaring the switch-image equivalents is up to you.
 
 ## SSH and Host Key Verification
 

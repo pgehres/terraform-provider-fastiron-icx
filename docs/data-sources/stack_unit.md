@@ -40,5 +40,5 @@ output "stack_ports" {
   - `id` (Number) - Module slot number.
   - `type` (String) - Module type string as reported in the running config.
 - `stack_ports` (List of String) - List of stack port identifiers (e.g. `["1/2/1", "1/2/2"]`).
-- `firmware_version` (String) - FastIron firmware version string from the running config (e.g. `"08.0.95rT211"`). Device-wide, not per stack unit.
+- `firmware_version` (String) - FastIron firmware version string from the running config (e.g. `"08.0.95rT211"`), or null if the config has no `ver` line. Device-wide, not per stack unit.
 - `image_type` (String) - FastIron firmware image type: `"router"` (SPR, Layer 3), `"switch"` (SPS, Layer 2 only), or `"unknown"` if it could not be determined. Device-wide, not per stack unit. See [Router Image vs. Switch Image](../index.md#router-image-vs-switch-image).

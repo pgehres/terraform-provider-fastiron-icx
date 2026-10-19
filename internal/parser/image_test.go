@@ -104,6 +104,27 @@ func TestImageType_StructuralFallback(t *testing.T) {
 			expected: ImageTypeUnknown,
 		},
 		{
+			// Switch images cannot carry L3 artifacts, so a router signal is
+			// definitive even alongside a switch-style global ip address.
+			name: "router signal wins over switch signal",
+			config: RunningConfig{
+				VEInterfaces: []VEInterface{{ID: 1}},
+				Global: GlobalSettings{
+					IPAddress:      "10.0.20.5 255.255.255.0",
+					DefaultGateway: "10.0.20.1",
+				},
+			},
+			expected: ImageTypeRouter,
+		},
+		{
+			name: "VLAN router-interface wins over global ip address",
+			config: RunningConfig{
+				VLANs:  []VLAN{{ID: 20, RouterInterface: &veID}},
+				Global: GlobalSettings{IPAddress: "10.0.20.5 255.255.255.0"},
+			},
+			expected: ImageTypeRouter,
+		},
+		{
 			name: "recognized version suffix wins over structure",
 			config: RunningConfig{
 				Global: GlobalSettings{

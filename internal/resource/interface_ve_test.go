@@ -8,6 +8,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
 )
@@ -121,6 +122,53 @@ func TestInterfaceVECreate_SwitchImageErrors(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected 'Router image required' error, got: %v", resp.Diagnostics)
+	}
+	if len(mock.Commands) != 0 {
+		t.Errorf("expected no commands sent, got %v", mock.Commands)
+	}
+}
+
+// Update keeps the fail-fast error on a switch image, before any commands.
+func TestInterfaceVEUpdate_SwitchImageErrors(t *testing.T) {
+	ctx := context.Background()
+	r, mock := newSwitchImageVEResource()
+	state := veStateWithID(t, r, 10)
+
+	plan := tfsdk.Plan{Schema: state.Schema}
+	diags := plan.Set(ctx, &InterfaceVEResourceModel{
+		ID:        types.StringValue("10"),
+		VeID:      types.Int64Value(10),
+		IPAddress: types.StringValue("10.0.20.1/24"),
+		RawConfig: types.ListNull(types.StringType),
+	})
+	if diags.HasError() {
+		t.Fatalf("failed to build plan: %v", diags)
+	}
+
+	resp := resource.UpdateResponse{State: state}
+	r.Update(ctx, resource.UpdateRequest{Plan: plan, State: state}, &resp)
+
+	if !hasRouterImageError(resp.Diagnostics) {
+		t.Fatalf("expected 'Router image required' error, got: %v", resp.Diagnostics)
+	}
+	if len(mock.Commands) != 0 {
+		t.Errorf("expected no commands sent, got %v", mock.Commands)
+	}
+}
+
+// Import on a switch image names the real cause rather than letting Read's
+// RemoveResource surface as "Cannot import non-existent remote object".
+func TestInterfaceVEImportState_SwitchImageErrors(t *testing.T) {
+	ctx := context.Background()
+	r, mock := newSwitchImageVEResource()
+	state := veSchema(t, r)
+	state.Raw = tftypes.NewValue(state.Schema.Type().TerraformType(ctx), nil)
+
+	resp := resource.ImportStateResponse{State: state}
+	r.ImportState(ctx, resource.ImportStateRequest{ID: "10"}, &resp)
+
+	if !hasRouterImageError(resp.Diagnostics) {
+		t.Fatalf("expected 'Router image required' error, got: %v", resp.Diagnostics)
 	}
 	if len(mock.Commands) != 0 {
 		t.Errorf("expected no commands sent, got %v", mock.Commands)
