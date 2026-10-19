@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -28,6 +29,7 @@ import (
 var (
 	_ resource.Resource                = &InterfaceEthernetResource{}
 	_ resource.ResourceWithImportState = &InterfaceEthernetResource{}
+	_ resource.ResourceWithModifyPlan  = &InterfaceEthernetResource{}
 )
 
 // rePort matches FastIron port identifiers in unit/slot/port format (e.g., "1/1/15").
@@ -49,6 +51,7 @@ type InterfaceEthernetResourceModel struct {
 	PortName             types.String `tfsdk:"port_name"`
 	SpanningTreePt2PtMac types.Bool   `tfsdk:"spanning_tree_pt2pt_mac"`
 	OpticalMonitor       types.Bool   `tfsdk:"optical_monitor"`
+	Enabled              types.Bool   `tfsdk:"enabled"`
 	UntaggedVLAN         types.Int64  `tfsdk:"untagged_vlan"`
 	TaggedVLANs          types.Set    `tfsdk:"tagged_vlans"`
 	TagAllVLANs          types.Bool   `tfsdk:"tag_all_vlans"`
@@ -110,6 +113,18 @@ func (r *InterfaceEthernetResource) Schema(_ context.Context, _ resource.SchemaR
 				Optional:    true,
 				Computed:    true,
 				Default:     booldefault.StaticBool(true),
+			},
+			"enabled": schema.BoolAttribute{
+				Description: "Administrative state of the port: false sends `disable` (admin-down), true sends `enable`. " +
+					"When omitted the port's current state is kept and recorded in state (zero-diff adoption), so " +
+					"a port disabled by hand stays disabled until the attribute is set explicitly. Destroy re-enables " +
+					"a port this resource disabled. Disabling the port that carries the switch's management next hop " +
+					"is refused at plan time; see the resource documentation.",
+				Optional: true,
+				Computed: true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"untagged_vlan": schema.Int64Attribute{
 				Description: "VLAN ID for untagged traffic on this port. The port will be set as untagged in this VLAN.",
@@ -176,6 +191,55 @@ func (r *InterfaceEthernetResource) dialectFor(config *parser.RunningConfig) dia
 	return r.dialect.Observe(config)
 }
 
+// boolKnown reports whether b holds a value (neither null nor unknown).
+func boolKnown(b types.Bool) bool { return !b.IsNull() && !b.IsUnknown() }
+
+// disablesPort reports whether applying plan over state administratively
+// disables the port: the plan says enabled = false and state does not already
+// record it as disabled. state may be nil (create).
+func disablesPort(plan, state *InterfaceEthernetResourceModel) bool {
+	if !boolKnown(plan.Enabled) || plan.Enabled.ValueBool() {
+		return false
+	}
+	return state == nil || !boolKnown(state.Enabled) || state.Enabled.ValueBool()
+}
+
+// ModifyPlan refuses, at plan time, to disable the port the switch reaches its
+// management next hop through (see mgmtpath.go). It runs only when the plan
+// turns enabled from true (or unrecorded) to false, costs one running-config
+// read plus one `show arp`, and sends no configuration. The same check is
+// repeated in Create/Update as a backstop for a value only known at apply.
+func (r *InterfaceEthernetResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() || r.client == nil {
+		return
+	}
+	var plan InterfaceEthernetResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	var state *InterfaceEthernetResourceModel
+	if !req.State.Raw.IsNull() {
+		state = &InterfaceEthernetResourceModel{}
+		resp.Diagnostics.Append(req.State.Get(ctx, state)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+	if !disablesPort(&plan, state) {
+		return
+	}
+	config, err := r.getRunningConfig()
+	if err != nil {
+		resp.Diagnostics.AddWarning("Cannot verify the management path",
+			"enabled = false will administratively disable port "+plan.Port.ValueString()+
+				", but the running config could not be read to check whether that port carries the provider's "+
+				"own session: "+err.Error())
+		return
+	}
+	checkManagementPathDisable(r.client, config, plan.Port.ValueString(), &resp.Diagnostics)
+}
+
 func (r *InterfaceEthernetResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan InterfaceEthernetResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -190,10 +254,25 @@ func (r *InterfaceEthernetResource) Create(ctx context.Context, req resource.Cre
 		return
 	}
 
-	// Apply interface-level commands.
-	ifCommands := r.buildInterfaceCommands(&plan, &resp.Diagnostics)
+	// enabled omitted: adopt the port's current admin state and send nothing
+	// for it, so existing fleets pick the attribute up with a zero-diff plan.
+	deviceDisabled := false
+	if iface := config.FindEthernetInterface(plan.Port.ValueString()); iface != nil {
+		deviceDisabled = iface.Disabled
+	}
+	if boolKnown(plan.Enabled) && !plan.Enabled.ValueBool() &&
+		!checkManagementPathDisable(r.client, config, plan.Port.ValueString(), &resp.Diagnostics) {
+		return
+	}
+
+	// Apply interface-level commands (built before the adoption below, so an
+	// adopted value is never sent as a command).
+	ifCommands := r.buildInterfaceCommands(&plan, deviceDisabled, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+	if !boolKnown(plan.Enabled) {
+		plan.Enabled = types.BoolValue(!deviceDisabled)
 	}
 	if len(ifCommands) > 0 {
 		if err := r.client.ExecuteInConfigMode(ifCommands); err != nil {
@@ -252,10 +331,12 @@ func (r *InterfaceEthernetResource) Read(ctx context.Context, req resource.ReadR
 		}
 		state.SpanningTreePt2PtMac = types.BoolValue(iface.SpanningTreePt2PtMac)
 		state.OpticalMonitor = types.BoolValue(!iface.OpticalMonitorDisable)
+		state.Enabled = types.BoolValue(!iface.Disabled)
 	} else {
 		state.PortName = types.StringNull()
 		state.SpanningTreePt2PtMac = types.BoolValue(false)
 		state.OpticalMonitor = types.BoolValue(true)
+		state.Enabled = types.BoolValue(true)
 	}
 
 	// Ensure tag_all_vlans has a value (can't be read from switch).
@@ -280,6 +361,15 @@ func (r *InterfaceEthernetResource) Update(ctx context.Context, req resource.Upd
 	config, err := r.getRunningConfig()
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to read running config", err.Error())
+		return
+	}
+
+	// enabled unknown (omitted from config, nothing recorded yet): keep
+	// whatever state has; the port's admin state is not touched.
+	if !boolKnown(plan.Enabled) {
+		plan.Enabled = state.Enabled
+	}
+	if disablesPort(&plan, &state) && !checkManagementPathDisable(r.client, config, plan.Port.ValueString(), &resp.Diagnostics) {
 		return
 	}
 
@@ -343,6 +433,11 @@ func (r *InterfaceEthernetResource) Delete(ctx context.Context, req resource.Del
 	if !state.OpticalMonitor.ValueBool() {
 		commands = append(commands, "optical-monitor")
 	}
+	// A port this resource disabled comes back up: enabled is the default
+	// state Delete returns every other attribute to.
+	if boolKnown(state.Enabled) && !state.Enabled.ValueBool() {
+		commands = append(commands, "enable")
+	}
 
 	// Remove raw config lines.
 	rawLines := listToStringSlice(ctx, state.RawConfig, &resp.Diagnostics)
@@ -380,8 +475,10 @@ func (r *InterfaceEthernetResource) ImportState(ctx context.Context, req resourc
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("port"), req.ID)...)
 }
 
-// buildInterfaceCommands generates commands for creating an interface configuration.
-func (r *InterfaceEthernetResource) buildInterfaceCommands(plan *InterfaceEthernetResourceModel, diags *diag.Diagnostics) []string {
+// buildInterfaceCommands generates commands for creating an interface
+// configuration. deviceDisabled is the port's current admin state, so that an
+// explicit enabled = true only sends `enable` when the port is actually down.
+func (r *InterfaceEthernetResource) buildInterfaceCommands(plan *InterfaceEthernetResourceModel, deviceDisabled bool, diags *diag.Diagnostics) []string {
 	port := plan.Port.ValueString()
 	commands := []string{fmt.Sprintf("interface ethernet %s", port)}
 
@@ -395,6 +492,14 @@ func (r *InterfaceEthernetResource) buildInterfaceCommands(plan *InterfaceEthern
 
 	if !plan.OpticalMonitor.ValueBool() {
 		commands = append(commands, "no optical-monitor")
+	}
+
+	if boolKnown(plan.Enabled) {
+		if !plan.Enabled.ValueBool() {
+			commands = append(commands, "disable")
+		} else if deviceDisabled {
+			commands = append(commands, "enable")
+		}
 	}
 
 	// Raw config lines.
@@ -434,6 +539,16 @@ func (r *InterfaceEthernetResource) buildInterfaceUpdateCommands(plan, state *In
 			innerCommands = append(innerCommands, "optical-monitor")
 		} else {
 			innerCommands = append(innerCommands, "no optical-monitor")
+		}
+	}
+
+	// Admin state. Both sides known and different; an unknown plan value was
+	// already replaced by state in Update.
+	if boolKnown(plan.Enabled) && boolKnown(state.Enabled) && plan.Enabled.ValueBool() != state.Enabled.ValueBool() {
+		if plan.Enabled.ValueBool() {
+			innerCommands = append(innerCommands, "enable")
+		} else {
+			innerCommands = append(innerCommands, "disable")
 		}
 	}
 

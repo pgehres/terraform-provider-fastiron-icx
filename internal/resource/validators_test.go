@@ -57,6 +57,36 @@ func TestValidatorRegexes(t *testing.T) {
 			bad:  []string{"", "local\nno username admin", `local"`, "local\r"},
 		},
 		{
+			name: "reNTPServer",
+			re:   reNTPServer,
+			ok:   []string{"216.239.35.0", "pool.ntp.org", "time-a.example"},
+			bad:  []string{"", "-bad", "10.0.0.1 key 1", "10.0.0.1\nexit", "host?", `"x"`, "a b"},
+		},
+		{
+			name: "reTimezone",
+			re:   reTimezone,
+			ok:   []string{"us pacific", "us Pacific", "US east-indiana", "gmt gmt+05:30", "europe cet", "australia wst"},
+			bad:  []string{"", "pacific", "us", "asia tokyo", "us pacific\nexit", "us pacific extra", "us pa?cific"},
+		},
+		{
+			name: "reCommunityString",
+			re:   reCommunityString,
+			ok:   []string{"public", "r3ad-0nly_!@#$%", "a.b~c|d<e>f"},
+			bad:  []string{"", "has space", `has"quote`, "has'quote", `back\slash`, "help?", "nl\nro", "tab\tx", "é"},
+		},
+		{
+			name: "reSNMPACL",
+			re:   reSNMPACL,
+			ok:   []string{"25", "mgmt_hosts", "acl.v2-ro"},
+			bad:  []string{"", "25 30", "acl\nexit", "acl?", "acl;x"},
+		},
+		{
+			name: "reSNMPText",
+			re:   reSNMPText,
+			ok:   []string{"Network Operations <noc@example.com>", "Rack 12, Row 3", "United States"},
+			bad:  []string{"", "line1\nline2", "cr\rx", `say "hi"`, "where?", "bell\x07", "del\x7f"},
+		},
+		{
 			name: "reUsernameValid",
 			re:   reUsernameValid,
 			ok:   []string{"admin", "svc-terraform", "user_2"},

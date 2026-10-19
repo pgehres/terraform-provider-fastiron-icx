@@ -24,6 +24,7 @@ Every FastIron release ships as two binaries per platform: the **switch image** 
 |---|---|---|
 | VLANs, port membership, port names, PoE | ✓ | ✓ |
 | `icx_user`, `icx_aaa`, users/SSH management | ✓ | ✓ |
+| `icx_ntp`, `icx_snmp`, `icx_logging`, port `enabled` | ✓ | ✓ |
 | Management IP | One global `ip address` + `ip default-gateway` — [`icx_management_ip`](resources/management_ip.md) | VE interfaces + `ip route` — [`icx_interface_ve`](resources/interface_ve.md) |
 | `icx_management_ip` | ✓ | ✗ (no global `ip address`) |
 | `icx_interface_ve` / `router_interface` on `icx_vlan` | ✗ (commands do not exist) | ✓ |
@@ -52,6 +53,11 @@ Beyond the router/switch image split, FastIron's CLI differs between firmware tr
 | `global_stp` on `icx_system` | ✓ | ✗ | ✓ | ✗ |
 | `icx_management_ip` (global `ip address` / `ip default-gateway` / `ip dns server-address`) | ✗ | ✓ | ✗ | ✓ |
 | `hostname` on `icx_system` | ✓ | ✓ | ✓ | ✓ |
+| `enabled` on `icx_interface_ethernet` (`disable`/`enable`) | ✓ | ✓ | ✓ | ✓ |
+| `icx_ntp` (`ntp` block, `clock summer-time`) | ✓ | ✓ | ✓ | ✓ |
+| `timezone` regions `gmt` / `us` on `icx_ntp` | ✓ | ✓ | ✓ | ✓ |
+| `timezone` regions `europe` / `australia` on `icx_ntp` | ✓ | ✓ | ✗ | ✗ |
+| `icx_snmp`, `icx_logging` | ✓ | ✓ | ✓ | ✓ |
 | `manager_registrar` / `manager_disable` / `manager_port_list` on `icx_system` | ✓ | ✓ | ✗ | ✗ |
 | `optical_monitor` / `optical_monitor_non_ruckus` on `icx_system` | ✓ | ✓ | ✓¹ | ✓¹ |
 | Trunk port with an untagged VLAN | VLAN-context `untagged ethe` | VLAN-context `untagged ethe` | `dual-mode <vlan>` on the interface | `dual-mode <vlan>` on the interface |
@@ -60,7 +66,7 @@ Beyond the router/switch image split, FastIron's CLI differs between firmware tr
 
 Reference devices: 08.0.9x router = ICX 7250-24 (`08.0.95mT213`), ICX 7150-24 and 7150-C12P (`08.0.95qT213`). 08.0.9x switch = ICX 7150-C10ZP (`08.0.95rT211`). 08.0.30 router = ICX 6450-C12PD (`08.0.30uT313`). 08.0.30 switch = ICX 6430-C12 (`08.0.30uT311`).
 
-- **Version boundaries.** The "08.0.30" columns apply to every release **before 08.0.80**. That is the release that deprecated `dual-mode`, and SmartZone documents it as the minimum release for the `manager` commands. 08.0.80 and later, 09.x included, use the 08.0.9x column. The DHCP-client spelling is the one difference that depends on both axes: the 08.0.30 router image already uses the 08.0.9x form. The bulk tagging command has its own boundary: the interface-level `vlan-config` commands were introduced in **08.0.50**, so 08.0.50 through 08.0.7x already use it while still using `dual-mode` for the untagged VLAN.
+- **Version boundaries.** The "08.0.30" columns apply to every release **before 08.0.80**. That is the release that deprecated `dual-mode`, and SmartZone documents it as the minimum release for the `manager` commands. 08.0.80 and later, 09.x included, use the 08.0.9x column. The one earlier boundary is 08.0.50, which added the `europe` and `australia` regions to `clock timezone` and introduced the interface-level `vlan-config` commands — so 08.0.50 through 08.0.7x already bulk-tag `tag_all_vlans` while still using `dual-mode` for the untagged VLAN. The DHCP-client spelling is the one difference that depends on both axes: the 08.0.30 router image already uses the 08.0.9x form.
 - **Unknown never blocks.** If the version string cannot be parsed, every version-dependent feature is allowed and the 08.0.9x syntax is used. If the image cannot be detected, every image-dependent feature is allowed. A wrong guess then surfaces as the switch's own CLI error, never as a provider refusal. Existing `dual-mode` lines in the running config also count as proof of the 08.0.30 trunk syntax.
 - **Hardware is out of scope.** PoE (`icx_poe`, `inline power`), optic support, and port layout depend on the chassis and modules. The firmware dialect does not determine them, so they are not capabilities and remain apply-time concerns for the switch.
 - ² `vlan-config add all-tagged` is a one-shot bulk command whose effect is ordinary per-VLAN tagged membership — it does not subscribe the port to VLANs created later. The provider re-reads the config afterwards and removes any tag on VLAN 1 or the untagged VLAN, so the result is identical to the per-VLAN expansion; see [the resource's bulk tagging section](resources/interface_ethernet.md#bulk-tagging-on-fastiron-08050-and-later). Not yet exercised on a live device.
@@ -68,7 +74,7 @@ Reference devices: 08.0.9x router = ICX 7250-24 (`08.0.95mT213`), ICX 7150-24 an
 
 -> **Migration note:** on FastIron 08.0.30 switch-image devices (ICX 6430) the DHCP client is reported correctly as disabled starting with this version. Set `dhcp_client_disable = true` to match before applying; see the [migration warning above](#router-image-vs-switch-image) for why. 08.0.9x and 08.0.30 router-image devices need no change.
 
-Universal settings — `hostname` on `icx_system`, and the switch-image management addressing where it applies — are available on every supported dialect; both are unit-tested against all six captures but have not yet been applied to any live device, on any firmware.
+Universal settings — `hostname` on `icx_system`, the switch-image management addressing where it applies, port admin state (`enabled` on `icx_interface_ethernet`) and the [`icx_ntp`](resources/ntp.md), [`icx_snmp`](resources/snmp.md) and [`icx_logging`](resources/logging.md) singletons — are available on every supported dialect; all are unit-tested against the six captures (the 6430 capture is the reference for the `ntp`/`clock` syntax) but have not yet been applied to any live device, on any firmware.
 
 A capability error names the attribute and the reason. For example, `manager_registrar = true` against an ICX 6430 fails `terraform plan` with: **Not supported by this firmware**: "The manager_registrar attribute of icx_system is not available on FastIron 08.0.30 (firmware 08.0.30uT311); the manager commands require FastIron 08.0.80 or later." Router-image features keep the **Router image required** error described above.
 

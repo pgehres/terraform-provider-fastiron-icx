@@ -88,42 +88,42 @@ func TestDetectHas(t *testing.T) {
 	}{
 		{"7250-24 router 08.0.95", "08.0.95mT213", parser.ImageTypeRouter, true, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: true,
+			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapClockTimezoneRegions: true, CapVlanConfigAllTagged: true,
 		}},
 		{"7150-24/C12P router 08.0.95", "08.0.95qT213", parser.ImageTypeRouter, true, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: true,
+			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapClockTimezoneRegions: true, CapVlanConfigAllTagged: true,
 		}},
 		{"C10ZP switch 08.0.95", "08.0.95rT211", parser.ImageTypeSwitch, true, caps{
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: true,
-			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: true,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapClockTimezoneRegions: true, CapVlanConfigAllTagged: true,
 		}},
 		{"6430 switch 08.0.30", "08.0.30uT311", parser.ImageTypeSwitch, true, caps{
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: false,
-			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: true, CapVlanConfigAllTagged: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: true, CapClockTimezoneRegions: false, CapVlanConfigAllTagged: false,
 		}},
 		{"6450 router 08.0.30", "08.0.30uT313", parser.ImageTypeRouter, true, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: false,
-			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: false,
+			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: false, CapClockTimezoneRegions: false, CapVlanConfigAllTagged: false,
 		}},
 		{"unparseable version, unknown image", "garbage", parser.ImageTypeUnknown, false, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapClockTimezoneRegions: true, CapVlanConfigAllTagged: false,
 		}},
 		{"empty version, empty image", "", "", false, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapClockTimezoneRegions: true, CapVlanConfigAllTagged: false,
 		}},
 		// The two axes are independent: a structurally detected switch image
 		// still blocks router-only features when the version is unparseable.
 		{"unparseable version, switch image", "", parser.ImageTypeSwitch, false, caps{
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: true,
-			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapClockTimezoneRegions: true, CapVlanConfigAllTagged: false,
 		}},
 		// And an old version with an undetected image does not guess the
 		// image-dependent DHCP spelling.
 		{"08.0.30 unknown image", "08.0.30uT31x", parser.ImageTypeUnknown, true, caps{
-			CapVEInterfaces: true, CapGlobalManagementIP: true, CapManager: false, CapDualMode: true, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: false,
+			CapVEInterfaces: true, CapGlobalManagementIP: true, CapManager: false, CapDualMode: true, CapLegacyDHCPClient: false, CapClockTimezoneRegions: false, CapVlanConfigAllTagged: false,
 		}},
 		// The bulk tagging command arrived in 08.0.50 and does not depend on
 		// the image.
@@ -221,6 +221,25 @@ func TestWhy(t *testing.T) {
 	}
 	if !strings.Contains(Docs(CapManager), "#firmware-dialects-and-capabilities") {
 		t.Errorf("Docs(Manager) = %q", Docs(CapManager))
+	}
+}
+
+// The europe/australia time-zone regions arrived in 08.0.50: the boundary is
+// inclusive, and an unknown version never blocks.
+func TestClockTimezoneRegionsBoundary(t *testing.T) {
+	for _, tt := range []struct {
+		ver  string
+		want bool
+	}{
+		{"08.0.30uT311", false}, {"08.0.40aT211", false}, {"08.0.50T211", true},
+		{"08.0.61T213", true}, {"08.0.95mT213", true}, {"09.0.10aT213", true}, {"", true},
+	} {
+		if got := Detect(tt.ver, parser.ImageTypeUnknown).Has(CapClockTimezoneRegions); got != tt.want {
+			t.Errorf("Has(CapClockTimezoneRegions) for %q = %v, want %v", tt.ver, got, tt.want)
+		}
+	}
+	if got := Detect("08.0.30uT311", parser.ImageTypeSwitch).Why(CapClockTimezoneRegions); !strings.Contains(got, "08.0.50") {
+		t.Errorf("Why = %q, want mention of 08.0.50", got)
 	}
 }
 

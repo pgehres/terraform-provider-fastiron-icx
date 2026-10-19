@@ -31,6 +31,12 @@ const (
 	// platform reports DOM data is a hardware question left to the switch.
 	CapOpticalMonitor Capability = "optical_monitor"
 
+	// CapClockTimezoneRegions: the `europe` and `australia` region keywords of
+	// `clock timezone` (icx_ntp's timezone attribute). FastIron 08.0.50 added
+	// them; earlier releases (08.0.30 on the ICX 6430/6450) accept only the
+	// `gmt` and `us` regions. The command itself exists everywhere.
+	CapClockTimezoneRegions Capability = "clock_timezone_regions"
+
 	// CapDualMode is a syntax form, not a feature: trunk ports that also carry
 	// an untagged VLAN are expressed with `dual-mode <vlan>` under the
 	// interface (FastIron 08.0.30 through 08.0.7x) instead of a VLAN-context
@@ -56,11 +62,12 @@ const (
 )
 
 var (
+	// v08050 added the europe/australia regions to `clock timezone` and
+	// introduced the interface-context `vlan-config` commands.
+	v08050 = Version{Major: 8, Minor: 0, Patch: 50}
 	// v08080 is the first release with the 08.0.9x-style VLAN/L2 dialect
 	// (dual-mode deprecated) and the minimum SmartZone-manageable release.
 	v08080 = Version{Major: 8, Minor: 0, Patch: 80}
-	// v08050 introduced the interface-context `vlan-config` commands.
-	v08050 = Version{Major: 8, Minor: 0, Patch: 50}
 )
 
 // kind distinguishes feature capabilities (permissive when unknown) from
@@ -140,6 +147,17 @@ var table = map[Capability]rule{
 		kind: feature,
 		has:  func(Dialect) bool { return true },
 	},
+	CapClockTimezoneRegions: {
+		kind:  feature,
+		has:   func(d Dialect) bool { return !d.before(v08050) },
+		title: "Not supported by this firmware",
+		why: func(d Dialect) string {
+			return fmt.Sprintf("is not available on FastIron %s (firmware %s); the europe and australia "+
+				"time-zone regions require FastIron 08.0.50 or later, and earlier releases accept only "+
+				"the gmt and us regions", d.Version.Family(), d.Firmware())
+		},
+		docs: docsDialects,
+	},
 	CapDualMode: {
 		kind: form,
 		has:  func(d Dialect) bool { return d.dualModeSeen || d.before(v08080) },
@@ -158,7 +176,8 @@ var table = map[Capability]rule{
 func Capabilities() []Capability {
 	return []Capability{
 		CapVEInterfaces, CapRouterInterface, CapGlobalSTP, CapGlobalManagementIP,
-		CapManager, CapOpticalMonitor, CapDualMode, CapLegacyDHCPClient, CapVlanConfigAllTagged,
+		CapManager, CapOpticalMonitor, CapClockTimezoneRegions, CapDualMode, CapLegacyDHCPClient,
+		CapVlanConfigAllTagged,
 	}
 }
 

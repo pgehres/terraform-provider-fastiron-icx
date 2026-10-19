@@ -29,3 +29,11 @@ resource "icx_interface_ethernet" "custom_port" {
     "rate-limit input fixed 100000",
   ]
 }
+
+# Administratively disabled spare port. Omitting `enabled` keeps whatever the
+# switch has; disabling the switch's own uplink is refused at plan time.
+resource "icx_interface_ethernet" "spare" {
+  port      = "1/1/12"
+  port_name = "spare"
+  enabled   = false
+}

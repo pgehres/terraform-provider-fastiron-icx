@@ -13,6 +13,10 @@ type RunningConfig struct {
 	AAA                AAAConfig
 	Global             GlobalSettings
 	StackUnits         []StackUnit
+	NTP                NTPConfig
+	Clock              ClockConfig
+	SNMP               SNMPConfig
+	Logging            LoggingConfig
 	RawLines           []string // Unparsed global lines
 }
 
@@ -126,6 +130,14 @@ func (c *RunningConfig) parseStanza(lines []string) error {
 			strings.Fields(strings.TrimPrefix(first, "ip dns server-address "))...)
 	case strings.HasPrefix(first, "hostname "):
 		c.Global.Hostname = strings.TrimSpace(strings.TrimPrefix(first, "hostname "))
+	case first == "ntp":
+		c.parseNTPStanza(lines)
+	case strings.HasPrefix(first, "clock "):
+		c.parseClockLine(first)
+	case strings.HasPrefix(first, "snmp-server "):
+		c.parseSNMPLine(first)
+	case strings.HasPrefix(first, "logging "), strings.HasPrefix(first, "no logging "):
+		c.parseLoggingLine(first)
 	default:
 		c.RawLines = append(c.RawLines, first)
 	}
