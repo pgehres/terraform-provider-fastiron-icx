@@ -18,8 +18,13 @@ install: build
 test:
 	go test ./... -v
 
+# Acceptance tests against a live lab switch (internal/acctest). Needs the
+# FASTIRON_* connection variables plus TF_ACC_SCRATCH_PORT; see the
+# "Acceptance tests" section of README.md for the full environment, the
+# pre-flight checklist and what the tests touch. -count=1 so a live run is
+# never served from the test cache. Narrow with TESTARGS='-run TestAccVLAN'.
 testacc:
-	TF_ACC=1 go test ./... -v -timeout 120m
+	TF_ACC=1 go test ./internal/acctest/... -v -count=1 -timeout 120m $(TESTARGS)
 
 lint:
 	golangci-lint run ./...
