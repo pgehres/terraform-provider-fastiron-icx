@@ -155,6 +155,10 @@ func (d Dialect) Firmware() string {
 // running the switch image.
 func (d Dialect) switchImage() bool { return d.Image == parser.ImageTypeSwitch }
 
+// routerImage is true only when the device is positively identified as
+// running the router image.
+func (d Dialect) routerImage() bool { return d.Image == parser.ImageTypeRouter }
+
 // before reports whether the device is positively known to run a release
 // earlier than v. Unknown versions are never "before" anything.
 func (d Dialect) before(v Version) bool { return d.Known && d.Version.Less(v) }

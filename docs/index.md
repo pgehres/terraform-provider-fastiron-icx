@@ -24,14 +24,15 @@ Every FastIron release ships as two binaries per platform: the **switch image** 
 |---|---|---|
 | VLANs, port membership, port names, PoE | ✓ | ✓ |
 | `icx_user`, `icx_aaa`, users/SSH management | ✓ | ✓ |
-| Management IP | One global `ip address` + `ip default-gateway` | VE interfaces + `ip route` |
+| Management IP | One global `ip address` + `ip default-gateway` — [`icx_management_ip`](resources/management_ip.md) | VE interfaces + `ip route` — [`icx_interface_ve`](resources/interface_ve.md) |
+| `icx_management_ip` | ✓ | ✗ (no global `ip address`) |
 | `icx_interface_ve` / `router_interface` on `icx_vlan` | ✗ (commands do not exist) | ✓ |
 | `global_stp` on `icx_system` | ✗ | ✓ |
 | Inter-VLAN routing, static routes | ✗ | ✓ |
 
 Identify the image from `show version` or the `ver` line at the top of the running config (e.g. `08.0.95rT211` = switch image, `08.0.95mT213` = router image).
 
--> **The provider detects the image type.** At connect time the provider reads the running config once and derives the image type, first from the version string's trailing T-code (`…T211` = switch image, `…T213` = router image) and, when that code is unrecognized, from structural signals (VE interfaces, `ip route`, a VLAN `router-interface`, or `global-stp` mean router image; a global `ip address`/`ip default-gateway` means switch image). Declaring a router-image-only resource or attribute against a detected switch-image device is then rejected at **plan time** with a clear **Router image required** error, so `terraform plan` fails before any resource in the run is applied — instead of a mid-apply `Invalid input` CLI error after other changes have already landed. (The same check is repeated at apply time, before any commands are sent, for values that are only known during apply.) Devices whose image cannot be determined are never blocked; misconfigurations there degrade to the switch's own apply-time CLI error. The detected type is exposed as `image_type` (alongside `firmware_version`) on the [`icx_stack_unit`](data-sources/stack_unit.md) data source.
+-> **The provider detects the image type.** At connect time the provider reads the running config once and derives the image type, first from the version string's trailing T-code (`…T211` = switch image, `…T213` = router image) and, when that code is unrecognized, from structural signals (VE interfaces, `ip route`, a VLAN `router-interface`, or `global-stp` mean router image; a global `ip address`/`ip default-gateway` means switch image). Declaring a router-image-only resource or attribute against a detected switch-image device is then rejected at **plan time** with a clear **Router image required** error (and `icx_management_ip` against a detected router image with **Switch image required**), so `terraform plan` fails before any resource in the run is applied — instead of a mid-apply `Invalid input` CLI error after other changes have already landed. (The same check is repeated at apply time, before any commands are sent, for values that are only known during apply.) Devices whose image cannot be determined are never blocked; misconfigurations there degrade to the switch's own apply-time CLI error. The detected type is exposed as `image_type` (alongside `firmware_version`) on the [`icx_stack_unit`](data-sources/stack_unit.md) data source.
 
 -> **Reimaging changes your Terraform config.** Moving a switch between images requires flashing the other binary and rebooting, and the management addressing does not translate: a switch-image device's global `ip address` must be rebuilt as an `icx_vlan` `router_interface` + `icx_interface_ve` (or vice versa). Plan this as a deliberate config migration: the provider does not rewrite your configuration. After a router→switch reimage, stale router-image state is cleared without errors — `icx_interface_ve` resources drop out of state on refresh (or destroy cleanly), and removing `router_interface`/`global_stp = true` from config applies without sending the non-existent `no` commands — but declaring the switch-image equivalents is up to you.
 
@@ -49,6 +50,8 @@ Beyond the router/switch image split, FastIron's CLI differs between firmware tr
 | `icx_interface_ve` | ✓ | ✗ | ✓ | ✗ |
 | `router_interface` on `icx_vlan` | ✓ | ✗ | ✓ | ✗ |
 | `global_stp` on `icx_system` | ✓ | ✗ | ✓ | ✗ |
+| `icx_management_ip` (global `ip address` / `ip default-gateway` / `ip dns server-address`) | ✗ | ✓ | ✗ | ✓ |
+| `hostname` on `icx_system` | ✓ | ✓ | ✓ | ✓ |
 | `manager_registrar` / `manager_disable` / `manager_port_list` on `icx_system` | ✓ | ✓ | ✗ | ✗ |
 | `optical_monitor` / `optical_monitor_non_ruckus` on `icx_system` | ✓ | ✓ | ✓¹ | ✓¹ |
 | Trunk port with an untagged VLAN | VLAN-context `untagged ethe` | VLAN-context `untagged ethe` | `dual-mode <vlan>` on the interface | `dual-mode <vlan>` on the interface |
@@ -62,6 +65,8 @@ Reference devices: 08.0.9x router = ICX 7250-24 (`08.0.95mT213`), ICX 7150-24 an
 - ¹ `optical-monitor` exists on every known firmware train. Whether a particular platform or optic reports DOM data is a hardware question, so the provider does not gate it. The per-interface `optical_monitor` on `icx_interface_ethernet` is not routed through the capability table at all.
 
 -> **Migration note:** on FastIron 08.0.30 switch-image devices (ICX 6430) the DHCP client is reported correctly as disabled starting with this version. Set `dhcp_client_disable = true` to match before applying; see the [migration warning above](#router-image-vs-switch-image) for why. 08.0.9x and 08.0.30 router-image devices need no change.
+
+Universal settings — `hostname` on `icx_system`, and the switch-image management addressing where it applies — are available on every supported dialect; both are unit-tested against all six captures but have not yet been applied to a live 08.0.30 device.
 
 A capability error names the attribute and the reason. For example, `manager_registrar = true` against an ICX 6430 fails `terraform plan` with: **Not supported by this firmware**: "The manager_registrar attribute of icx_system is not available on FastIron 08.0.30 (firmware 08.0.30uT311); the manager commands require FastIron 08.0.80 or later." Router-image features keep the **Router image required** error described above.
 

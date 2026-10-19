@@ -219,6 +219,7 @@ func (p *FastIronICXProvider) Resources(_ context.Context) []func() resource.Res
 		icxresource.NewVLANResource,
 		icxresource.NewInterfaceEthernetResource,
 		icxresource.NewInterfaceVEResource,
+		icxresource.NewManagementIPResource,
 		icxresource.NewUserResource,
 		icxresource.NewAAAResource,
 		icxresource.NewSystemResource,

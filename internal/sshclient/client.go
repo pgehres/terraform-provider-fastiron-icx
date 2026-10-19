@@ -26,6 +26,24 @@ type byteResult struct {
 // passes before a byte arrives from the switch.
 var errDeadlineExceeded = errors.New("deadline exceeded")
 
+// ErrSessionSevered is returned (wrapped) once the shell stopped answering
+// after a command that was expected to cut the connection — a management IP
+// change sent over the very address the provider is connected to. Every later
+// command on the client fails immediately with it instead of waiting out the
+// read timeout, so an apply that continues past the change fails fast with a
+// clear cause.
+var ErrSessionSevered = errors.New("SSH session severed by a management address change; " +
+	"update the provider's host and run terraform again")
+
+// anyPrompt matches a FastIron prompt of any hostname and mode:
+// "SSH@ICX7250-24 Router#", "SSH@lab-sw.site Router(config)#", "ICX7150>" ...
+// The base portion (hostname plus optional "Router"/"Switch" word) is captured
+// so an exact prompt regex can be built from it. It is anchored to the start
+// of the line: the match is attempted byte by byte, and an unanchored pattern
+// would accept the moment FastIron's "Invalid input -> ..." error line ends in
+// ">" and adopt "-" as the prompt.
+var anyPrompt = regexp.MustCompile(`^\s*([\w@.\-]+(?:\s+\w+)?)\s*(?:\([^\)]*\))?[#>]\s*$`)
+
 // Client manages an interactive SSH shell session to an ICX switch.
 type Client struct {
 	mu           sync.Mutex
@@ -36,6 +54,7 @@ type Client struct {
 	promptRegex  *regexp.Regexp
 	promptString string // The exact detected prompt (e.g., "ICX7250-24 Router#")
 	inConfigMode bool
+	disconnected bool // set once a session-severing command went through; see ErrSessionSevered
 	options      Options
 }
 
@@ -388,6 +407,110 @@ func (c *Client) ExecuteInConfigMode(commands []string) error {
 	return nil
 }
 
+// ExecutePromptChanging runs one config-mode command whose success changes
+// the CLI prompt — today only `hostname <name>`, since the prompt is
+// "SSH@<hostname> Router#". The ordinary execute path waits for the prompt
+// detected at connect time, which such a command makes obsolete, so it would
+// wait out the full timeout and fail; and every command after it (including
+// the `write memory` that saves the change) would fail the same way. This
+// path instead sends the command and re-detects the prompt from whatever the
+// switch prints next, then checks that output for a CLI error exactly like
+// ExecuteInConfigMode does. If the command was rejected the prompt is simply
+// re-detected unchanged.
+func (c *Client) ExecutePromptChanging(command string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.inConfigMode {
+		if _, err := c.execute("configure terminal"); err != nil {
+			return fmt.Errorf("enter config mode: %w", err)
+		}
+		c.inConfigMode = true
+	}
+
+	if err := c.checkControlCharacters(command); err != nil {
+		return err
+	}
+	if c.disconnected {
+		return ErrSessionSevered
+	}
+	if _, err := fmt.Fprintf(c.stdin, "%s\n", command); err != nil {
+		return fmt.Errorf("write command: %w", err)
+	}
+	output, err := c.readNewPrompt()
+	if err != nil {
+		return fmt.Errorf("command %q: re-detect prompt: %w", command, err)
+	}
+	output = stripEchoedCommand(sanitizeOutput(output), command)
+	if errMsg := detectCLIError(output); errMsg != "" {
+		return fmt.Errorf("command %q: %s", command, strings.TrimSpace(errMsg))
+	}
+	return nil
+}
+
+// ExecuteExpectingDisconnect runs config-mode commands that are expected to
+// cut this SSH session — changing the global management `ip address` the
+// provider is connected through — and saves the configuration in the same
+// breath. The commands, `end` and `write memory` are written to the shell in
+// ONE write, without waiting for a prompt in between, so the switch has
+// received the whole batch before it executes the first line; if the address
+// change kills the connection, the `write memory` already sitting in its input
+// buffer still has a chance to run. (Executing them one prompt at a time would
+// guarantee the save is never sent.)
+//
+// Each command's output is then read in turn. A CLI error in any of them is
+// returned as usual while the session is still alive. If the shell stops
+// answering — timeout, EOF or transport error — the client is marked
+// disconnected and ErrSessionSevered is returned (wrapped); from then on every
+// method fails immediately with it. The caller cannot know whether the save
+// ran in that case and must say so.
+func (c *Client) ExecuteExpectingDisconnect(commands []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(commands) == 0 {
+		return nil
+	}
+	for _, cmd := range commands {
+		if err := c.checkControlCharacters(cmd); err != nil {
+			return err
+		}
+	}
+	if !c.inConfigMode {
+		if _, err := c.execute("configure terminal"); err != nil {
+			return fmt.Errorf("enter config mode: %w", err)
+		}
+		c.inConfigMode = true
+	}
+	if c.disconnected {
+		return ErrSessionSevered
+	}
+
+	batch := append(append([]string{}, commands...), "end", "write memory")
+	if _, err := io.WriteString(c.stdin, strings.Join(batch, "\n")+"\n"); err != nil {
+		return fmt.Errorf("write command batch: %w", err)
+	}
+	// Every line of the batch produces a prompt, so every one must be read
+	// even after a CLI error — returning early would leave the output of the
+	// remaining lines in the pipe to be mistaken for the next command's.
+	var cliErr error
+	for _, cmd := range batch {
+		output, err := c.readUntilPrompt()
+		if err != nil {
+			c.disconnected = true
+			return fmt.Errorf("after %q: %w (%v)", cmd, ErrSessionSevered, err)
+		}
+		output = stripEchoedCommand(sanitizeOutput(output), cmd)
+		if errMsg := detectCLIError(output); errMsg != "" && cliErr == nil {
+			cliErr = fmt.Errorf("command %q: %s", cmd, strings.TrimSpace(errMsg))
+		}
+	}
+	// The batch ended with `end`, so the shell is back in privileged EXEC mode
+	// whether or not a command was rejected.
+	c.inConfigMode = false
+	return cliErr
+}
+
 // WriteMemory saves the running configuration to startup configuration.
 func (c *Client) WriteMemory() error {
 	c.mu.Lock()
@@ -459,15 +582,25 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// execute sends a command and reads output until the prompt. Must be called with mu held.
-func (c *Client) execute(command string) (string, error) {
-	// Reject commands containing control characters (including DEL) —
-	// defense-in-depth against CLI injection via embedded newlines, carriage
-	// returns, or other controls.
+// checkControlCharacters rejects commands containing control characters
+// (including DEL) — defense-in-depth against CLI injection via embedded
+// newlines, carriage returns, or other controls.
+func (c *Client) checkControlCharacters(command string) error {
 	for _, b := range []byte(command) {
 		if b < 0x20 || b == 0x7f {
-			return "", fmt.Errorf("command contains control characters and was not sent")
+			return fmt.Errorf("command contains control characters and was not sent")
 		}
+	}
+	return nil
+}
+
+// execute sends a command and reads output until the prompt. Must be called with mu held.
+func (c *Client) execute(command string) (string, error) {
+	if err := c.checkControlCharacters(command); err != nil {
+		return "", err
+	}
+	if c.disconnected {
+		return "", ErrSessionSevered
 	}
 
 	// Send the command.
@@ -608,21 +741,27 @@ func (c *Client) detectPrompt() error {
 	if _, err := fmt.Fprintf(c.stdin, "\n"); err != nil {
 		return fmt.Errorf("send newline: %w", err)
 	}
+	_, err := c.readNewPrompt()
+	return err
+}
 
+// readNewPrompt reads until the current line looks like a FastIron prompt of
+// ANY hostname (anyPrompt), then installs that prompt as the one every later
+// readUntilPrompt waits for. It returns everything read, prompt line included,
+// so callers can inspect the output that preceded the prompt. Nothing is sent:
+// the caller has already written whatever will make the switch print a prompt.
+func (c *Client) readNewPrompt() (string, error) {
 	var buf strings.Builder
 	deadline := time.Now().Add(time.Duration(c.options.TimeoutSeconds) * time.Second)
-	// Match prompts ending in # or > with optional (config...) before the # or >.
-	// The base portion can include @, letters, digits, hyphens, spaces.
-	anyPrompt := regexp.MustCompile(`([\w@\-]+(?:\s+\w+)?)\s*(?:\([^\)]*\))?[#>]\s*$`)
 
 	for {
 		b, err := c.readByteWithDeadline(deadline)
 		if err != nil {
 			bufStr := buf.String()
 			if errors.Is(err, errDeadlineExceeded) {
-				return fmt.Errorf("timeout detecting prompt (buffer: %q)", bufStr)
+				return bufStr, fmt.Errorf("timeout detecting prompt (buffer: %q)", bufStr)
 			}
-			return fmt.Errorf("read: %w", err)
+			return bufStr, fmt.Errorf("read: %w", err)
 		}
 
 		buf.WriteByte(b)
@@ -637,7 +776,7 @@ func (c *Client) detectPrompt() error {
 			// Build a regex that matches this exact base with any mode suffix.
 			escaped := regexp.QuoteMeta(m[1])
 			c.promptRegex = regexp.MustCompile(escaped + `\s*(?:\([^\)]*\))?[#>]\s*$`)
-			return nil
+			return content, nil
 		}
 	}
 }

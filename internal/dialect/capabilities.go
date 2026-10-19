@@ -13,6 +13,12 @@ const (
 	// CapGlobalSTP: the global `global-stp` command. Router image only — the
 	// switch image runs STP per VLAN and has no such command.
 	CapGlobalSTP Capability = "global_stp"
+	// CapGlobalManagementIP: the switch image's single global `ip address`,
+	// `ip default-gateway` and `ip dns server-address` management addressing
+	// (icx_management_ip). Switch image only — the router image addresses
+	// management on a VE interface (CapVEInterfaces) and has no global
+	// `ip address`.
+	CapGlobalManagementIP Capability = "global_management_ip"
 	// CapManager: the SmartZone/Unleashed `manager ...` commands
 	// (registrar, disable, port-list). Absent on FastIron 08.0.30 (ICX
 	// 6430/6450); SmartZone documents 08.0.80 as the minimum release for ICX
@@ -88,12 +94,26 @@ var routerImageRule = rule{
 	docs: docsRouterImage,
 }
 
+var switchImageRule = rule{
+	kind:  feature,
+	has:   func(d Dialect) bool { return !d.routerImage() },
+	title: "Switch image required",
+	why: func(d Dialect) string {
+		return fmt.Sprintf("is only available on the FastIron switch image, which addresses the device "+
+			"with one global `ip address`; this device runs the router image (firmware %s), where the "+
+			"management address lives on a VE interface — use icx_interface_ve (with router_interface "+
+			"on icx_vlan) instead", d.Firmware())
+	},
+	docs: docsRouterImage,
+}
+
 // table is the capability matrix. To support a new model or firmware, add or
 // adjust rows here — never add version/image checks in resources.
 var table = map[Capability]rule{
-	CapVEInterfaces:    routerImageRule,
-	CapRouterInterface: routerImageRule,
-	CapGlobalSTP:       routerImageRule,
+	CapVEInterfaces:       routerImageRule,
+	CapRouterInterface:    routerImageRule,
+	CapGlobalSTP:          routerImageRule,
+	CapGlobalManagementIP: switchImageRule,
 	CapManager: {
 		kind:  feature,
 		has:   func(d Dialect) bool { return !d.before(v08080) },
@@ -121,8 +141,8 @@ var table = map[Capability]rule{
 // Capabilities lists every capability in display order.
 func Capabilities() []Capability {
 	return []Capability{
-		CapVEInterfaces, CapRouterInterface, CapGlobalSTP, CapManager,
-		CapOpticalMonitor, CapDualMode, CapLegacyDHCPClient,
+		CapVEInterfaces, CapRouterInterface, CapGlobalSTP, CapGlobalManagementIP,
+		CapManager, CapOpticalMonitor, CapDualMode, CapLegacyDHCPClient,
 	}
 }
 
