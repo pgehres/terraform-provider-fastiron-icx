@@ -17,7 +17,8 @@ import (
 // icx_system.hostname: the one attribute whose command changes the CLI prompt.
 // Every test here checks that `hostname` never travels through
 // ExecuteInConfigMode (which would hang the session) but through the
-// prompt re-detecting path, and always last, before `write memory`.
+// prompt re-detecting path, and always FIRST, so a failure aborts before any
+// other command is live (see SystemResource.applyCommands).
 
 func systemWithConfig(t *testing.T, fixture string) (*SystemResource, *sshclient.MockClient) {
 	t.Helper()
@@ -34,9 +35,10 @@ func withHostname(m *SystemResourceModel, h types.String) *SystemResourceModel {
 	return m
 }
 
-// Create with a hostname and another setting: the other setting goes through
-// the normal path, the hostname through the prompt-changing one, then save.
-func TestSystemCreate_HostnameLastViaPromptChangingPath(t *testing.T) {
+// Create with a hostname and another setting: the hostname first through the
+// prompt-changing path, then the other setting through the normal one, then
+// save.
+func TestSystemCreate_HostnameFirstViaPromptChangingPath(t *testing.T) {
 	r, mock := systemWithConfig(t, "")
 	plan := withHostname(systemModel(false, false), types.StringValue("lab-core"))
 	state, p := systemStateAndPlan(t, r, systemModel(false, true), plan)
@@ -46,7 +48,7 @@ func TestSystemCreate_HostnameLastViaPromptChangingPath(t *testing.T) {
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("create: %v", resp.Diagnostics)
 	}
-	assertCommands(t, "create", mock.Commands, []string{"no telnet server", "hostname lab-core", "write memory"})
+	assertCommands(t, "create", mock.Commands, []string{"hostname lab-core", "no telnet server", "write memory"})
 	if mock.PromptRedetects != 1 || len(mock.PromptChangingCommands) != 1 || mock.PromptChangingCommands[0] != "hostname lab-core" {
 		t.Errorf("hostname must go through ExecutePromptChanging exactly once, got redetects=%d cmds=%v",
 			mock.PromptRedetects, mock.PromptChangingCommands)
@@ -142,8 +144,8 @@ func TestSystemRead_Hostname(t *testing.T) {
 	}
 }
 
-// Update renaming the device: other changes first, hostname last via the
-// prompt-changing path, then save.
+// Update renaming the device: hostname first via the prompt-changing path,
+// other changes after it, then save.
 func TestSystemUpdate_HostnameChangeOrdering(t *testing.T) {
 	r, mock := systemWithConfig(t, "")
 	st := withHostname(systemModel(false, true), types.StringValue("old-name"))
@@ -155,7 +157,7 @@ func TestSystemUpdate_HostnameChangeOrdering(t *testing.T) {
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("update: %v", resp.Diagnostics)
 	}
-	assertCommands(t, "update", mock.Commands, []string{"no telnet server", "hostname new-name", "write memory"})
+	assertCommands(t, "update", mock.Commands, []string{"hostname new-name", "no telnet server", "write memory"})
 	if mock.PromptRedetects != 1 {
 		t.Errorf("expected one prompt re-detection, got %d", mock.PromptRedetects)
 	}
@@ -199,12 +201,92 @@ func TestSystemUpdate_HostnameUnknownKeepsState(t *testing.T) {
 	}
 }
 
-// The switch rejecting the hostname fails the apply before `write memory`.
-func TestSystemUpdate_HostnameCLIErrorStopsBeforeSave(t *testing.T) {
+// The switch rejecting the hostname fails the apply before any other command
+// is sent — so nothing is left live but unsaved — and before `write memory`.
+func TestSystemUpdate_HostnameCLIErrorStopsBeforeOtherCommands(t *testing.T) {
 	r, mock := systemWithConfig(t, "")
 	mock.ErrorOnCommand["hostname rejected"] = errors.New("Invalid input -> rejected")
 	st := withHostname(systemModel(false, true), types.StringValue("ok"))
-	pl := withHostname(systemModel(false, true), types.StringValue("rejected"))
+	pl := withHostname(systemModel(false, false), types.StringValue("rejected"))
+	state, plan := systemStateAndPlan(t, r, st, pl)
+
+	resp := resource.UpdateResponse{State: state}
+	r.Update(context.Background(), resource.UpdateRequest{Plan: plan, State: state}, &resp)
+	if !hasErrorTitled(resp.Diagnostics, "Failed to set hostname") {
+		t.Fatalf("expected the hostname error, got %v", resp.Diagnostics)
+	}
+	assertCommands(t, "update", mock.Commands, []string{"hostname rejected"})
+	if mock.WriteMemoryCalls != 0 {
+		t.Errorf("write memory must not run after a failed hostname change, got %v", mock.Commands)
+	}
+}
+
+// Same on create.
+func TestSystemCreate_HostnameCLIErrorStopsBeforeOtherCommands(t *testing.T) {
+	r, mock := systemWithConfig(t, "")
+	mock.ErrorOnCommand["hostname rejected"] = errors.New("Invalid input -> rejected")
+	plan := withHostname(systemModel(false, false), types.StringValue("rejected"))
+	state, p := systemStateAndPlan(t, r, systemModel(false, true), plan)
+
+	resp := resource.CreateResponse{State: state}
+	r.Create(context.Background(), resource.CreateRequest{Plan: p}, &resp)
+	if !hasErrorTitled(resp.Diagnostics, "Failed to set hostname") {
+		t.Fatalf("expected the hostname error, got %v", resp.Diagnostics)
+	}
+	assertCommands(t, "create", mock.Commands, []string{"hostname rejected"})
+}
+
+// The prompt not being recognised after `hostname` loses the session: the
+// error names the cause, nothing else is sent and no save is attempted.
+func TestSystemUpdate_HostnameSessionLost(t *testing.T) {
+	r, mock := systemWithConfig(t, "")
+	mock.LoseSessionOnPromptChange = true
+	st := withHostname(systemModel(false, true), types.StringValue("old-name"))
+	pl := withHostname(systemModel(false, false), types.StringValue("new-name"))
+	state, plan := systemStateAndPlan(t, r, st, pl)
+
+	resp := resource.UpdateResponse{State: state}
+	r.Update(context.Background(), resource.UpdateRequest{Plan: plan, State: state}, &resp)
+	if !hasErrorTitled(resp.Diagnostics, "Failed to set hostname") {
+		t.Fatalf("expected the hostname error, got %v", resp.Diagnostics)
+	}
+	found := false
+	for _, d := range resp.Diagnostics.Errors() {
+		found = found || strings.Contains(d.Detail(), "session lost after a hostname change")
+	}
+	if !found {
+		t.Errorf("error must explain the lost session, got %v", resp.Diagnostics)
+	}
+	assertCommands(t, "update", mock.Commands, []string{"hostname new-name"})
+	if mock.WriteMemoryCalls != 0 {
+		t.Errorf("no save may be attempted on a lost session, got %d", mock.WriteMemoryCalls)
+	}
+}
+
+// The hostname applied, then another system command was rejected: the
+// running configuration (hostname included) is saved before the error is
+// reported, so the applied hostname is not silently lost on the next reboot.
+func TestSystemUpdate_LaterFailureStillSavesAppliedHostname(t *testing.T) {
+	r, mock := systemWithConfig(t, "")
+	mock.ErrorOnCommand["no telnet server"] = errors.New("Invalid input -> telnet")
+	st := withHostname(systemModel(false, true), types.StringValue("old-name"))
+	pl := withHostname(systemModel(false, false), types.StringValue("new-name"))
+	state, plan := systemStateAndPlan(t, r, st, pl)
+
+	resp := resource.UpdateResponse{State: state}
+	r.Update(context.Background(), resource.UpdateRequest{Plan: plan, State: state}, &resp)
+	if !hasErrorTitled(resp.Diagnostics, "Failed to update system") {
+		t.Fatalf("expected the update error, got %v", resp.Diagnostics)
+	}
+	assertCommands(t, "update", mock.Commands, []string{"hostname new-name", "no telnet server", "write memory"})
+}
+
+// Without a hostname change a failing command keeps the old behaviour: no save.
+func TestSystemUpdate_FailureWithoutHostnameDoesNotSave(t *testing.T) {
+	r, mock := systemWithConfig(t, "")
+	mock.ErrorOnCommand["no telnet server"] = errors.New("Invalid input -> telnet")
+	st := withHostname(systemModel(false, true), types.StringValue("same"))
+	pl := withHostname(systemModel(false, false), types.StringValue("same"))
 	state, plan := systemStateAndPlan(t, r, st, pl)
 
 	resp := resource.UpdateResponse{State: state}
@@ -213,7 +295,7 @@ func TestSystemUpdate_HostnameCLIErrorStopsBeforeSave(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 	if mock.WriteMemoryCalls != 0 {
-		t.Errorf("write memory must not run after a failed hostname change, got %v", mock.Commands)
+		t.Errorf("no save expected, got %v", mock.Commands)
 	}
 }
 

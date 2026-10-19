@@ -250,22 +250,13 @@ func (r *SystemResource) Create(ctx context.Context, req resource.CreateRequest,
 		plan.Hostname = hostnameValue(config.Global.Hostname)
 	}
 
-	if len(commands) > 0 {
-		if err := r.client.ExecuteInConfigMode(commands); err != nil {
-			resp.Diagnostics.AddError("Failed to configure system", err.Error())
-			return
-		}
-	}
-	// The hostname goes last, through the prompt re-detecting path: once it is
-	// sent the CLI prompt changes, and nothing else would be readable until the
-	// client has learned the new one.
-	sent := len(commands) > 0
+	var hostname string
 	if setHostname {
-		if err := r.client.ExecutePromptChanging("hostname " + plan.Hostname.ValueString()); err != nil {
-			resp.Diagnostics.AddError("Failed to set hostname", err.Error())
-			return
-		}
-		sent = true
+		hostname = plan.Hostname.ValueString()
+	}
+	sent, ok := r.applyCommands(hostname, commands, "configure", &resp.Diagnostics)
+	if !ok {
+		return
 	}
 	if sent {
 		if err := r.client.WriteMemory(); err != nil {
@@ -276,6 +267,44 @@ func (r *SystemResource) Create(ctx context.Context, req resource.CreateRequest,
 
 	plan.ID = types.StringValue("system")
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// applyCommands sends a hostname change (when hostname is non-empty) and then
+// the other system commands, and reports whether anything was sent and
+// whether the caller may go on to save. The caller saves on success.
+//
+// The hostname goes FIRST, through the prompt re-detecting path. It is the
+// one command that can leave the session unusable (the prompt changes; if the
+// new one is not recognised the client marks the session lost), so sending it
+// first means a failure — CLI rejection or lost session — aborts before any
+// other command is live, and nothing is left applied-but-unsaved by this
+// resource. (Sent last, a rejected hostname would strand the commands before
+// it live but unsaved: a refresh would show them, the plan would be clean, and
+// a reboot would silently revert them.) Once the hostname has succeeded, a
+// later failure must not strand it either: the running configuration is saved
+// before the error is reported, so startup and running agree with what the
+// next refresh will read.
+func (r *SystemResource) applyCommands(hostname string, commands []string, op string, diags *diag.Diagnostics) (sent, ok bool) {
+	if hostname != "" {
+		if err := r.client.ExecutePromptChanging("hostname " + hostname); err != nil {
+			diags.AddError("Failed to set hostname", err.Error())
+			return false, false
+		}
+		sent = true
+	}
+	if len(commands) > 0 {
+		if err := r.client.ExecuteInConfigMode(commands); err != nil {
+			diags.AddError(fmt.Sprintf("Failed to %s system", op), err.Error())
+			if sent {
+				if werr := r.client.WriteMemory(); werr != nil {
+					diags.AddError("Failed to save the applied hostname", werr.Error())
+				}
+			}
+			return sent, false
+		}
+		sent = true
+	}
+	return sent, true
 }
 
 // hostnameValue maps the parser's hostname ("" = device default) to the
@@ -402,27 +431,20 @@ func (r *SystemResource) Update(ctx context.Context, req resource.UpdateRequest,
 		}
 	}
 
-	if len(commands) > 0 {
-		if err := r.client.ExecuteInConfigMode(commands); err != nil {
-			resp.Diagnostics.AddError("Failed to update system", err.Error())
-			return
-		}
-	}
-
 	// hostname: unknown means "not in config and nothing in state to keep"
 	// (the device runs its default name) — leave it alone. Null in plan cannot
-	// happen for an Optional+Computed attribute. A changed value goes last,
-	// through the prompt re-detecting path (see Create).
-	sent := len(commands) > 0
+	// happen for an Optional+Computed attribute. A changed value goes first,
+	// through the prompt re-detecting path (see applyCommands).
 	if plan.Hostname.IsUnknown() {
 		plan.Hostname = state.Hostname
 	}
+	var hostname string
 	if !plan.Hostname.IsNull() && !plan.Hostname.Equal(state.Hostname) {
-		if err := r.client.ExecutePromptChanging("hostname " + plan.Hostname.ValueString()); err != nil {
-			resp.Diagnostics.AddError("Failed to set hostname", err.Error())
-			return
-		}
-		sent = true
+		hostname = plan.Hostname.ValueString()
+	}
+	sent, ok := r.applyCommands(hostname, commands, "update", &resp.Diagnostics)
+	if !ok {
+		return
 	}
 	if sent {
 		if err := r.client.WriteMemory(); err != nil {
