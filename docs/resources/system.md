@@ -28,7 +28,7 @@ resource "icx_system" "this" {
 
 ### Optional
 
-- `global_stp` (Boolean) - Enable global 802.1w spanning tree. Defaults to `false`. Not supported on ICX 7150-C10ZP.
+- `global_stp` (Boolean) - Enable global 802.1w spanning tree. Defaults to `false`. Router image only — see the switch-image note above; on a switch-image device (any model) this command does not exist and setting `true` fails at apply time.
 - `telnet_server` (Boolean) - Enable the telnet server. Set to `false` to disable (sends `no telnet server`). Defaults to `true`.
 - `dhcp_client_disable` (Boolean) - Disable the DHCP client globally. Defaults to `false`.
 - `optical_monitor` (Boolean) - Enable optical monitoring globally. Defaults to `false`.

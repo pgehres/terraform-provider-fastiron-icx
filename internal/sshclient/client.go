@@ -63,6 +63,10 @@ func NewClient(opts Options) (*Client, error) {
 		Timeout:         time.Duration(opts.TimeoutSeconds) * time.Second,
 	}
 
+	if opts.LegacySSHAlgorithms {
+		config.KeyExchanges, config.Ciphers, config.HostKeyAlgorithms = legacyAlgorithms()
+	}
+
 	addr := fmt.Sprintf("%s:%d", opts.Host, opts.Port)
 	sshClient, err := ssh.Dial("tcp", addr, config)
 	if err != nil {
@@ -246,11 +250,51 @@ func buildHostKeyCallback(opts Options) (ssh.HostKeyCallback, error) {
 	}, nil
 }
 
+// legacyAlgorithms returns the key exchange, cipher, and host key algorithm
+// lists used when Options.LegacySSHAlgorithms is set: x/crypto's current
+// secure defaults extended with the SHA-1/CBC-era algorithms that old
+// FastIron SSH stacks require. The legacy entries are appended after the
+// secure ones, so a switch that supports a modern algorithm still negotiates
+// it. The lists are built from ssh.InsecureAlgorithms() (filtered to the
+// algorithms we actually intend to offer — RC4/arcfour is never offered)
+// rather than hard-coded, so an algorithm x/crypto drops in a future release
+// simply disappears from the offer instead of failing the handshake setup.
+func legacyAlgorithms() (kex, ciphers, hostKeys []string) {
+	supported := ssh.SupportedAlgorithms()
+	insecure := ssh.InsecureAlgorithms()
+
+	kex = append(append([]string{}, supported.KeyExchanges...), insecure.KeyExchanges...)
+
+	allowedCiphers := map[string]bool{"aes128-cbc": true, "3des-cbc": true}
+	ciphers = append([]string{}, supported.Ciphers...)
+	for _, c := range insecure.Ciphers {
+		if allowedCiphers[c] {
+			ciphers = append(ciphers, c)
+		}
+	}
+
+	allowedHostKeys := map[string]bool{"ssh-rsa": true, "ssh-dss": true}
+	hostKeys = append([]string{}, supported.HostKeys...)
+	for _, hk := range insecure.HostKeys {
+		if allowedHostKeys[hk] {
+			hostKeys = append(hostKeys, hk)
+		}
+	}
+
+	return kex, ciphers, hostKeys
+}
+
 // FetchHostKey connects to the switch just far enough to capture its SSH host
 // public key, then disconnects without authenticating. This exists because
 // ssh-keyscan cannot negotiate with older FastIron SSH stacks (e.g. RomSShell
 // 5.40 offers KEX algorithms modern OpenSSH refuses), while the x/crypto
 // client used by this provider negotiates with them fine.
+//
+// The probe always offers the legacy algorithm lists: no credentials or data
+// are sent during a key capture, and the captured key is verified out-of-band
+// by the operator anyway, so there is nothing for a weak algorithm to weaken —
+// while the widest offer lets the probe reach the oldest FastIron stacks
+// (e.g. FastIron 08.0.30 on the ICX 6430) without extra flags.
 func FetchHostKey(host string, port, timeoutSeconds int) (ssh.PublicKey, error) {
 	if port == 0 {
 		port = 22
@@ -269,6 +313,7 @@ func FetchHostKey(host string, port, timeoutSeconds int) (ssh.PublicKey, error) 
 		},
 		Timeout: time.Duration(timeoutSeconds) * time.Second,
 	}
+	config.KeyExchanges, config.Ciphers, config.HostKeyAlgorithms = legacyAlgorithms()
 
 	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", host, port), config)
 	if client != nil {
