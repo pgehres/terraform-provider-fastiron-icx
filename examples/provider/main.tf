@@ -18,6 +18,12 @@ provider "icx" {
 
   # For lab use only — disables host key verification (MITM risk):
   # insecure_skip_host_key_verify = true
+
+  # Factory-fresh / competition switch with no users and only telnet exposed.
+  # Both are plaintext/no-auth opt-ins that warn on every run — lab use only:
+  # transport               = "telnet"
+  # insecure_transport_ack  = true
+  # allow_empty_credentials = true
 }
 
 variable "switch_username" {

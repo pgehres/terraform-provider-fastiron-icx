@@ -1,13 +1,37 @@
 package sshclient
 
-// Options holds the configuration for connecting to an ICX switch via SSH.
+// Transport names accepted by Options.Transport and Connect.
+const (
+	TransportSSH    = "ssh"
+	TransportTelnet = "telnet"
+)
+
+// Options holds the configuration for connecting to an ICX switch.
 type Options struct {
-	Host           string
+	Host string
+	// Port is the TCP port; 0 means the transport's default (22 for SSH, 23
+	// for telnet).
 	Port           int
 	Username       string
 	Password       string
 	EnablePassword string
 	TimeoutSeconds int
+
+	// Transport selects the interactive transport: TransportSSH (the default
+	// when empty) or TransportTelnet. Telnet is plaintext — credentials and
+	// every command cross the wire unencrypted and the switch's identity is
+	// never verified. It exists for factory-fresh or competition switches
+	// that expose nothing else; the provider requires an explicit
+	// acknowledgement before using it.
+	Transport string
+
+	// AllowEmptyCredentials permits connecting with an empty username,
+	// password and/or enable password, as a factory-fresh switch with no
+	// local users accepts. Over SSH it also offers keyboard-interactive
+	// authentication answered with the (empty) password; the x/crypto client
+	// always tries the "none" method first regardless. Without it, a user-mode
+	// prompt with no enable password configured is an error, as before.
+	AllowEmptyCredentials bool
 
 	// HostKey is the switch's SSH host public key in authorized_keys / known_hosts
 	// format (e.g. "ssh-rsa AAAA...") or a SHA256 fingerprint (e.g. "SHA256:...").

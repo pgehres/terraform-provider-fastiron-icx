@@ -48,11 +48,17 @@ resource "icx_interface_ethernet" "server1" {
 | Attribute | Description | Required | Env Var |
 |---|---|---|---|
 | `host` | Switch IP or hostname | Yes | `FASTIRON_HOST` |
-| `port` | SSH port (default: 22) | No | `FASTIRON_PORT` |
-| `username` | SSH username | Yes | `FASTIRON_USERNAME` |
-| `password` | SSH password | Yes | `FASTIRON_PASSWORD` |
+| `port` | TCP port (default: 22 for SSH, 23 for telnet) | No | `FASTIRON_PORT` |
+| `username` | Login username | Unless `allow_empty_credentials` | `FASTIRON_USERNAME` |
+| `password` | Login password | Unless `allow_empty_credentials` | `FASTIRON_PASSWORD` |
 | `enable_password` | Enable mode password | No | `FASTIRON_ENABLE_PASSWORD` |
-| `timeout` | SSH timeout in seconds (default: 30) | No | |
+| `timeout` | Connection / command timeout in seconds (default: 30) | No | |
+| `host_key` | SSH host key or `SHA256:` fingerprint (one of this or `insecure_skip_host_key_verify` is required over SSH) | See docs | `FASTIRON_HOST_KEY` |
+| `transport` | `ssh` (default) or `telnet` — plaintext, requires `insecure_transport_ack`; lab / competition only | No | `FASTIRON_TRANSPORT` |
+| `allow_empty_credentials` | Permit empty username / password / enable password (factory-fresh switch); lab / competition only | No | |
+| `insecure_transport_ack` | Acknowledge the plaintext telnet transport; required with `transport = "telnet"` | With telnet | |
+
+See the [provider documentation](docs/index.md) for `insecure_skip_host_key_verify`, `legacy_ssh_algorithms`, and the **Lab / competition switches** section on driving factory-fresh switches that expose only telnet and accept empty credentials.
 
 ### Multi-Switch Setup
 

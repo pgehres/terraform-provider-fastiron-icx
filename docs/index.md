@@ -6,7 +6,7 @@ description: |-
 
 # fastiron-icx Provider
 
-The `fastiron-icx` provider manages Brocade/Ruckus ICX switches running FastIron firmware. It communicates with each switch over an SSH CLI session — no REST API or NETCONF is required or available on these firmware versions.
+The `fastiron-icx` provider manages Brocade/Ruckus ICX switches running FastIron firmware. It communicates with each switch over an interactive CLI session — SSH by default, or plaintext telnet for [lab and competition switches](#lab--competition-switches-telnet-no-credentials) that expose nothing else — no REST API or NETCONF is required or available on these firmware versions.
 
 **Tested firmware:** FastIron 08.0.95
 
@@ -109,6 +109,34 @@ This *extends* the offered algorithm lists with `diffie-hellman-group14-sha1`, `
 
 The `debug-ssh -print-host-key` host-key capture always offers the legacy algorithms (nothing secret is exchanged during a key capture), so it works against these devices without extra flags.
 
+## Lab / competition switches (telnet, no credentials)
+
+A factory-fresh ICX switch has no local users, no enable password and no SSH host key: it answers only on telnet, logs anyone straight in at a `>` prompt, and `enable` succeeds without a password. Competition and classroom fleets are often provisioned in exactly this state. The provider can drive such switches, but **only through two explicit opt-ins that are never defaults**, and it warns on every plan and apply while they are set:
+
+```terraform
+provider "icx" {
+  alias = "comp_access_1"
+  host  = "10.80.0.2"
+
+  # Factory-fresh switch: no users, no enable password. Lab / competition only.
+  allow_empty_credentials = true
+
+  # Telnet is plaintext and unauthenticated. Lab / competition only.
+  transport              = "telnet"
+  insecure_transport_ack = true
+}
+```
+
+What each opt-in does and costs:
+
+- **`allow_empty_credentials = true`** lets `username`, `password` and `enable_password` be empty. Over telnet the provider simply waits for the CLI prompt (answering a `User Name:` / `Password:` login — or older wording such as `Please Enter Login Name:` — with the configured values only if the switch presents one). Over SSH it offers password authentication with the empty password and additionally keyboard-interactive authentication answered with it; the SSH client always tries the "none" method first, which is what a switch with no users accepts. A switch that accepts any of this is **fully controllable by anyone who can reach it** — the warning says so, and the right fix is to let Terraform create a local user (`icx_user`) and an enable password, then remove the flag.
+- **`transport = "telnet"`** switches the CLI session from SSH to telnet on port 23 (or `port`). Credentials and the **entire running configuration cross the network in plaintext**, and nothing verifies that the host you reached is your switch. `host_key`, `insecure_skip_host_key_verify` and `legacy_ssh_algorithms` are ignored (with a warning) because they have no meaning without SSH. Enable mode, prompt detection, paging, per-command error detection and the hostname and management-IP safety paths run through the same session layer as over SSH. Telnet adds its own safeguards against the session falling out of step (a stray extra prompt making every later command read the previous command's output): lines are sent with a bare LF, as Python's telnetlib does; stray output is drained at connect and before each command; and when the switch echoes commands, each command's output must begin with its echo. If that check fails the provider stops with a "telnet session out of sync" error rather than act on output that may belong to another command — rerun to reconnect.
+- **`insecure_transport_ack = true`** is **required** with telnet. Without it the provider refuses to connect and says why. It exists so that a plaintext connection is an explicit, reviewable decision in the configuration rather than a side effect of a transport name.
+
+The intended life cycle is: provision over telnet with empty credentials → create a user and enable password → `crypto key generate` so SSH comes up → repoint the provider at SSH with a pinned `host_key` → drop both opt-ins. The provider does not enforce this order, it only makes the insecure state loud.
+
+~> **Not yet validated on a live device.** The telnet transport and empty-credential login are unit-tested against a scripted switch (option negotiation, `User Name:`/`Password:` login, `enable` without a password, the full command dialogue), but have not run against real hardware yet. The debug tool connects the same way the provider does, so it is the first thing to try: `FASTIRON_HOST=<switch> go run ./cmd/debug-ssh -transport telnet -insecure-transport-ack -allow-empty-credentials` prints the running configuration or the exact point the dialogue failed.
+
 ## Example Usage
 
 ```terraform
@@ -177,14 +205,17 @@ resource "icx_vlan" "servers_access" {
 | Argument | Type | Required | Environment Variable | Description |
 |---|---|---|---|---|
 | `host` | string | yes | `FASTIRON_HOST` | Hostname or IP address of the switch. |
-| `port` | number | no | `FASTIRON_PORT` | SSH port. Defaults to 22. |
-| `username` | string | yes | `FASTIRON_USERNAME` | SSH username. |
-| `password` | string | yes | `FASTIRON_PASSWORD` | SSH password. Sensitive. |
-| `enable_password` | string | no | `FASTIRON_ENABLE_PASSWORD` | Enable mode password. Required if the switch prompts for one; safe to set even when the switch has no enable password configured. Sensitive. |
-| `timeout` | number | no | — | SSH connection timeout in seconds. Defaults to 30. |
-| `host_key` | string | see note | `FASTIRON_HOST_KEY` | The switch's SSH host public key in `known_hosts` format or `SHA256:<fingerprint>`. Obtain with `ssh-keyscan <host>` (see the host-key note above if it prints nothing). One of `host_key` or `insecure_skip_host_key_verify` is required. |
+| `port` | number | no | `FASTIRON_PORT` | TCP port of the CLI transport. Defaults to 22 for SSH, 23 for telnet. |
+| `username` | string | see note | `FASTIRON_USERNAME` | Login username. Required unless `allow_empty_credentials` is set. |
+| `password` | string | see note | `FASTIRON_PASSWORD` | Login password. Required unless `allow_empty_credentials` is set. Sensitive. |
+| `enable_password` | string | no | `FASTIRON_ENABLE_PASSWORD` | Enable mode password. Required if the switch prompts for one (unless `allow_empty_credentials` is set); safe to set even when the switch has no enable password configured. Sensitive. |
+| `timeout` | number | no | — | Connection and per-command read timeout in seconds. Defaults to 30. |
+| `host_key` | string | see note | `FASTIRON_HOST_KEY` | The switch's SSH host public key in `known_hosts` format or `SHA256:<fingerprint>`. Obtain with `ssh-keyscan <host>` (see the host-key note above if it prints nothing). One of `host_key` or `insecure_skip_host_key_verify` is required over SSH; ignored over telnet. |
 | `insecure_skip_host_key_verify` | bool | see note | — | Disable SSH host key verification. Exposes connections to man-in-the-middle attacks. For lab use only. |
 | `legacy_ssh_algorithms` | bool | no | — | Additionally offer weak legacy SSH algorithms required by very old FastIron SSH stacks (e.g. 08.0.30 on the EOL ICX 6430). Defaults to `false`. |
+| `transport` | string | no | `FASTIRON_TRANSPORT` | `ssh` (default) or `telnet`. Telnet is plaintext and requires `insecure_transport_ack`. Lab / competition use only. |
+| `allow_empty_credentials` | bool | no | — | Permit an empty `username`, `password` and/or `enable_password` (factory-fresh switch). Warns on every run. Lab / competition use only. Defaults to `false`. |
+| `insecure_transport_ack` | bool | with telnet | — | Acknowledges that `transport = "telnet"` is plaintext and unauthenticated. Required with telnet; no effect over SSH. Defaults to `false`. |
 
 ### Argument Reference
 
@@ -194,15 +225,15 @@ Hostname or IP address of the ICX switch. Can also be set with the `FASTIRON_HOS
 
 #### `port` (Optional)
 
-SSH port number. Defaults to `22`. Can also be set with the `FASTIRON_PORT` environment variable.
+TCP port of the CLI transport. Defaults to `22` for SSH and `23` for telnet. Can also be set with the `FASTIRON_PORT` environment variable.
 
-#### `username` (Required)
+#### `username` (Required unless `allow_empty_credentials`)
 
-SSH username. Can also be set with the `FASTIRON_USERNAME` environment variable.
+Login username. Can also be set with the `FASTIRON_USERNAME` environment variable. May be omitted or empty only when `allow_empty_credentials = true`.
 
-#### `password` (Required, Sensitive)
+#### `password` (Required unless `allow_empty_credentials`, Sensitive)
 
-SSH password. Can also be set with the `FASTIRON_PASSWORD` environment variable.
+Login password. Can also be set with the `FASTIRON_PASSWORD` environment variable. May be omitted or empty only when `allow_empty_credentials = true`.
 
 #### `enable_password` (Optional, Sensitive)
 
@@ -210,7 +241,7 @@ Enable mode password. The provider enters enable mode only when the switch lands
 
 #### `timeout` (Optional)
 
-SSH connection and command timeout in seconds. Defaults to `30`.
+Connection and per-command read timeout in seconds, for either transport. Defaults to `30`.
 
 #### `host_key` (Optional)
 
@@ -227,3 +258,15 @@ When `true`, host key verification is disabled. This means an attacker performin
 #### `legacy_ssh_algorithms` (Optional)
 
 When `true`, the provider additionally offers legacy SSH algorithms — `diffie-hellman-group14-sha1`, `diffie-hellman-group1-sha1`, and `diffie-hellman-group-exchange-sha1` key exchange; `aes128-cbc` and `3des-cbc` ciphers; `ssh-rsa` and `ssh-dss` host key signatures — needed by very old FastIron SSH stacks such as FastIron 08.0.30 on the EOL ICX 6430. Modern algorithms remain preferred, so switches that support them are unaffected. **These algorithms are cryptographically weak** (SHA-1 key exchange, CBC-mode ciphers, SHA-1 signatures); enable this only for EOL devices on trusted networks. RC4 is never offered. Defaults to `false`. See [Legacy SSH Algorithms](#legacy-ssh-algorithms-eol-devices).
+
+#### `transport` (Optional)
+
+The CLI transport: `"ssh"` (default) or `"telnet"`. Telnet sends credentials and every command — including the full running configuration the provider reads on each run — **in plaintext**, and nothing verifies the identity of the host that answered. It exists only for factory-fresh or competition switches that expose no SSH, and requires `insecure_transport_ack = true`; the provider warns on every plan and apply while it is in use. `host_key`, `insecure_skip_host_key_verify` and `legacy_ssh_algorithms` are ignored (with a warning) over telnet. The default port becomes `23`. Can also be set with the `FASTIRON_TRANSPORT` environment variable. See [Lab / competition switches](#lab--competition-switches-telnet-no-credentials).
+
+#### `allow_empty_credentials` (Optional)
+
+When `true`, `username`, `password` and `enable_password` may be empty or omitted, as a factory-fresh switch with no local users and no enable password accepts. Over telnet the provider waits for the CLI prompt and answers a `User Name:` / `Password:` login only if the switch presents one; over SSH it offers password authentication with the (empty) password and keyboard-interactive authentication answered with it, after the SSH client's implicit `none` attempt. **A switch that accepts this is fully controllable by anyone who can reach it.** The provider warns on every run while this is set; create a local user (`icx_user`) and an enable password, then remove it. Defaults to `false`.
+
+#### `insecure_transport_ack` (Optional, required with telnet)
+
+Must be `true` when `transport = "telnet"`: it is your acknowledgement that the connection is plaintext and unauthenticated. Without it the provider refuses to connect. It has no effect over SSH (a warning says so if it is set anyway). Defaults to `false`.

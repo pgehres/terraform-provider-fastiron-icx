@@ -19,6 +19,18 @@ func main() {
 		"additionally offer legacy SSH algorithms (SHA-1 key exchange, CBC ciphers, ssh-rsa/ssh-dss host key "+
 			"signatures) for very old FastIron stacks, e.g. 08.0.30 on the ICX 6430. The -print-host-key probe "+
 			"always offers them; this flag applies to the full connect.")
+	transport := flag.String("transport", sshclient.TransportSSH,
+		"CLI transport: ssh or telnet (FASTIRON_TRANSPORT). Telnet is PLAINTEXT and unauthenticated — lab and "+
+			"competition switches that expose no SSH only; this tool connects exactly as the provider does with "+
+			"transport = \"telnet\" and insecure_transport_ack = true, and like the provider refuses telnet without "+
+			"-insecure-transport-ack (or FASTIRON_INSECURE_TRANSPORT_ACK=true).")
+	insecureAck := flag.Bool("insecure-transport-ack", false,
+		"acknowledge that -transport telnet is plaintext and unauthenticated (the provider's insecure_transport_ack); "+
+			"FASTIRON_INSECURE_TRANSPORT_ACK=true is equivalent. Required with telnet.")
+	allowEmpty := flag.Bool("allow-empty-credentials", false,
+		"permit empty FASTIRON_USERNAME / FASTIRON_PASSWORD / FASTIRON_ENABLE_PASSWORD, as a factory-fresh switch "+
+			"with no local users accepts (the provider's allow_empty_credentials).")
+	port := flag.Int("port", 0, "TCP port; 0 = the transport's default (22 for ssh, 23 for telnet). FASTIRON_PORT is also honoured.")
 	flag.Parse()
 
 	host := os.Getenv("FASTIRON_HOST")
@@ -40,11 +52,23 @@ func main() {
 		return
 	}
 
+	if env := os.Getenv("FASTIRON_TRANSPORT"); env != "" && *transport == sshclient.TransportSSH {
+		*transport = env
+	}
+	if *port == 0 {
+		if env := os.Getenv("FASTIRON_PORT"); env != "" {
+			if _, err := fmt.Sscanf(env, "%d", port); err != nil {
+				fmt.Fprintf(os.Stderr, "FASTIRON_PORT %q: %v\n", env, err)
+				os.Exit(1)
+			}
+		}
+	}
+
 	user := os.Getenv("FASTIRON_USERNAME")
 	pass := os.Getenv("FASTIRON_PASSWORD")
 
-	if host == "" || user == "" || pass == "" {
-		fmt.Fprintln(os.Stderr, "Set FASTIRON_HOST, FASTIRON_USERNAME, FASTIRON_PASSWORD")
+	if host == "" || (!*allowEmpty && (user == "" || pass == "")) {
+		fmt.Fprintln(os.Stderr, "Set FASTIRON_HOST, FASTIRON_USERNAME, FASTIRON_PASSWORD (or pass -allow-empty-credentials for a switch with no users)")
 		os.Exit(1)
 	}
 
@@ -57,22 +81,42 @@ func main() {
 	hostKey := os.Getenv("FASTIRON_HOST_KEY")
 
 	opts := sshclient.Options{
-		Host:                host,
-		Port:                22,
-		Username:            user,
-		Password:            pass,
-		EnablePassword:      enablePass,
-		TimeoutSeconds:      15,
-		HostKey:             hostKey,
-		LegacySSHAlgorithms: *legacySSH,
+		Host:                  host,
+		Port:                  *port,
+		Username:              user,
+		Password:              pass,
+		EnablePassword:        enablePass,
+		TimeoutSeconds:        15,
+		HostKey:               hostKey,
+		LegacySSHAlgorithms:   *legacySSH,
+		Transport:             *transport,
+		AllowEmptyCredentials: *allowEmpty,
 	}
 
-	if hostKey == "" {
-		fmt.Fprintln(os.Stderr, "WARNING: FASTIRON_HOST_KEY not set — skipping SSH host key verification (MITM risk)")
-		opts.InsecureSkipHostKeyVerify = true
+	switch *transport {
+	case sshclient.TransportSSH:
+		if hostKey == "" {
+			fmt.Fprintln(os.Stderr, "WARNING: FASTIRON_HOST_KEY not set — skipping SSH host key verification (MITM risk)")
+			opts.InsecureSkipHostKeyVerify = true
+		}
+	case sshclient.TransportTelnet:
+		if !*insecureAck && os.Getenv("FASTIRON_INSECURE_TRANSPORT_ACK") != "true" {
+			fmt.Fprintln(os.Stderr, "refusing telnet: it sends credentials and configuration in PLAINTEXT and does not verify "+
+				"the switch's identity. Pass -insecure-transport-ack or set FASTIRON_INSECURE_TRANSPORT_ACK=true to acknowledge "+
+				"this (the provider's insecure_transport_ack).")
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "WARNING: telnet transport — credentials and configuration cross the network in plaintext, "+
+			"and the switch's identity is not verified")
+	default:
+		fmt.Fprintf(os.Stderr, "unknown transport %q (want ssh or telnet)\n", *transport)
+		os.Exit(1)
+	}
+	if *allowEmpty && (user == "" || pass == "" || enablePass == "") {
+		fmt.Fprintln(os.Stderr, "WARNING: connecting with empty credentials")
 	}
 
-	client, err := sshclient.NewClient(opts)
+	client, err := sshclient.Connect(opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "connect error: %v\n", err)
 		os.Exit(1)
