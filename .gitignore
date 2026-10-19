@@ -7,3 +7,4 @@ dist/
 *.tfvars
 !*.tfvars.example
 configs/
+.claude/

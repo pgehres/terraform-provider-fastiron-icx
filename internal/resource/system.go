@@ -22,6 +22,7 @@ import (
 var (
 	_ resource.Resource                = &SystemResource{}
 	_ resource.ResourceWithImportState = &SystemResource{}
+	_ resource.ResourceWithModifyPlan  = &SystemResource{}
 )
 
 // reManagerPortList matches valid FastIron manager port-list values: digits,
@@ -32,7 +33,9 @@ var (
 var reManagerPortList = regexp.MustCompile(`^[0-9to/, ]+$`)
 
 type SystemResource struct {
-	client sshclient.CommandExecutor
+	client          sshclient.CommandExecutor
+	imageType       parser.ImageType
+	firmwareVersion string
 }
 
 type SystemResourceModel struct {
@@ -134,12 +137,38 @@ func (r *SystemResource) Configure(_ context.Context, req resource.ConfigureRequ
 		return
 	}
 	r.client = data.Client
+	r.imageType = data.ImageType
+	r.firmwareVersion = data.FirmwareVersion
+}
+
+// ModifyPlan rejects a planned global_stp = true at plan time when the device is
+// known to run the switch image. Destroy plans and a null, unknown, or false
+// value pass; the apply-time guard in Create/Update still backstops a value
+// that only becomes known during apply.
+func (r *SystemResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+	var globalSTP types.Bool
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("global_stp"), &globalSTP)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !globalSTP.ValueBool() {
+		return
+	}
+	requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics)
 }
 
 func (r *SystemResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan SystemResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if plan.GlobalSTP.ValueBool() &&
+		!requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics) {
 		return
 	}
 
@@ -205,12 +234,20 @@ func (r *SystemResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 
+	// Guard only the plan side: global_stp=true solely in state (left behind
+	// by a router→switch reimage) is necessarily absent on a switch image, so
+	// turning it off must not error — the `no global-stp` is skipped instead.
+	if plan.GlobalSTP.ValueBool() &&
+		!requireRouterImage(r.imageType, r.firmwareVersion, "The global_stp attribute of icx_system", &resp.Diagnostics) {
+		return
+	}
+
 	var commands []string
 
 	if plan.GlobalSTP.ValueBool() != state.GlobalSTP.ValueBool() {
 		if plan.GlobalSTP.ValueBool() {
 			commands = append(commands, "global-stp")
-		} else {
+		} else if r.imageType != parser.ImageTypeSwitch {
 			commands = append(commands, "no global-stp")
 		}
 	}
@@ -297,9 +334,11 @@ func (r *SystemResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		return
 	}
 
-	// Reset all settings to defaults.
+	// Reset all settings to defaults. On a switch image global-stp cannot be
+	// configured (and `no global-stp` does not exist), so a true value in
+	// stale state is skipped rather than blocking the singleton's delete.
 	var commands []string
-	if state.GlobalSTP.ValueBool() {
+	if state.GlobalSTP.ValueBool() && r.imageType != parser.ImageTypeSwitch {
 		commands = append(commands, "no global-stp")
 	}
 	if !state.TelnetServer.ValueBool() {

@@ -21,10 +21,13 @@ import (
 var (
 	_ resource.Resource                = &InterfaceVEResource{}
 	_ resource.ResourceWithImportState = &InterfaceVEResource{}
+	_ resource.ResourceWithModifyPlan  = &InterfaceVEResource{}
 )
 
 type InterfaceVEResource struct {
-	client sshclient.CommandExecutor
+	client          sshclient.CommandExecutor
+	imageType       parser.ImageType
+	firmwareVersion string
 }
 
 type InterfaceVEResourceModel struct {
@@ -79,12 +82,29 @@ func (r *InterfaceVEResource) Configure(_ context.Context, req resource.Configur
 		return
 	}
 	r.client = data.Client
+	r.imageType = data.ImageType
+	r.firmwareVersion = data.FirmwareVersion
+}
+
+// ModifyPlan rejects creating or updating a VE at plan time when the device is
+// known to run the switch image, so the error surfaces in `terraform plan`
+// instead of mid-apply. A destroy plan (null) is allowed through: Delete
+// deliberately succeeds on a switch image so stale state can be cleared.
+func (r *InterfaceVEResource) ModifyPlan(_ context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+	requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics)
 }
 
 func (r *InterfaceVEResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan InterfaceVEResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
 		return
 	}
 
@@ -124,6 +144,14 @@ func (r *InterfaceVEResource) Read(ctx context.Context, req resource.ReadRequest
 		return
 	}
 
+	// A switch-image device cannot have VE interfaces. Treat that as the VE
+	// being absent rather than erroring, so state left behind by a
+	// router→switch reimage can still be refreshed away and destroyed.
+	if r.imageType == parser.ImageTypeSwitch {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+
 	config, err := r.getRunningConfig()
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to read running config", err.Error())
@@ -157,6 +185,10 @@ func (r *InterfaceVEResource) Update(ctx context.Context, req resource.UpdateReq
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
 		return
 	}
 
@@ -230,6 +262,13 @@ func (r *InterfaceVEResource) Delete(ctx context.Context, req resource.DeleteReq
 		return
 	}
 
+	// On a switch image the VE necessarily does not exist; succeed without
+	// sending commands so stale state from a router→switch reimage can be
+	// destroyed.
+	if r.imageType == parser.ImageTypeSwitch {
+		return
+	}
+
 	commands := []string{fmt.Sprintf("no interface ve %d", state.VeID.ValueInt64())}
 
 	if err := r.client.ExecuteInConfigMode(commands); err != nil {
@@ -244,6 +283,13 @@ func (r *InterfaceVEResource) Delete(ctx context.Context, req resource.DeleteReq
 }
 
 func (r *InterfaceVEResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	// Read treats a VE on a switch image as absent, which would surface as the
+	// framework's generic "Cannot import non-existent remote object". Fail
+	// with the specific reason instead.
+	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
+		return
+	}
+
 	veID, err := strconv.ParseInt(req.ID, 10, 64)
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid VE ID", fmt.Sprintf("Expected numeric VE ID, got %q", req.ID))
