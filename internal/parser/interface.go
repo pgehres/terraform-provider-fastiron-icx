@@ -19,7 +19,10 @@ type EthernetInterface struct {
 	// such a port only as *tagged*; the untagged VLAN lives here. A bare
 	// `dual-mode` means the default VLAN (1). Nil when not configured.
 	DualModeVLAN *int
-	RawLines     []string
+	// Disabled is true when the interface carries a ` disable` line: the
+	// port is administratively down. Ports without the line are enabled.
+	Disabled bool
+	RawLines []string
 }
 
 // VEInterface represents a parsed virtual ethernet interface configuration.
@@ -63,6 +66,9 @@ func (c *RunningConfig) parseEthernetStanza(lines []string) error {
 
 		case trimmed == "no optical-monitor":
 			iface.OpticalMonitorDisable = true
+
+		case trimmed == "disable":
+			iface.Disabled = true
 
 		case dualModeRe.MatchString(trimmed):
 			dm := dualModeRe.FindStringSubmatch(trimmed)

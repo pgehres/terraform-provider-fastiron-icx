@@ -22,6 +22,10 @@ var _ provider.Provider = &FastIronICXProvider{}
 
 type FastIronICXProvider struct {
 	version string
+	// client is the SSH session opened by Configure, kept so Close can
+	// release it. Terraform itself never needs this: a provider process
+	// exits after each command and the connection dies with it.
+	client *sshclient.Client
 }
 
 type FastIronICXProviderModel struct {
@@ -183,6 +187,8 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 		return
 	}
 
+	p.client = client
+
 	data := &providerdata.ProviderData{
 		Client:   client,
 		Username: username,
@@ -198,6 +204,7 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 		// The client is already connected; close it so the switch's SSH
 		// session is not leaked until process exit.
 		_ = client.Close()
+		p.client = nil
 		resp.Diagnostics.AddError("Failed to read running config",
 			"Unable to read the running configuration during provider setup: "+err.Error())
 		return
@@ -215,6 +222,22 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 	resp.ResourceData = data
 }
 
+// Close releases the SSH session opened by Configure, if any. A provider
+// served by Terraform never needs it (the process exits after each command),
+// but the acceptance test harness runs the provider in-process — one instance
+// per terraform command — and must close each instance before starting the
+// next, or the leaked sessions exhaust the switch's SSH session limit a few
+// commands into the first test. Safe to call on an unconfigured provider and
+// more than once.
+func (p *FastIronICXProvider) Close() error {
+	if p.client == nil {
+		return nil
+	}
+	err := p.client.Close()
+	p.client = nil
+	return err
+}
+
 func (p *FastIronICXProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		icxresource.NewVLANResource,
@@ -224,6 +247,9 @@ func (p *FastIronICXProvider) Resources(_ context.Context) []func() resource.Res
 		icxresource.NewUserResource,
 		icxresource.NewAAAResource,
 		icxresource.NewSystemResource,
+		icxresource.NewNTPResource,
+		icxresource.NewSNMPResource,
+		icxresource.NewLoggingResource,
 		icxresource.NewPoEResource,
 		icxresource.NewRawConfigResource,
 	}
