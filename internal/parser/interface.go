@@ -136,3 +136,15 @@ func (c *RunningConfig) FindVEInterface(id int) *VEInterface {
 	}
 	return nil
 }
+
+// HasDualModeLines reports whether any interface carries a `dual-mode` line.
+// Only firmware that has the command prints it, so this is direct evidence of
+// the 08.0.30-era trunk dialect (consumed by internal/dialect).
+func (c *RunningConfig) HasDualModeLines() bool {
+	for i := range c.EthernetInterfaces {
+		if c.EthernetInterfaces[i].DualModeVLAN != nil {
+			return true
+		}
+	}
+	return false
+}
