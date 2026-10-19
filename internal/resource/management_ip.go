@@ -40,14 +40,20 @@ const managementIPID = "management"
 // gated on dialect.CapGlobalManagementIP.
 //
 // Safety model. The provider talks to the switch over the very address this
-// resource manages, so:
-//   - an `ip address` command is only ever sent with allow_management_ip_change
-//     = true, is always the last command of the apply, and goes through
-//     ExecuteExpectingDisconnect so `write memory` is queued in the same write;
+// resource manages — and, when Terraform runs from another subnet, through
+// the default gateway the switch routes its replies by — so:
+//   - an `ip address` or `ip default-gateway` command is only ever sent with
+//     allow_management_ip_change = true (refused at plan time otherwise), and
+//     both go last, through ExecuteExpectingDisconnect, so `end` and `write
+//     memory` are queued in the same write (see apply for the ordering);
 //   - Delete sends nothing (removing the address would cut off remote access
 //     for good) and only forgets the resource;
 //   - default_gateway and dns_servers left out of the configuration are kept
-//     as the device has them, never removed.
+//     as the device has them. A gateway is never removed (Optional+Computed:
+//     a null configuration value plans as the prior state); DNS servers are
+//     cleared only by an explicit dns_servers = [].
+//   - a DHCP-learned address (`ip address A M dynamic`) is refused outright:
+//     it is not this resource's to manage.
 type ManagementIPResource struct {
 	client  sshclient.CommandExecutor
 	dialect dialect.Dialect
@@ -94,8 +100,10 @@ func (r *ManagementIPResource) Schema(_ context.Context, _ resource.SchemaReques
 			},
 			"default_gateway": schema.StringAttribute{
 				Description: "Default gateway (`ip default-gateway`). When omitted the device's current " +
-					"gateway is kept and recorded in state; the provider only removes a gateway that was " +
-					"previously set through this attribute.",
+					"gateway is kept and recorded in state. A gateway cannot be removed through this " +
+					"resource: removing the attribute keeps the current one. Changing it can sever the " +
+					"provider's session (the switch routes its replies by it), so a change is refused " +
+					"unless allow_management_ip_change is true.",
 				Optional: true,
 				Computed: true,
 				PlanModifiers: []planmodifier.String{
@@ -107,7 +115,8 @@ func (r *ManagementIPResource) Schema(_ context.Context, _ resource.SchemaReques
 			},
 			"dns_servers": schema.ListAttribute{
 				Description: "DNS servers (`ip dns server-address`), in order, up to four. When omitted " +
-					"the device's current servers are kept and recorded in state.",
+					"the device's current servers are kept and recorded in state; set it to [] to remove " +
+					"them all.",
 				Optional:    true,
 				Computed:    true,
 				ElementType: types.StringType,
@@ -121,10 +130,11 @@ func (r *ManagementIPResource) Schema(_ context.Context, _ resource.SchemaReques
 				},
 			},
 			"allow_management_ip_change": schema.BoolAttribute{
-				Description: "Must be true for the provider to send an `ip address` command at all — " +
-					"on create when the device's address differs from ip_address, and on any change of " +
-					"ip_address. The SSH session is expected to drop; afterwards point the provider's host " +
-					"at the new address and verify the startup configuration saved it. Defaults to false.",
+				Description: "Must be true for the provider to send an `ip address` or `ip default-gateway` " +
+					"command at all — on create when the device's address or gateway differs from the " +
+					"configuration, and on any change of ip_address or default_gateway. The SSH session may " +
+					"drop; afterwards point the provider's host at the new address (if it changed) and verify " +
+					"the startup configuration saved the change. Defaults to false.",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(false),
@@ -147,18 +157,21 @@ func (r *ManagementIPResource) Configure(_ context.Context, req resource.Configu
 }
 
 const (
-	titleIPChangeRefused = "Management IP change refused"
-	titleIPChangeSevered = "Management IP changed; SSH session severed (expected)"
+	titleIPChangeRefused      = "Management IP change refused"
+	titleGatewayChangeRefused = "Management default gateway change refused"
+	titleIPChangeSevered      = "Management addressing changed; SSH session severed (expected)"
+	titleDHCPAddress          = "Management address is DHCP-learned"
 )
 
-// ipChangeProcedure is the after-care every message about an address change
-// must carry.
+// ipChangeProcedure is the after-care every message about an address or
+// gateway change must carry.
 const ipChangeProcedure = "Run this change on its own (`terraform apply -target=<this resource>`), since every " +
-	"command after it fails until the provider reconnects. The provider sends the new address last, " +
-	"together with `end` and `write memory` in a single write, and treats the dropped session as " +
-	"expected. Afterwards point the provider block's host at the new address, run `terraform plan` " +
-	"(it should show no changes), and confirm the startup configuration holds the new address " +
-	"(`show configuration | include ip address`); if it does not, run `write memory` by hand."
+	"command after it fails if the session drops. The provider sends the gateway and address changes " +
+	"last, together with `end` and `write memory` in a single write, and treats a dropped session as " +
+	"expected. Afterwards point the provider block's host at the new address if it changed (and make sure " +
+	"the machine running Terraform can route to it), run `terraform plan` (it should show no changes), and " +
+	"confirm the startup configuration holds the change (`show configuration | include ip`); if it does " +
+	"not, run `write memory` by hand."
 
 func ipChangeRefusedMessage(from, to string) string {
 	if from == "" {
@@ -170,17 +183,37 @@ func ipChangeRefusedMessage(from, to string) string {
 		from, to, ipChangeProcedure)
 }
 
-func ipChangeSeveredMessage(to string) string {
-	return fmt.Sprintf("The new management address %s was sent and the switch stopped answering, as expected. "+
-		"Whether the queued `write memory` ran cannot be confirmed from here. %s", to, ipChangeProcedure)
+func gatewayChangeRefusedMessage(from, to string) string {
+	if from == "" {
+		from = "<none>"
+	}
+	return fmt.Sprintf("Setting the default gateway would send `ip default-gateway` (%s -> %s). The switch "+
+		"routes its replies to any off-subnet client through that gateway, so when Terraform reaches the "+
+		"switch through a router the command can sever the provider's own SSH session, leaving the change "+
+		"unsaved. No commands were sent. If this change is intended, set allow_management_ip_change = true. %s",
+		from, to, ipChangeProcedure)
+}
+
+func ipChangeSeveredMessage(sent []string) string {
+	return fmt.Sprintf("%s was sent and the switch stopped answering, as expected. "+
+		"Whether the queued `write memory` ran cannot be confirmed from here. %s",
+		"`"+strings.Join(sent, "` and `")+"`", ipChangeProcedure)
+}
+
+func dhcpAddressMessage(raw string) string {
+	return fmt.Sprintf("The device's management address (`ip address %s`) was learned from DHCP. "+
+		"icx_management_ip manages a static address only and would report the lease as configuration, so "+
+		"it refuses to read or adopt it. Remove the resource from the configuration (and `terraform state "+
+		"rm` it if it is already in state), or configure a static address from the console first.", raw)
 }
 
 // ModifyPlan refuses, at plan time, what would fail or do damage at apply:
-// the resource on a known router image, and an `ip address` change without
+// the resource on a known router image, a DHCP-learned device address, and an
+// `ip address` or `ip default-gateway` change without
 // allow_management_ip_change. Destroy plans pass (Delete sends nothing). For
 // a create the device is consulted — a read — so a mismatch between the
-// configured address and the device's shows up in `terraform plan`, not
-// mid-apply; the apply-time checks in Create/Update remain as the backstop.
+// configuration and the device shows up in `terraform plan`, not mid-apply;
+// the apply-time checks in Create/Update remain as the backstop.
 func (r *ManagementIPResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
 		return
@@ -194,7 +227,7 @@ func (r *ManagementIPResource) ModifyPlan(ctx context.Context, req resource.Modi
 		return
 	}
 
-	var current string
+	var currentIP, currentGW string
 	if req.State.Raw.IsNull() {
 		if r.client == nil {
 			return
@@ -204,30 +237,64 @@ func (r *ManagementIPResource) ModifyPlan(ctx context.Context, req resource.Modi
 			// Not an error at plan time: Create reads again and reports it.
 			return
 		}
-		current = globalIPToCIDR(config.Global.IPAddress)
+		if config.Global.IPAddressDynamic {
+			resp.Diagnostics.AddAttributeError(path.Root("ip_address"), titleDHCPAddress,
+				dhcpAddressMessage(config.Global.IPAddress))
+			return
+		}
+		currentIP = globalIPToCIDR(config.Global.IPAddress)
+		currentGW = deviceGateway(config)
 	} else {
 		var state ManagementIPResourceModel
 		resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		current = state.IPAddress.ValueString()
+		currentIP = state.IPAddress.ValueString()
+		currentGW = state.DefaultGateway.ValueString()
 	}
 
-	if current == plan.IPAddress.ValueString() {
+	ipChange := currentIP != plan.IPAddress.ValueString()
+	// An unknown or null planned gateway means "keep the device's" — no change.
+	gwChange := !plan.DefaultGateway.IsUnknown() && !plan.DefaultGateway.IsNull() &&
+		plan.DefaultGateway.ValueString() != currentGW
+	if !ipChange && !gwChange {
 		return
 	}
 	switch {
 	case plan.AllowManagementIPChange.IsUnknown():
 		// Decided at apply time.
 	case !plan.AllowManagementIPChange.ValueBool():
-		resp.Diagnostics.AddAttributeError(path.Root("ip_address"), titleIPChangeRefused,
-			ipChangeRefusedMessage(current, plan.IPAddress.ValueString()))
+		if ipChange {
+			resp.Diagnostics.AddAttributeError(path.Root("ip_address"), titleIPChangeRefused,
+				ipChangeRefusedMessage(currentIP, plan.IPAddress.ValueString()))
+		}
+		if gwChange {
+			resp.Diagnostics.AddAttributeError(path.Root("default_gateway"), titleGatewayChangeRefused,
+				gatewayChangeRefusedMessage(currentGW, plan.DefaultGateway.ValueString()))
+		}
 	default:
-		resp.Diagnostics.AddAttributeWarning(path.Root("ip_address"), "Management IP change will sever the SSH session",
-			fmt.Sprintf("Applying will send `ip address` (%s -> %s) as the last command and the provider's "+
-				"session will drop. %s", current, plan.IPAddress.ValueString(), ipChangeProcedure))
+		var changes []string
+		attr := path.Root("ip_address")
+		if gwChange {
+			changes = append(changes, fmt.Sprintf("`ip default-gateway` (%s -> %s)", orNone(currentGW), plan.DefaultGateway.ValueString()))
+			attr = path.Root("default_gateway")
+		}
+		if ipChange {
+			changes = append(changes, fmt.Sprintf("`ip address` (%s -> %s)", orNone(currentIP), plan.IPAddress.ValueString()))
+			attr = path.Root("ip_address")
+		}
+		resp.Diagnostics.AddAttributeWarning(attr, "Management addressing change may sever the SSH session",
+			fmt.Sprintf("Applying will send %s as the last commands, and the provider's session may drop. %s",
+				strings.Join(changes, " and "), ipChangeProcedure))
 	}
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "<none>"
+	}
+	return s
 }
 
 func (r *ManagementIPResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -297,7 +364,12 @@ func (r *ManagementIPResource) Read(ctx context.Context, req resource.ReadReques
 	}
 	state.IPAddress = device.IPAddress
 	state.DefaultGateway = device.DefaultGateway
-	state.DNSServers = device.DNSServers
+	// dns_servers = [] (all removed) and "none on the device" are the same
+	// thing; keep the configured empty list rather than flipping it to null,
+	// which would show a diff on every plan.
+	if !(device.DNSServers.IsNull() && isEmptyKnownList(state.DNSServers)) {
+		state.DNSServers = device.DNSServers
+	}
 	// Terraform-only; nothing on the device to read it from.
 	if state.AllowManagementIPChange.IsNull() || state.AllowManagementIPChange.IsUnknown() {
 		state.AllowManagementIPChange = types.BoolValue(false)
@@ -337,58 +409,96 @@ func (r *ManagementIPResource) Update(ctx context.Context, req resource.UpdateRe
 }
 
 // apply reconciles the device from `from` (its current addressing, as read
-// from the device on create or from state on update) to `to`. Gateway and
-// DNS changes go first through the ordinary path; an address change, if
-// allowed, goes last through the disconnect-tolerant path with the save
-// queued behind it. A severed session is reported as a warning — the
-// resource is in the state the plan asked for; only the save is unconfirmed.
+// from the device on create or from state on update) to `to`.
+//
+// DNS changes are not in the SSH path and go first, through the ordinary
+// path. Gateway and address changes are session-risky — the address is the
+// one the provider is connected to, and the gateway is the switch's return
+// route to an off-subnet Terraform runner — so both require
+// allow_management_ip_change and go last, together, through the
+// disconnect-tolerant path with `end` and `write memory` queued behind them.
+// A severed session is reported as a warning: the resource is in the state
+// the plan asked for; only the save is unconfirmed.
 func (r *ManagementIPResource) apply(ctx context.Context, op string, from, to *ManagementIPResourceModel, diags *diag.Diagnostics) {
-	var commands []string
-	commands = append(commands, gatewayCommands(from.DefaultGateway, to.DefaultGateway)...)
-	commands = append(commands, dnsServerCommands(
+	dnsCommands := dnsServerCommands(
 		listToStringSlice(ctx, from.DNSServers, diags),
-		listToStringSlice(ctx, to.DNSServers, diags))...)
+		listToStringSlice(ctx, to.DNSServers, diags))
 	if diags.HasError() {
 		return
 	}
 
-	var ipCommand string
-	if !to.IPAddress.Equal(from.IPAddress) {
-		if !to.AllowManagementIPChange.ValueBool() {
+	// The risky batch: every command needed for the final addressing, in
+	// one write. Order: gateway first, then address, then (appended by
+	// ExecuteExpectingDisconnect) `end` and `write memory`.
+	//
+	// The whole batch is in the switch's input buffer before it executes the
+	// first line, and the shell normally runs every buffered line even after
+	// the TCP session is cut — which is why each line needed for the final
+	// state must be in it, not sent afterwards. Order still matters for the
+	// case where the shell dies with the session and drops what it has not
+	// yet run: the `ip address` change is the command certain to cut a
+	// runner connected through that address, whereas the gateway change only
+	// might. Putting the gateway first means it has already executed when
+	// the certain cut happens, so the device is never left with the new
+	// address and the old (possibly off-subnet) gateway; and a gateway-only
+	// change is followed directly by `end` + `write memory`. Whether FastIron
+	// accepts a gateway outside the current subnet before the address moves
+	// is not validated on a live device yet. If it rejected it, the address
+	// line and the save would still run (they are already buffered), leaving
+	// the new address with the old gateway; the CLI error is reported only if
+	// the session survives. That is the first thing to check on a lab switch.
+	gw := gatewayCommands(from.DefaultGateway, to.DefaultGateway)
+	ipChange := !to.IPAddress.Equal(from.IPAddress)
+	if !to.AllowManagementIPChange.ValueBool() {
+		if ipChange {
 			diags.AddAttributeError(path.Root("ip_address"), titleIPChangeRefused,
 				ipChangeRefusedMessage(from.IPAddress.ValueString(), to.IPAddress.ValueString()))
+		}
+		if len(gw) > 0 {
+			diags.AddAttributeError(path.Root("default_gateway"), titleGatewayChangeRefused,
+				gatewayChangeRefusedMessage(from.DefaultGateway.ValueString(), to.DefaultGateway.ValueString()))
+		}
+		if diags.HasError() {
 			return
 		}
+	}
+	var risky []string
+	var riskyAttr path.Path
+	if len(gw) > 0 {
+		risky = append(risky, gw...)
+		riskyAttr = path.Root("default_gateway")
+	}
+	if ipChange {
 		addrMask, err := cidrToAddressMask(to.IPAddress.ValueString())
 		if err != nil {
 			diags.AddError("Invalid IP address", err.Error())
 			return
 		}
-		ipCommand = "ip address " + addrMask
+		risky = append(risky, "ip address "+addrMask)
+		riskyAttr = path.Root("ip_address")
 	}
 
-	if len(commands) > 0 {
-		if err := r.client.ExecuteInConfigMode(commands); err != nil {
+	if len(dnsCommands) > 0 {
+		if err := r.client.ExecuteInConfigMode(dnsCommands); err != nil {
 			diags.AddError(fmt.Sprintf("Failed to %s management addressing", op), err.Error())
 			return
 		}
 	}
 
-	if ipCommand != "" {
-		err := r.client.ExecuteExpectingDisconnect([]string{ipCommand})
+	if len(risky) > 0 {
+		err := r.client.ExecuteExpectingDisconnect(risky)
 		switch {
 		case err == nil:
 			// Session survived and the batch's own `write memory` ran.
 		case errors.Is(err, sshclient.ErrSessionSevered):
-			diags.AddAttributeWarning(path.Root("ip_address"), titleIPChangeSevered,
-				ipChangeSeveredMessage(to.IPAddress.ValueString()))
+			diags.AddAttributeWarning(riskyAttr, titleIPChangeSevered, ipChangeSeveredMessage(risky))
 		default:
-			diags.AddError("Failed to set management IP address", err.Error())
+			diags.AddError(fmt.Sprintf("Failed to %s management addressing", op), err.Error())
 		}
 		return
 	}
 
-	if len(commands) > 0 {
+	if len(dnsCommands) > 0 {
 		if err := r.client.WriteMemory(); err != nil {
 			diags.AddError("Failed to save configuration", err.Error())
 		}
@@ -433,14 +543,18 @@ func managementFromConfig(_ context.Context, config *parser.RunningConfig, diags
 		DNSServers:              types.ListNull(types.StringType),
 		AllowManagementIPChange: types.BoolValue(false),
 	}
+	if config.Global.IPAddressDynamic {
+		diags.AddAttributeError(path.Root("ip_address"), titleDHCPAddress, dhcpAddressMessage(config.Global.IPAddress))
+		return m
+	}
 	if cidr := globalIPToCIDR(config.Global.IPAddress); cidr != "" {
 		m.IPAddress = types.StringValue(cidr)
 	} else if config.Global.IPAddress != "" {
 		diags.AddError("Unparseable management IP address",
 			fmt.Sprintf("The device's global `ip address %s` could not be read as address and mask.", config.Global.IPAddress))
 	}
-	if gw := strings.TrimSpace(config.Global.DefaultGateway); gw != "" {
-		m.DefaultGateway = types.StringValue(strings.Fields(gw)[0])
+	if gw := deviceGateway(config); gw != "" {
+		m.DefaultGateway = types.StringValue(gw)
 	}
 	if len(config.Global.DNSServers) > 0 {
 		elems := make([]attr.Value, len(config.Global.DNSServers))
@@ -454,9 +568,23 @@ func managementFromConfig(_ context.Context, config *parser.RunningConfig, diags
 	return m
 }
 
+// deviceGateway returns the device's global default gateway address, or "".
+func deviceGateway(config *parser.RunningConfig) string {
+	if gw := strings.Fields(config.Global.DefaultGateway); len(gw) > 0 {
+		return gw[0]
+	}
+	return ""
+}
+
+// isEmptyKnownList reports whether l is a known, non-null, empty list.
+func isEmptyKnownList(l types.List) bool {
+	return !l.IsNull() && !l.IsUnknown() && len(l.Elements()) == 0
+}
+
 // globalIPToCIDR converts the parser's global IP line ("10.0.20.5
-// 255.255.255.0", possibly followed by a keyword such as "dynamic") to CIDR,
-// or "" when there is none or it cannot be parsed.
+// 255.255.255.0", possibly followed by a keyword) to CIDR, or "" when there
+// is none or it cannot be parsed. A DHCP-learned ("dynamic") address is
+// flagged by the parser and refused before this is consulted.
 func globalIPToCIDR(raw string) string {
 	fields := strings.Fields(raw)
 	if len(fields) < 2 {
@@ -471,17 +599,14 @@ func globalIPToCIDR(raw string) string {
 
 // gatewayCommands moves the default gateway from `from` to `to`. FastIron
 // keeps a single gateway and `ip default-gateway <new>` replaces it, so a
-// change never passes through a gateway-less moment; only an explicit removal
-// (to null, from set) sends `no ip default-gateway`.
+// change never passes through a gateway-less moment. A null or unknown target
+// means "keep the device's" and sends nothing: default_gateway is
+// Optional+Computed, so Terraform never plans a removal, and this resource
+// never sends `no ip default-gateway` — removing the gateway can cut off an
+// off-subnet provider for good, exactly like Delete.
 func gatewayCommands(from, to types.String) []string {
-	if to.Equal(from) {
+	if to.IsNull() || to.IsUnknown() || to.ValueString() == "" || to.Equal(from) {
 		return nil
-	}
-	if to.IsNull() || to.ValueString() == "" {
-		if from.IsNull() || from.ValueString() == "" {
-			return nil
-		}
-		return []string{"no ip default-gateway " + from.ValueString()}
 	}
 	return []string{"ip default-gateway " + to.ValueString()}
 }

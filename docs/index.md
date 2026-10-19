@@ -66,7 +66,7 @@ Reference devices: 08.0.9x router = ICX 7250-24 (`08.0.95mT213`), ICX 7150-24 an
 
 -> **Migration note:** on FastIron 08.0.30 switch-image devices (ICX 6430) the DHCP client is reported correctly as disabled starting with this version. Set `dhcp_client_disable = true` to match before applying; see the [migration warning above](#router-image-vs-switch-image) for why. 08.0.9x and 08.0.30 router-image devices need no change.
 
-Universal settings — `hostname` on `icx_system`, and the switch-image management addressing where it applies — are available on every supported dialect; both are unit-tested against all six captures but have not yet been applied to a live 08.0.30 device.
+Universal settings — `hostname` on `icx_system`, and the switch-image management addressing where it applies — are available on every supported dialect; both are unit-tested against all six captures but have not yet been applied to any live device, on any firmware.
 
 A capability error names the attribute and the reason. For example, `manager_registrar = true` against an ICX 6430 fails `terraform plan` with: **Not supported by this firmware**: "The manager_registrar attribute of icx_system is not available on FastIron 08.0.30 (firmware 08.0.30uT311); the manager commands require FastIron 08.0.80 or later." Router-image features keep the **Router image required** error described above.
 

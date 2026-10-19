@@ -80,3 +80,41 @@ func TestParseGlobalManagement_Forms(t *testing.T) {
 		t.Errorf("domain-list must stay raw: dns=%v raw=%v", config.Global.DNSServers, config.RawLines)
 	}
 }
+
+// A DHCP-learned global address carries a trailing "dynamic" keyword; the
+// parser flags it (the raw value is kept as printed). Static addresses in
+// every fixture are not flagged.
+func TestParseGlobalManagement_DynamicAddress(t *testing.T) {
+	tests := []struct {
+		in      string
+		ip      string
+		dynamic bool
+	}{
+		{"ip address 10.0.20.50 255.255.255.0 dynamic\n", "10.0.20.50 255.255.255.0 dynamic", true},
+		{"ip address 10.0.20.5 255.255.255.0\n", "10.0.20.5 255.255.255.0", false},
+		{"ip address 10.0.20.5 dynamic\n", "10.0.20.5 dynamic", false}, // malformed: no mask
+	}
+	for _, tt := range tests {
+		config, err := ParseRunningConfig(tt.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if config.Global.IPAddress != tt.ip || config.Global.IPAddressDynamic != tt.dynamic {
+			t.Errorf("%q: IPAddress=%q dynamic=%v, want %q %v", tt.in, config.Global.IPAddress,
+				config.Global.IPAddressDynamic, tt.ip, tt.dynamic)
+		}
+	}
+	for _, fixture := range []string{"7150-c10zp", "6430-c12"} {
+		data, err := os.ReadFile("../../testdata/config." + fixture + ".txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		config, err := ParseRunningConfig(string(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if config.Global.IPAddressDynamic {
+			t.Errorf("%s: static address flagged as dynamic", fixture)
+		}
+	}
+}

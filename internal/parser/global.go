@@ -22,7 +22,8 @@ type GlobalSettings struct {
 	StaticRoutes            []string
 	DefaultNetwork          string
 	DefaultGateway          string
-	IPAddress               string   // Global IP (used on some models like c10zp)
+	IPAddress               string   // Global IP (used on some models like c10zp), as printed after "ip address "
+	IPAddressDynamic        bool     // the global IP line ends in "dynamic": a DHCP-learned address, not configuration
 	Hostname                string   // `hostname X`; empty when the device uses its default name
 	DNSServers              []string // `ip dns server-address A [B C D]`, in device order
 }
