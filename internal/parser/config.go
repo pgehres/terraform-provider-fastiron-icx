@@ -92,6 +92,14 @@ func (c *RunningConfig) parseStanza(lines []string) error {
 		c.Global.TelnetServerSet = true
 	case first == "ip dhcp-client disable":
 		c.Global.DHCPClientDisable = true
+	// FastIron 08.0.30 switch-image dialect (ICX 6430): the DHCP client is
+	// enabled by default and turned off with `no ip dhcp-client enable`.
+	// Both spellings map onto the same DHCPClientDisable field so Read agrees
+	// with what dialect.DHCPClientDisable renders.
+	case first == "no ip dhcp-client enable":
+		c.Global.DHCPClientDisable = true
+	case first == "ip dhcp-client enable":
+		c.Global.DHCPClientDisable = false
 	case first == "optical-monitor":
 		c.Global.OpticalMonitor = true
 	case first == "optical-monitor non-ruckus-optic-enable":

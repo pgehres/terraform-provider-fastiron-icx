@@ -9,8 +9,8 @@ import (
 // 08.0.95 fixtures: trunk untagged membership appears as `dual-mode <vlan>` on
 // the interface (a command that no longer exists on 08.0.95), and the DHCP
 // client is disabled via `no ip dhcp-client enable` rather than
-// `ip dhcp-client disable`. The parser must tolerate both without error; it is
-// not yet expected to interpret them.
+// `ip dhcp-client disable`. The parser interprets both: dual-mode as
+// EthernetInterface.DualModeVLAN, and the DHCP form as DHCPClientDisable.
 func TestParseRunningConfig6430C12(t *testing.T) {
 	text := loadTestConfig(t, "../../testdata/config.6430-c12.txt")
 	config, err := ParseRunningConfig(text)
@@ -51,6 +51,16 @@ func TestParseRunningConfig6430C12(t *testing.T) {
 	}
 	if config.Global.DefaultGateway != "10.0.20.9" {
 		t.Errorf("default gateway: %q", config.Global.DefaultGateway)
+	}
+	// `no ip dhcp-client enable` is the 08.0.30 switch-image spelling of
+	// `ip dhcp-client disable`.
+	if !config.Global.DHCPClientDisable {
+		t.Error("expected `no ip dhcp-client enable` to parse as DHCPClientDisable")
+	}
+	for _, l := range config.RawLines {
+		if l == "no ip dhcp-client enable" {
+			t.Error("`no ip dhcp-client enable` must not be left as a raw line")
+		}
 	}
 	if len(config.VEInterfaces) != 0 {
 		t.Errorf("expected no VE interfaces on switch image, got %d", len(config.VEInterfaces))
