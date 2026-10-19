@@ -57,7 +57,11 @@ const (
 	// one-shot, non-savable command whose effect is ordinary per-VLAN tagged
 	// membership — it does not subscribe the port to VLANs created later.
 	// Unknown firmware falls back to the per-VLAN spelling, which exists
-	// everywhere, so a command that might not exist is never sent.
+	// everywhere, so a command that might not exist is never sent. Having the
+	// capability is necessary but not sufficient: icx_interface_ethernet only
+	// uses the command when the provider opts in (native_bulk_tagging,
+	// experimental, default off) and the port is a tagged-only,
+	// non-management trunk.
 	CapVlanConfigAllTagged Capability = "vlan_config_all_tagged"
 )
 

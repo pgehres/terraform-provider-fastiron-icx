@@ -43,6 +43,9 @@ var rePortName = regexp.MustCompile(`^[^"\x00-\x1f]+$`)
 type InterfaceEthernetResource struct {
 	client  sshclient.CommandExecutor
 	dialect dialect.Dialect
+	// nativeBulkTagging is the provider's experimental native_bulk_tagging
+	// opt-in (default false). See bulkTaggingAllowed.
+	nativeBulkTagging bool
 }
 
 type InterfaceEthernetResourceModel struct {
@@ -182,6 +185,7 @@ func (r *InterfaceEthernetResource) Configure(_ context.Context, req resource.Co
 	}
 	r.client = data.Client
 	r.dialect = data.Dialect
+	r.nativeBulkTagging = data.NativeBulkTagging
 }
 
 // dialectFor returns the dialect to use against config: the Configure-time
@@ -287,12 +291,18 @@ func (r *InterfaceEthernetResource) Create(ctx context.Context, req resource.Cre
 		return
 	}
 	if len(vlanCommands) > 0 {
-		if err := r.client.ExecuteInConfigMode(vlanCommands); err != nil {
-			resp.Diagnostics.AddError("Failed to configure VLAN membership", err.Error())
-			return
-		}
-		r.verifyBulkTagging(vlanCommands, &plan, config, &resp.Diagnostics)
-		if resp.Diagnostics.HasError() {
+		execErr := r.client.ExecuteInConfigMode(vlanCommands)
+		if !r.sentBulk(vlanCommands, config) {
+			if execErr != nil {
+				resp.Diagnostics.AddError("Failed to configure VLAN membership", execErr.Error())
+				return
+			}
+		} else if _, failed := r.finishBulkTagging(execErr, &plan, config, &resp.Diagnostics); failed {
+			// Deliberately no state: a Create that returns an error with
+			// state set leaves the resource tainted, and the replace that
+			// follows strips every VLAN from the trunk (CLAUDE.md gotcha #9).
+			// Whatever the bulk command did has been saved; the next apply
+			// re-runs Create additively.
 			return
 		}
 	}
@@ -391,12 +401,23 @@ func (r *InterfaceEthernetResource) Update(ctx context.Context, req resource.Upd
 		return
 	}
 	if len(vlanCommands) > 0 {
-		if err := r.client.ExecuteInConfigMode(vlanCommands); err != nil {
-			resp.Diagnostics.AddError("Failed to update VLAN membership", err.Error())
-			return
-		}
-		r.verifyBulkTagging(vlanCommands, &plan, config, &resp.Diagnostics)
-		if resp.Diagnostics.HasError() {
+		execErr := r.client.ExecuteInConfigMode(vlanCommands)
+		if !r.sentBulk(vlanCommands, config) {
+			if execErr != nil {
+				resp.Diagnostics.AddError("Failed to update VLAN membership", execErr.Error())
+				return
+			}
+		} else if after, failed := r.finishBulkTagging(execErr, &plan, config, &resp.Diagnostics); failed {
+			// Record what the device actually has, as an explicit list with
+			// tag_all_vlans = false, so the next plan shows the remaining
+			// VLANs as an ordinary additive diff instead of hiding them
+			// behind tag_all_vlans (CLAUDE.md gotcha #8).
+			if after != nil {
+				plan.ID = state.ID
+				plan.TagAllVLANs = types.BoolValue(false)
+				r.readVLANMembership(ctx, plan.Port.ValueString(), after.FindEthernetInterface(plan.Port.ValueString()), after, &plan, &resp.Diagnostics)
+				resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+			}
 			return
 		}
 	}
@@ -675,18 +696,19 @@ func (r *InterfaceEthernetResource) buildVLANMembershipCommands(ctx context.Cont
 		)
 	}
 
-	// Add new tagged VLAN membership: one `tagged ethe` per VLAN, or — for a
-	// tag_all_vlans port on firmware that has it — the single bulk command.
+	// Add new tagged VLAN membership: one `tagged ethe` per VLAN, or — only
+	// when the provider opted in and the port is a tagged-only, non-management
+	// tag_all_vlans trunk (bulkTaggingAllowed) — the single bulk command.
 	var toAdd []int
 	for _, vlanID := range newTaggedVLANs {
 		if !intSliceContains(oldTaggedVLANs, vlanID) {
 			toAdd = append(toAdd, vlanID)
 		}
 	}
-	if d := r.dialectFor(config); len(toAdd) > 0 && usesBulkTagging(d, plan) {
+	if len(toAdd) > 0 && r.bulkTaggingAllowed(plan, config) {
 		commands = append(commands,
 			fmt.Sprintf("interface ethernet %s", port),
-			d.VlanConfigAddAllTagged(),
+			r.dialectFor(config).VlanConfigAddAllTagged(),
 			"exit",
 		)
 		return commands
@@ -702,57 +724,124 @@ func (r *InterfaceEthernetResource) buildVLANMembershipCommands(ctx context.Cont
 	return commands
 }
 
-// usesBulkTagging reports whether a tag_all_vlans apply on dialect d adds its
-// tagged membership with `vlan-config add all-tagged` (dialect.CapVlanConfigAllTagged,
-// FastIron 08.0.50+) instead of one `tagged ethe` per VLAN.
+// bulkTaggingAllowed reports whether this tag_all_vlans apply may add its
+// tagged membership with the single interface command
+// `vlan-config add all-tagged` (dialect.CapVlanConfigAllTagged, FastIron
+// 08.0.50+) instead of one `tagged ethe` per VLAN.
 //
-// The bulk command is a one-shot: it tags the port in every VLAN that exists
-// at that moment and is saved as ordinary per-VLAN membership, so Read and
-// Delete still work per VLAN and a VLAN created later is handled by
-// icx_vlan.Create exactly as before. The per-VLAN spelling stays the fallback
-// for firmware without the command, for unknown firmware (a command that may
-// not exist is never sent) and for the dual-mode dialect, whose membership is
-// built by buildDualModeMembershipCommands.
-func usesBulkTagging(d dialect.Dialect, plan *InterfaceEthernetResourceModel) bool {
-	return plan.TagAllVLANs.ValueBool() && !d.Has(dialect.CapDualMode) && d.Has(dialect.CapVlanConfigAllTagged)
+// The command is EXPERIMENTAL and strictly opt-in: it is never used unless the
+// provider sets native_bulk_tagging = true, and with that off every command
+// stream is the per-VLAN expansion byte for byte. Its documentation does not
+// say what it does to the default VLAN 1 or to the port's own untagged VLAN.
+// If it converted an uplink's untagged management VLAN to tagged, the SSH
+// session would die before any read-back could correct it — the same class of
+// self-inflicted outage as gotcha #9. So even when opted in it is used only on
+// a tagged-only trunk, and the per-VLAN form (which exists everywhere and is
+// always safe to fall back to) is used whenever:
+//
+//   - tag_all_vlans is off (the command is only ever a spelling of it);
+//   - the plan sets untagged_vlan, or the device shows the port as an untagged
+//     member of any VLAN (Create does not reconcile membership it was never
+//     told about, so the device is checked as well as the plan);
+//   - the dialect has dual-mode (08.0.5x-08.0.7x take the dual-mode builder
+//     first), lacks the command, or has an unknown version;
+//   - the port is the switch's detected management path (mgmtpath.go), or
+//     that path cannot be determined. This is the only check that costs a
+//     device read (`show arp`), so it runs last and only when everything
+//     else already allows bulk.
+//
+// The command is a one-shot: what `write memory` saves is ordinary per-VLAN
+// membership, so Read and Delete still work per VLAN and a VLAN created later
+// is still handled by icx_vlan.Create.
+func (r *InterfaceEthernetResource) bulkTaggingAllowed(plan *InterfaceEthernetResourceModel, config *parser.RunningConfig) bool {
+	if !r.nativeBulkTagging || !plan.TagAllVLANs.ValueBool() {
+		return false
+	}
+	if !plan.UntaggedVLAN.IsNull() && !plan.UntaggedVLAN.IsUnknown() && plan.UntaggedVLAN.ValueInt64() != 0 {
+		return false
+	}
+	d := r.dialectFor(config)
+	if !d.Known || d.Has(dialect.CapDualMode) || !d.Has(dialect.CapVlanConfigAllTagged) {
+		return false
+	}
+	port := plan.Port.ValueString()
+	for _, vlan := range config.VLANs {
+		if stringSliceContains(vlan.UntaggedPorts, port) {
+			return false
+		}
+	}
+	found, reason := managementPathPorts(r.client, config)
+	if reason != "" {
+		return false
+	}
+	for _, p := range found {
+		if p == port {
+			return false
+		}
+	}
+	return true
 }
 
-// verifyBulkTagging makes the bulk and per-VLAN tagging paths converge on the
-// same device state. It runs after sent has been executed and does nothing
-// unless sent contained the bulk command.
+// sentBulk reports whether the membership stream contains the bulk command.
+func (r *InterfaceEthernetResource) sentBulk(sent []string, before *parser.RunningConfig) bool {
+	return stringSliceContains(sent, r.dialectFor(before).VlanConfigAddAllTagged())
+}
+
+// finishBulkTagging runs after a membership stream containing the bulk
+// command was executed, successfully or not (execErr). It re-reads the running
+// config and removes any tag the per-VLAN expansion would not have set (see
+// bulkTaggingCorrections) — the command is undocumented on VLAN 1, so this is
+// best-effort until validated on hardware.
 //
-// `vlan-config add all-tagged` is documented only as "adds the interface to
-// all VLANs as a tagged member". The provider's tag_all_vlans expansion
-// deliberately leaves out the default VLAN 1 and the port's own untagged VLAN,
-// and whether the bulk command also skips them is not documented, so instead of
-// guessing the port's membership is re-read from the switch and anything the
-// expansion would not have tagged is removed again: `no tagged ethe` in VLAN 1,
-// and in the untagged VLAN (restoring its `untagged ethe` membership if the
-// switch had converted it). A device that already skips both — what the
-// fleet's running configs suggest — sends nothing here.
-func (r *InterfaceEthernetResource) verifyBulkTagging(sent []string, plan *InterfaceEthernetResourceModel, before *parser.RunningConfig, diags *diag.Diagnostics) {
+// When execErr is set (the switch printed an `error - ...` line, or the
+// session failed part-way), the bulk command may have tagged some VLANs before
+// refusing the rest. Rather than leave that partial change in the running
+// config only — unsaved, divergent from startup, and re-attempted on every
+// apply — it still verifies, saves what succeeded with `write memory`, and
+// reports the error. It returns the re-read config (nil if that read failed),
+// from which the caller records state, and whether the apply failed.
+func (r *InterfaceEthernetResource) finishBulkTagging(execErr error, plan *InterfaceEthernetResourceModel, before *parser.RunningConfig, diags *diag.Diagnostics) (*parser.RunningConfig, bool) {
 	bulk := r.dialectFor(before).VlanConfigAddAllTagged()
-	if !stringSliceContains(sent, bulk) {
-		return
-	}
-	after, err := r.getRunningConfig()
-	if err != nil {
+	port := plan.Port.ValueString()
+	failed := execErr != nil
+
+	after, readErr := r.getRunningConfig()
+	if readErr != nil {
+		failed = true
 		diags.AddError("Failed to verify bulk VLAN tagging",
-			fmt.Sprintf("`%s` was sent for port %s but the running config could not be re-read to check its effect "+
-				"on VLAN 1 and the untagged VLAN: %s", bulk, plan.Port.ValueString(), err.Error()))
-		return
+			fmt.Sprintf("`%s` was sent for port %s but the running config could not be re-read to check its effect: %s",
+				bulk, port, readErr.Error()))
+	} else {
+		var untagged int
+		if !plan.UntaggedVLAN.IsNull() && !plan.UntaggedVLAN.IsUnknown() {
+			untagged = int(plan.UntaggedVLAN.ValueInt64())
+		}
+		if corrections := bulkTaggingCorrections(after, port, untagged); len(corrections) > 0 {
+			if err := r.client.ExecuteInConfigMode(corrections); err != nil {
+				failed = true
+				diags.AddError("Failed to correct bulk VLAN tagging", err.Error())
+			}
+		}
 	}
-	var untagged int
-	if !plan.UntaggedVLAN.IsNull() {
-		untagged = int(plan.UntaggedVLAN.ValueInt64())
+	if execErr == nil {
+		// Success (or a verification failure): the caller's normal path
+		// saves, or its error return skips the save as before.
+		return after, failed
 	}
-	corrections := bulkTaggingCorrections(after, plan.Port.ValueString(), untagged)
-	if len(corrections) == 0 {
-		return
+
+	saved := "The partial change has been saved with `write memory`, so the running and startup configs agree."
+	if err := r.client.WriteMemory(); err != nil {
+		saved = "Saving the partial change with `write memory` also failed (" + err.Error() +
+			"), so the running config may differ from the startup config until the next successful apply."
 	}
-	if err := r.client.ExecuteInConfigMode(corrections); err != nil {
-		diags.AddError("Failed to correct bulk VLAN tagging", err.Error())
-	}
+	diags.AddError("Bulk VLAN tagging failed",
+		fmt.Sprintf("`%s` on port %s failed: %s. It may have tagged the port in some VLANs before failing. %s "+
+			"On an update, state records the port's membership as read back from the device (tag_all_vlans = false "+
+			"with the actual tagged_vlans), so the next plan shows the remaining VLANs as an additive change; on a "+
+			"create no state is recorded and the next apply re-runs the create, which is additive. Remove the configuration the switch objected to, or set "+
+			"native_bulk_tagging = false on the provider to use one `tagged ethe` per VLAN.",
+			bulk, port, execErr.Error(), saved))
+	return after, true
 }
 
 // bulkTaggingCorrections returns the VLAN-context commands that bring port's

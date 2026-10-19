@@ -9,18 +9,23 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
 )
 
 // These tests cover the two spellings of a tag_all_vlans apply: the bulk
-// `vlan-config add all-tagged` interface command on FastIron 08.0.50+
-// (dialect.CapVlanConfigAllTagged) and the per-VLAN `tagged ethe` expansion
+// `vlan-config add all-tagged` interface command (experimental, opt-in through
+// the provider's native_bulk_tagging, FastIron 08.0.50+, tagged-only
+// non-management trunks only) and the per-VLAN `tagged ethe` expansion
 // everywhere else. They run against the real ICX 7250-24 capture (08.0.95,
-// VLANs 1/10/20/30/40/50/60/70; port 1/1/16 untagged in 20, port 1/1/15
-// untagged in 20 and tagged in 30-70) and the ICX 6430-C12 capture (08.0.30).
+// VLANs 1/10/20/30/40/50/60/70, default route via 10.0.20.1; port 1/1/16
+// untagged in 20, 1/1/15 untagged in 20 and tagged in 30-70, 1/1/22 tagged in
+// 20 only and untagged nowhere, 1/2/1 untagged in management VLAN 20 and
+// tagged in the rest) and the ICX 6430-C12 capture (08.0.30).
 
 const bulkCmd = "vlan-config add all-tagged"
 
@@ -29,34 +34,50 @@ var (
 	dialect08030 = dialect.Detect("08.0.30uT311", parser.ImageTypeSwitch)
 )
 
-// runCreate runs Create for plan against cfg under dialect d and returns the
-// mock, so callers can inspect the command stream including config reads.
-func runCreate(t *testing.T, cfg string, d dialect.Dialect, plan *InterfaceEthernetResourceModel) (*sshclient.MockClient, resource.CreateResponse) {
-	t.Helper()
-	mock := sshclient.NewMockClient(cfg)
-	r := &InterfaceEthernetResource{client: mock, dialect: d}
-	_, p := ethStateAndPlan(t, r, nil, plan)
-	state, _ := ethStateAndPlan(t, r, nil, nil)
-	resp := resource.CreateResponse{State: state}
-	r.Create(context.Background(), resource.CreateRequest{Plan: p}, &resp)
-	return mock, resp
+// arpVia is router-image `show arp` output placing the 7250's management next
+// hop (its default route, 10.0.20.1) behind port.
+func arpVia(port string) string {
+	return "Total number of ARP entries: 1\n" +
+		"   1     10.0.20.1       0000.5e00.0101  Dynamic 0   " + port + "  Valid\n"
 }
 
-func runUpdate(t *testing.T, cfg string, d dialect.Dialect, state, plan *InterfaceEthernetResourceModel) (*sshclient.MockClient, resource.UpdateResponse) {
+// applyEth runs Create (state == nil) or Update against exec and returns the
+// diagnostics and the state the operation recorded (nil when none was set).
+func applyEth(t *testing.T, exec sshclient.CommandExecutor, d dialect.Dialect, bulk bool, state, plan *InterfaceEthernetResourceModel) (diag.Diagnostics, *InterfaceEthernetResourceModel) {
 	t.Helper()
-	mock := sshclient.NewMockClient(cfg)
-	r := &InterfaceEthernetResource{client: mock, dialect: d}
+	ctx := context.Background()
+	r := &InterfaceEthernetResource{client: exec, dialect: d, nativeBulkTagging: bulk}
+	var diags diag.Diagnostics
+	var recorded InterfaceEthernetResourceModel
+	if state == nil {
+		_, p := ethStateAndPlan(t, r, nil, plan)
+		empty, _ := ethStateAndPlan(t, r, nil, nil)
+		resp := resource.CreateResponse{State: empty}
+		r.Create(ctx, resource.CreateRequest{Plan: p}, &resp)
+		diags = resp.Diagnostics
+		if resp.State.Raw.IsNull() {
+			return diags, nil
+		}
+		if dd := resp.State.Get(ctx, &recorded); dd.HasError() {
+			t.Fatalf("read back state: %v", dd)
+		}
+		return diags, &recorded
+	}
 	s, p := ethStateAndPlan(t, r, state, plan)
 	resp := resource.UpdateResponse{State: s}
-	r.Update(context.Background(), resource.UpdateRequest{Plan: p, State: s}, &resp)
-	return mock, resp
+	r.Update(ctx, resource.UpdateRequest{Plan: p, State: s}, &resp)
+	if dd := resp.State.Get(ctx, &recorded); dd.HasError() {
+		t.Fatalf("read back state: %v", dd)
+	}
+	return resp.Diagnostics, &recorded
 }
 
-func mustOK(t *testing.T, what string, diags interface{ HasError() bool }, errs any) {
+func mockApply(t *testing.T, cfg string, d dialect.Dialect, bulk bool, state, plan *InterfaceEthernetResourceModel) (*sshclient.MockClient, diag.Diagnostics) {
 	t.Helper()
-	if diags.HasError() {
-		t.Fatalf("%s error: %v", what, errs)
-	}
+	mock := sshclient.NewMockClient(cfg)
+	mock.Responses["show arp"] = arpVia("1/2/1")
+	diags, _ := applyEth(t, mock, d, bulk, state, plan)
+	return mock, diags
 }
 
 func countCommand(cmds []string, want string) int {
@@ -69,106 +90,149 @@ func countCommand(cmds []string, want string) int {
 	return n
 }
 
-// --- command generation ---------------------------------------------------
+func without(cmds []string, drop string) []string {
+	var out []string
+	for _, c := range cmds {
+		if c != drop {
+			out = append(out, c)
+		}
+	}
+	return out
+}
 
-// 08.0.95: a tag_all_vlans create sends the untagged membership, then the one
-// bulk command in interface context, then re-reads the config to verify it.
-func TestInterfaceEthernetCreate_TagAllBulkOn08095(t *testing.T) {
-	mock, resp := runCreate(t, loadFixture(t, "7250-24"), dialect08095, ethModel("1/1/16", 20, nil, true))
-	mustOK(t, "Create", resp.Diagnostics, resp.Diagnostics)
+// fixture15 is the 7250 capture with 1/1/15 also tagged in VLAN 10, so a
+// state saying tag_all_vlans = true for it matches the device.
+func fixture15(t *testing.T) string {
+	t.Helper()
+	return strings.Replace(loadFixture(t, "7250-24"),
+		" tagged ethe 1/1/19 to 1/1/20 ethe 1/2/1 ethe 1/2/3 to 1/2/8\n",
+		" tagged ethe 1/1/15 ethe 1/1/19 to 1/1/20 ethe 1/2/1 ethe 1/2/3 to 1/2/8\n", 1)
+}
+
+// --- default off: byte-identical to main -----------------------------------
+
+// mainCommandStreams is the exact mock command stream (config reads and
+// write memory included) that origin/main — the per-VLAN expansion, before
+// vlan-config bulk tagging existed — produces for each tag_all_vlans scenario
+// on the 08.0.95 7250 capture. Captured by running these scenarios on main.
+var mainCommandStreams = map[string][]string{
+	"create trunk with untagged":   []string{"show running-config", "interface ethernet 1/1/16", "exit", "vlan 20", "untagged ethe 1/1/16", "exit", "vlan 10", "tagged ethe 1/1/16", "exit", "vlan 30", "tagged ethe 1/1/16", "exit", "vlan 40", "tagged ethe 1/1/16", "exit", "vlan 50", "tagged ethe 1/1/16", "exit", "vlan 60", "tagged ethe 1/1/16", "exit", "vlan 70", "tagged ethe 1/1/16", "exit", "write memory"},
+	"create trunk no untagged":     []string{"show running-config", "interface ethernet 1/1/16", "exit", "vlan 10", "tagged ethe 1/1/16", "exit", "vlan 20", "tagged ethe 1/1/16", "exit", "vlan 30", "tagged ethe 1/1/16", "exit", "vlan 40", "tagged ethe 1/1/16", "exit", "vlan 50", "tagged ethe 1/1/16", "exit", "vlan 60", "tagged ethe 1/1/16", "exit", "vlan 70", "tagged ethe 1/1/16", "exit", "write memory"},
+	"create trunk moving untagged": []string{"show running-config", "interface ethernet 1/1/16", "exit", "vlan 30", "untagged ethe 1/1/16", "exit", "vlan 10", "tagged ethe 1/1/16", "exit", "vlan 20", "tagged ethe 1/1/16", "exit", "vlan 40", "tagged ethe 1/1/16", "exit", "vlan 50", "tagged ethe 1/1/16", "exit", "vlan 60", "tagged ethe 1/1/16", "exit", "vlan 70", "tagged ethe 1/1/16", "exit", "write memory"},
+	"create tagged-only trunk":     []string{"show running-config", "interface ethernet 1/1/22", "exit", "vlan 10", "tagged ethe 1/1/22", "exit", "vlan 20", "tagged ethe 1/1/22", "exit", "vlan 30", "tagged ethe 1/1/22", "exit", "vlan 40", "tagged ethe 1/1/22", "exit", "vlan 50", "tagged ethe 1/1/22", "exit", "vlan 60", "tagged ethe 1/1/22", "exit", "vlan 70", "tagged ethe 1/1/22", "exit", "write memory"},
+	"create with untagged 1":       []string{"show running-config", "interface ethernet 1/1/22", "exit", "vlan 1", "untagged ethe 1/1/22", "exit", "vlan 10", "tagged ethe 1/1/22", "exit", "vlan 20", "tagged ethe 1/1/22", "exit", "vlan 30", "tagged ethe 1/1/22", "exit", "vlan 40", "tagged ethe 1/1/22", "exit", "vlan 50", "tagged ethe 1/1/22", "exit", "vlan 60", "tagged ethe 1/1/22", "exit", "vlan 70", "tagged ethe 1/1/22", "exit", "write memory"},
+	"explicit to tag_all":          []string{"show running-config", "vlan 10", "tagged ethe 1/1/15", "exit", "write memory"},
+	"drifted trunk repair":         []string{"show running-config", "vlan 10", "tagged ethe 1/1/15", "exit", "vlan 60", "tagged ethe 1/1/15", "exit", "vlan 70", "tagged ethe 1/1/15", "exit", "write memory"},
+	"tag_all change untagged":      []string{"show running-config", "vlan 20", "no untagged ethe 1/1/15", "exit", "vlan 30", "no tagged ethe 1/1/15", "exit", "vlan 30", "untagged ethe 1/1/15", "exit", "vlan 20", "tagged ethe 1/1/15", "exit", "write memory"},
+	"tag_all drop untagged":        []string{"show running-config", "vlan 20", "no untagged ethe 1/1/15", "exit", "vlan 20", "tagged ethe 1/1/15", "exit", "write memory"},
+	"tag_all no change":            []string{"show running-config"},
+}
+
+type tagAllScenario struct {
+	name        string
+	fixture     func(*testing.T) string
+	state, plan *InterfaceEthernetResourceModel
+}
+
+func tagAllScenarios() []tagAllScenario {
+	fx := func(t *testing.T) string { return loadFixture(t, "7250-24") }
+	return []tagAllScenario{
+		{"create trunk with untagged", fx, nil, ethModel("1/1/16", 20, nil, true)},
+		{"create trunk no untagged", fx, nil, ethModel("1/1/16", 0, nil, true)},
+		{"create trunk moving untagged", fixture15, nil, ethModel("1/1/16", 30, nil, true)},
+		{"create tagged-only trunk", fixture15, nil, ethModel("1/1/22", 0, nil, true)},
+		{"create with untagged 1", fixture15, nil, ethModel("1/1/22", 1, nil, true)},
+		{"explicit to tag_all", fx, ethModel("1/1/15", 20, []int64{30, 40, 50, 60, 70}, false), ethModel("1/1/15", 20, nil, true)},
+		{"drifted trunk repair", fixture15, ethModel("1/1/15", 20, []int64{30, 40, 50}, false), ethModel("1/1/15", 20, nil, true)},
+		{"tag_all change untagged", fx, ethModel("1/1/15", 20, nil, true), ethModel("1/1/15", 30, nil, true)},
+		{"tag_all drop untagged", fixture15, ethModel("1/1/15", 20, nil, true), ethModel("1/1/15", 0, nil, true)},
+		{"tag_all no change", fx, ethModel("1/1/15", 20, nil, true), ethModel("1/1/15", 20, nil, true)},
+	}
+}
+
+// With native_bulk_tagging unset (false), every tag_all_vlans scenario sends
+// exactly what main sends — same commands, same order, same config reads, no
+// `show arp`, same write memory — even on firmware that has the command and
+// with a resolvable management path.
+func TestTagAll_DefaultOffIsByteIdenticalToMain(t *testing.T) {
+	for _, sc := range tagAllScenarios() {
+		want, ok := mainCommandStreams[sc.name]
+		if !ok {
+			t.Fatalf("no main baseline for %q", sc.name)
+		}
+		mock, diags := mockApply(t, sc.fixture(t), dialect08095, false, sc.state, sc.plan)
+		if diags.HasError() {
+			t.Fatalf("%s: %v", sc.name, diags)
+		}
+		if !reflect.DeepEqual(mock.Commands, want) {
+			t.Errorf("%s: flag off diverges from main:\n got %q\nwant %q", sc.name, mock.Commands, want)
+		}
+	}
+}
+
+// Configure threads the provider's opt-in through to the resource.
+func TestTagAll_ConfigureThreadsFlag(t *testing.T) {
+	r := &InterfaceEthernetResource{}
+	var resp resource.ConfigureResponse
+	r.Configure(context.Background(), resource.ConfigureRequest{ProviderData: providerDataWith(true)}, &resp)
+	if resp.Diagnostics.HasError() || !r.nativeBulkTagging {
+		t.Fatalf("Configure must thread NativeBulkTagging through, got %v (%v)", r.nativeBulkTagging, resp.Diagnostics)
+	}
+	r2 := &InterfaceEthernetResource{}
+	r2.Configure(context.Background(), resource.ConfigureRequest{ProviderData: providerDataWith(false)}, &resp)
+	if r2.nativeBulkTagging {
+		t.Fatal("default provider data must leave bulk tagging off")
+	}
+}
+
+func providerDataWith(bulk bool) *providerdata.ProviderData {
+	return &providerdata.ProviderData{Client: sshclient.NewMockClient(""), NativeBulkTagging: bulk}
+}
+
+// --- opted in: when bulk is and is not used --------------------------------
+
+// Opted in, on a tagged-only, non-management trunk on 08.0.95: the
+// management path is checked (one `show arp`), the bulk command is sent in
+// interface context, and the config is re-read once to verify it.
+func TestTagAll_OptInBulkOnTaggedOnlyTrunk(t *testing.T) {
+	mock, diags := mockApply(t, loadFixture(t, "7250-24"), dialect08095, true, nil, ethModel("1/1/22", 0, nil, true))
+	if diags.HasError() {
+		t.Fatal(diags)
+	}
 	want := []string{
-		"interface ethernet 1/1/16", "exit",
-		"vlan 20", "untagged ethe 1/1/16", "exit",
-		"interface ethernet 1/1/16", bulkCmd, "exit",
+		"show running-config",
+		"interface ethernet 1/1/22", "exit",
+		"show arp",
+		"interface ethernet 1/1/22", bulkCmd, "exit",
+		"show running-config",
+		"write memory",
 	}
-	if got := cliOf(mock); !reflect.DeepEqual(got, want) {
-		t.Errorf("commands:\n got %q\nwant %q", got, want)
-	}
-	if n := countCommand(mock.Commands, "show running-config"); n != 2 {
-		t.Errorf("expected the bulk apply to re-read the running config once (2 reads total), got %d", n)
-	}
-	if mock.WriteMemoryCalls != 1 {
-		t.Errorf("write memory calls = %d, want 1", mock.WriteMemoryCalls)
+	if !reflect.DeepEqual(mock.Commands, want) {
+		t.Errorf("commands:\n got %q\nwant %q", mock.Commands, want)
 	}
 }
 
 // The provider's dialect may be unknown while the config's own `ver` line is
-// parseable: the config is evidence enough for the bulk command.
-func TestInterfaceEthernetCreate_TagAllBulkFromConfigVersion(t *testing.T) {
-	mock, resp := runCreate(t, loadFixture(t, "7250-24"), dialect.Dialect{}, ethModel("1/1/16", 0, nil, true))
-	mustOK(t, "Create", resp.Diagnostics, resp.Diagnostics)
+// parseable: that is evidence enough.
+func TestTagAll_OptInBulkFromConfigVersion(t *testing.T) {
+	mock, diags := mockApply(t, loadFixture(t, "7250-24"), dialect.Dialect{}, true, nil, ethModel("1/1/22", 0, nil, true))
+	if diags.HasError() {
+		t.Fatal(diags)
+	}
 	if countCommand(mock.Commands, bulkCmd) != 1 {
-		t.Errorf("expected %q with an 08.0.95 ver line, got %q", bulkCmd, cliOf(mock))
+		t.Errorf("expected %q with an 08.0.95 ver line, got %q", bulkCmd, mock.Commands)
 	}
 }
 
-// No firmware evidence at all: the per-VLAN expansion, never a command that
-// might not exist. Exactly one config read (nothing to verify).
-func TestInterfaceEthernetCreate_TagAllExpansionOnUnknownFirmware(t *testing.T) {
-	cfg := stripDialectEvidence(loadFixture(t, "7250-24"))
-	mock, resp := runCreate(t, cfg, dialect.Dialect{}, ethModel("1/1/16", 20, nil, true))
-	mustOK(t, "Create", resp.Diagnostics, resp.Diagnostics)
-	want := []string{
-		"interface ethernet 1/1/16", "exit",
-		"vlan 20", "untagged ethe 1/1/16", "exit",
-		"vlan 10", "tagged ethe 1/1/16", "exit",
-		"vlan 30", "tagged ethe 1/1/16", "exit",
-		"vlan 40", "tagged ethe 1/1/16", "exit",
-		"vlan 50", "tagged ethe 1/1/16", "exit",
-		"vlan 60", "tagged ethe 1/1/16", "exit",
-		"vlan 70", "tagged ethe 1/1/16", "exit",
+// The explicit-list -> tag_all_vlans transition (the shape a drift repair
+// takes) on a tagged-only trunk adds with the bulk command and removes nothing.
+func TestTagAll_OptInUpdateExplicitToTagAllUsesBulk(t *testing.T) {
+	mock, diags := mockApply(t, loadFixture(t, "7250-24"), dialect08095, true,
+		ethModel("1/1/22", 0, []int64{20}, false), ethModel("1/1/22", 0, nil, true))
+	if diags.HasError() {
+		t.Fatal(diags)
 	}
-	if got := cliOf(mock); !reflect.DeepEqual(got, want) {
-		t.Errorf("commands:\n got %q\nwant %q", got, want)
-	}
-	if n := countCommand(mock.Commands, "show running-config"); n != 1 {
-		t.Errorf("expansion path must not re-read the config, got %d reads", n)
-	}
-}
-
-// FastIron 08.0.30 predates vlan-config (08.0.50): the dual-mode builder's
-// per-VLAN expansion is used and the bulk command never appears.
-func TestInterfaceEthernetCreate_TagAllNeverBulkOn08030(t *testing.T) {
-	mock, resp := runCreate(t, loadFixture(t, "6430-c12"), dialect08030, ethModel("1/1/7", 102, nil, true))
-	mustOK(t, "Create", resp.Diagnostics, resp.Diagnostics)
-	cmds := cliOf(mock)
-	if countCommand(cmds, bulkCmd) != 0 {
-		t.Errorf("08.0.30 must never send %q, got %q", bulkCmd, cmds)
-	}
-	if countCommand(cmds, "tagged ethe 1/1/7") == 0 {
-		t.Errorf("expected per-VLAN tagging on 08.0.30, got %q", cmds)
-	}
-	if n := countCommand(mock.Commands, "show running-config"); n != 1 {
-		t.Errorf("dual-mode path must not re-read the config, got %d reads", n)
-	}
-}
-
-// An explicit tagged_vlans create is untouched by the capability: the bulk
-// command is only ever a spelling of tag_all_vlans.
-func TestInterfaceEthernetCreate_ExplicitTaggedNeverBulk(t *testing.T) {
-	mock, resp := runCreate(t, loadFixture(t, "7250-24"), dialect08095, ethModel("1/1/16", 20, []int64{30, 10}, false))
-	mustOK(t, "Create", resp.Diagnostics, resp.Diagnostics)
-	want := []string{
-		"interface ethernet 1/1/16", "exit",
-		"vlan 20", "untagged ethe 1/1/16", "exit",
-		"vlan 10", "tagged ethe 1/1/16", "exit",
-		"vlan 30", "tagged ethe 1/1/16", "exit",
-	}
-	if got := cliOf(mock); !reflect.DeepEqual(got, want) {
-		t.Errorf("commands:\n got %q\nwant %q", got, want)
-	}
-}
-
-// Update from an explicit list to tag_all_vlans — the shape Read produces when
-// it reports a drifted trunk (tag_all_vlans = false, tagged_vlans = actual) —
-// adds the missing VLANs with the bulk command and removes nothing.
-func TestInterfaceEthernetUpdate_ExplicitToTagAllUsesBulk(t *testing.T) {
-	mock, resp := runUpdate(t, loadFixture(t, "7250-24"), dialect08095,
-		ethModel("1/1/15", 20, []int64{30, 40, 50, 60, 70}, false),
-		ethModel("1/1/15", 20, nil, true))
-	mustOK(t, "Update", resp.Diagnostics, resp.Diagnostics)
-	want := []string{"interface ethernet 1/1/15", bulkCmd, "exit"}
-	if got := cliOf(mock); !reflect.DeepEqual(got, want) {
+	if got, want := cliOf(mock), []string{"show arp", "interface ethernet 1/1/22", bulkCmd, "exit"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("commands:\n got %q\nwant %q", got, want)
 	}
 	if mock.WriteMemoryCalls != 1 {
@@ -176,104 +240,99 @@ func TestInterfaceEthernetUpdate_ExplicitToTagAllUsesBulk(t *testing.T) {
 	}
 }
 
-// Same transition on unknown firmware: only the one missing VLAN, per VLAN.
-func TestInterfaceEthernetUpdate_ExplicitToTagAllExpansionOnUnknownFirmware(t *testing.T) {
-	cfg := stripDialectEvidence(loadFixture(t, "7250-24"))
-	mock, resp := runUpdate(t, cfg, dialect.Dialect{},
-		ethModel("1/1/15", 20, []int64{30, 40, 50, 60, 70}, false),
-		ethModel("1/1/15", 20, nil, true))
-	mustOK(t, "Update", resp.Diagnostics, resp.Diagnostics)
-	want := []string{"vlan 10", "tagged ethe 1/1/15", "exit"}
-	if got := cliOf(mock); !reflect.DeepEqual(got, want) {
-		t.Errorf("commands:\n got %q\nwant %q", got, want)
+// Even opted in, the bulk command is never used — and the stream is exactly
+// the flag-off stream, apart from a `show arp` where the management path had
+// to be checked — when the port has an untagged VLAN (in the plan or on the
+// device), is the management path or the path cannot be determined, the
+// firmware lacks the command or is unknown, or the membership is an explicit
+// list.
+func TestTagAll_OptInNeverBulk(t *testing.T) {
+	fx := loadFixture(t, "7250-24")
+	tests := []struct {
+		name    string
+		cfg     string
+		d       dialect.Dialect
+		arp     string // "" = no `show arp` answer
+		state   *InterfaceEthernetResourceModel
+		plan    *InterfaceEthernetResourceModel
+		wantArp bool
+	}{
+		{name: "plan untagged_vlan", cfg: fx, d: dialect08095, arp: arpVia("1/2/1"), plan: ethModel("1/1/16", 20, nil, true)},
+		{name: "plan untagged_vlan 1", cfg: fx, d: dialect08095, arp: arpVia("1/2/1"), plan: ethModel("1/1/22", 1, nil, true)},
+		{name: "plan untagged_vlan on update", cfg: fixture15(t), d: dialect08095, arp: arpVia("1/2/1"),
+			state: ethModel("1/1/15", 20, nil, true), plan: ethModel("1/1/15", 30, nil, true)},
+		// The plan omits untagged_vlan, but the device has 1/1/16 untagged in 20.
+		{name: "device untagged", cfg: fx, d: dialect08095, arp: arpVia("1/2/1"), plan: ethModel("1/1/16", 0, nil, true)},
+		// The 7150-24 uplink shape: untagged in management VLAN 20, tagged in the rest.
+		{name: "management uplink 1/2/1", cfg: fx, d: dialect08095, arp: arpVia("1/2/1"),
+			state: ethModel("1/2/1", 20, []int64{10, 30, 40}, false), plan: ethModel("1/2/1", 20, nil, true)},
+		{name: "tagged-only port is the management path", cfg: fx, d: dialect08095, arp: arpVia("1/1/22"),
+			plan: ethModel("1/1/22", 0, nil, true), wantArp: true},
+		{name: "management path undeterminable", cfg: fx, d: dialect08095, arp: "",
+			plan: ethModel("1/1/22", 0, nil, true), wantArp: true},
+		{name: "unknown firmware", cfg: stripDialectEvidence(fx), d: dialect.Dialect{}, arp: arpVia("1/2/1"),
+			plan: ethModel("1/1/22", 0, nil, true)},
+		{name: "08.0.30 dual-mode dialect", cfg: loadFixture(t, "6430-c12"), d: dialect08030, arp: arpVia("1/2/1"),
+			plan: ethModel("1/1/7", 0, nil, true)},
+		{name: "explicit tagged_vlans", cfg: fx, d: dialect08095, arp: arpVia("1/2/1"),
+			plan: ethModel("1/1/22", 0, []int64{10, 30}, false)},
+	}
+	for _, tt := range tests {
+		run := func(bulk bool) *sshclient.MockClient {
+			mock := sshclient.NewMockClient(tt.cfg)
+			if tt.arp != "" {
+				mock.Responses["show arp"] = tt.arp
+			}
+			diags, _ := applyEth(t, mock, tt.d, bulk, tt.state, tt.plan)
+			if diags.HasError() {
+				t.Fatalf("%s (bulk=%v): %v", tt.name, bulk, diags)
+			}
+			return mock
+		}
+		on, off := run(true), run(false)
+		if countCommand(on.Commands, bulkCmd) != 0 {
+			t.Errorf("%s: bulk command sent: %q", tt.name, on.Commands)
+		}
+		if got := countCommand(on.Commands, "show arp"); (got == 1) != tt.wantArp || got > 1 {
+			t.Errorf("%s: show arp sent %d times, want it only when every other check allowed bulk (%v)", tt.name, got, tt.wantArp)
+		}
+		if got, want := without(on.Commands, "show arp"), off.Commands; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: opted-in stream differs from the per-VLAN stream:\n got %q\nwant %q", tt.name, got, want)
+		}
 	}
 }
 
-// Changing the untagged VLAN of a tag_all_vlans trunk: removals stay per VLAN
-// and precede the new untagged membership; the old untagged VLAN then joins
-// the tagged set through the bulk command.
-func TestInterfaceEthernetUpdate_TagAllChangeUntaggedUsesBulkForAdd(t *testing.T) {
+// A tag_all_vlans trunk with nothing to add sends nothing — not even `show arp`.
+func TestTagAll_OptInNoChangeSendsNothing(t *testing.T) {
+	mock, diags := mockApply(t, loadFixture(t, "7250-24"), dialect08095, true,
+		ethModel("1/1/20", 0, nil, true), ethModel("1/1/20", 0, nil, true))
+	if diags.HasError() {
+		t.Fatal(diags)
+	}
+	if !reflect.DeepEqual(mock.Commands, []string{"show running-config"}) {
+		t.Errorf("expected a single config read, got %q", mock.Commands)
+	}
+}
+
+// --- verification and failure handling -------------------------------------
+
+// If the re-read shows the bulk command tagged VLAN 1 — undocumented, and
+// still unverified on hardware — that tag is removed again, best-effort.
+func TestTagAll_OptInBulkCorrectsDefaultVLAN(t *testing.T) {
+	fx := loadFixture(t, "7250-24")
+	mock := sshclient.NewMockClient(fx)
+	mock.Responses["show arp"] = arpVia("1/2/1")
+	mock.RunningConfigQueue = []string{fx, strings.Replace(fx,
+		"vlan 1 name DEFAULT-VLAN by port\n", "vlan 1 name DEFAULT-VLAN by port\n tagged ethe 1/1/22\n", 1)}
+	diags, _ := applyEth(t, mock, dialect08095, true, nil, ethModel("1/1/22", 0, nil, true))
+	if diags.HasError() {
+		t.Fatal(diags)
+	}
 	want := []string{
-		"vlan 20", "no untagged ethe 1/1/15", "exit",
-		"vlan 30", "no tagged ethe 1/1/15", "exit",
-		"vlan 30", "untagged ethe 1/1/15", "exit",
-		"interface ethernet 1/1/15", bulkCmd, "exit",
-	}
-	// The verification read sees the device as those commands leave it (bulk
-	// command skipping VLAN 1 and the untagged VLAN), so nothing is corrected.
-	seed, err := parser.ParseRunningConfig(loadFixture(t, "7250-24"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	after := newSimSwitch(seed, false, false)
-	after.run(t, want)
-
-	mock := sshclient.NewMockClient(loadFixture(t, "7250-24"))
-	mock.RunningConfigQueue = []string{loadFixture(t, "7250-24"), after.render()}
-	r := &InterfaceEthernetResource{client: mock, dialect: dialect08095}
-	st, p := ethStateAndPlan(t, r, ethModel("1/1/15", 20, nil, true), ethModel("1/1/15", 30, nil, true))
-	resp := resource.UpdateResponse{State: st}
-	r.Update(context.Background(), resource.UpdateRequest{Plan: p, State: st}, &resp)
-	mustOK(t, "Update", resp.Diagnostics, resp.Diagnostics)
-	if got := cliOf(mock); !reflect.DeepEqual(got, want) {
-		t.Errorf("commands:\n got %q\nwant %q", got, want)
-	}
-	if n := countCommand(mock.Commands, "show running-config"); n != 2 {
-		t.Errorf("expected one verification re-read (2 reads total), got %d", n)
-	}
-}
-
-// A tag_all_vlans trunk with nothing to add sends nothing — no bulk command,
-// no verification read, no write memory.
-func TestInterfaceEthernetUpdate_TagAllNoChangeNoBulk(t *testing.T) {
-	mock, resp := runUpdate(t, loadFixture(t, "7250-24"), dialect08095,
-		ethModel("1/1/15", 20, nil, true),
-		ethModel("1/1/15", 20, nil, true))
-	mustOK(t, "Update", resp.Diagnostics, resp.Diagnostics)
-	if got := cliOf(mock); len(got) != 0 {
-		t.Errorf("expected no commands, got %q", got)
-	}
-	if n := countCommand(mock.Commands, "show running-config"); n != 1 {
-		t.Errorf("expected a single config read, got %d", n)
-	}
-	if mock.WriteMemoryCalls != 0 {
-		t.Errorf("write memory calls = %d, want 0", mock.WriteMemoryCalls)
-	}
-}
-
-// --- verification read-back -----------------------------------------------
-
-// withBulkSideEffects returns the 7250 fixture as it would look if the bulk
-// command had also tagged port in VLAN 1 and converted its untagged VLAN 20
-// membership to tagged — the two side effects the provider does not assume
-// away.
-func withBulkSideEffects(t *testing.T, port string) string {
-	t.Helper()
-	cfg := loadFixture(t, "7250-24")
-	cfg = strings.Replace(cfg, "vlan 1 name DEFAULT-VLAN by port\n", "vlan 1 name DEFAULT-VLAN by port\n tagged ethe "+port+"\n", 1)
-	cfg = strings.Replace(cfg, " untagged ethe 1/1/1 to 1/1/18 ethe 1/1/24 ethe 1/2/1 ethe 1/2/4 to 1/2/6\n",
-		" tagged ethe "+port+"\n untagged ethe 1/1/1 to 1/1/15 ethe 1/1/17 to 1/1/18 ethe 1/1/24 ethe 1/2/1 ethe 1/2/4 to 1/2/6\n", 1)
-	return cfg
-}
-
-// If the re-read shows the bulk command tagged VLAN 1 or the untagged VLAN,
-// those memberships are corrected so the device ends up exactly where the
-// expansion would have put it.
-func TestInterfaceEthernetCreate_BulkCorrectsDefaultAndUntaggedVLAN(t *testing.T) {
-	mock := sshclient.NewMockClient(loadFixture(t, "7250-24"))
-	mock.RunningConfigQueue = []string{loadFixture(t, "7250-24"), withBulkSideEffects(t, "1/1/16")}
-	r := &InterfaceEthernetResource{client: mock, dialect: dialect08095}
-	_, p := ethStateAndPlan(t, r, nil, ethModel("1/1/16", 20, nil, true))
-	state, _ := ethStateAndPlan(t, r, nil, nil)
-	resp := resource.CreateResponse{State: state}
-	r.Create(context.Background(), resource.CreateRequest{Plan: p}, &resp)
-	mustOK(t, "Create", resp.Diagnostics, resp.Diagnostics)
-	want := []string{
-		"interface ethernet 1/1/16", "exit",
-		"vlan 20", "untagged ethe 1/1/16", "exit",
-		"interface ethernet 1/1/16", bulkCmd, "exit",
-		"vlan 1", "no tagged ethe 1/1/16", "exit",
-		"vlan 20", "no tagged ethe 1/1/16", "untagged ethe 1/1/16", "exit",
+		"interface ethernet 1/1/22", "exit",
+		"show arp",
+		"interface ethernet 1/1/22", bulkCmd, "exit",
+		"vlan 1", "no tagged ethe 1/1/22", "exit",
 	}
 	if got := cliOf(mock); !reflect.DeepEqual(got, want) {
 		t.Errorf("commands:\n got %q\nwant %q", got, want)
@@ -283,82 +342,92 @@ func TestInterfaceEthernetCreate_BulkCorrectsDefaultAndUntaggedVLAN(t *testing.T
 	}
 }
 
-// Without an untagged VLAN only VLAN 1 can need correcting.
 func TestBulkTaggingCorrections(t *testing.T) {
-	cfg, err := parser.ParseRunningConfig(withBulkSideEffects(t, "1/1/16"))
+	fx := loadFixture(t, "7250-24")
+	sideEffects := strings.Replace(fx, "vlan 1 name DEFAULT-VLAN by port\n", "vlan 1 name DEFAULT-VLAN by port\n tagged ethe 1/1/16\n", 1)
+	sideEffects = strings.Replace(sideEffects, " untagged ethe 1/1/1 to 1/1/18 ethe 1/1/24 ethe 1/2/1 ethe 1/2/4 to 1/2/6\n",
+		" tagged ethe 1/1/16\n untagged ethe 1/1/1 to 1/1/15 ethe 1/1/17 to 1/1/18 ethe 1/1/24 ethe 1/2/1 ethe 1/2/4 to 1/2/6\n", 1)
+	cfg, err := parser.ParseRunningConfig(sideEffects)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := bulkTaggingCorrections(cfg, "1/1/16", 0); !reflect.DeepEqual(got, []string{"vlan 1", "no tagged ethe 1/1/16", "exit"}) {
 		t.Errorf("no untagged VLAN: got %q", got)
 	}
-	// Tagged in VLAN 20 but 20 is the untagged VLAN and the untagged
-	// membership survived: drop the tag only.
-	cfg2 := strings.Replace(withBulkSideEffects(t, "1/1/16"), "ethe 1/1/1 to 1/1/15 ethe 1/1/17 to 1/1/18", "ethe 1/1/1 to 1/1/18", 1)
-	c2, err := parser.ParseRunningConfig(cfg2)
+	want := []string{"vlan 1", "no tagged ethe 1/1/16", "exit", "vlan 20", "no tagged ethe 1/1/16", "untagged ethe 1/1/16", "exit"}
+	if got := bulkTaggingCorrections(cfg, "1/1/16", 20); !reflect.DeepEqual(got, want) {
+		t.Errorf("untagged converted: got %q, want %q", got, want)
+	}
+	healthy, err := parser.ParseRunningConfig(fx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"vlan 1", "no tagged ethe 1/1/16", "exit", "vlan 20", "no tagged ethe 1/1/16", "exit"}
-	if got := bulkTaggingCorrections(c2, "1/1/16", 20); !reflect.DeepEqual(got, want) {
-		t.Errorf("untagged survived: got %q, want %q", got, want)
-	}
-	// The healthy case — what the fleet's captures show — needs nothing.
-	healthy, err := parser.ParseRunningConfig(loadFixture(t, "7250-24"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := bulkTaggingCorrections(healthy, "1/1/15", 20); len(got) != 0 {
+	if got := bulkTaggingCorrections(healthy, "1/1/22", 0); len(got) != 0 {
 		t.Errorf("healthy port: got %q, want none", got)
 	}
-	if got := bulkTaggingCorrections(healthy, "1/1/15", 0); len(got) != 0 {
-		t.Errorf("healthy port, no untagged: got %q, want none", got)
-	}
 }
 
-// A refused bulk command (the switch prints "error - ..." when, say, the port
-// carries an IP address) fails the apply before write memory, with nothing
-// else sent.
-func TestInterfaceEthernetCreate_BulkRefusedFailsApply(t *testing.T) {
+const bulkRefusal = "error - IP routing, vrf, ip policy, route-only, rpf-mode, ip-mac or ip tcp mss was configured on ports  1/1/22"
+
+// A bulk command that errors (the switch's lower-case `error - ...`) may have
+// changed some membership already. Create still verifies, saves what
+// succeeded, and reports the error — but records no state, because an errored
+// Create with state is tainted and the replace that follows would strip the
+// trunk (gotcha #9).
+func TestTagAll_OptInBulkErrorOnCreateSavesAndRecordsNoState(t *testing.T) {
 	mock := sshclient.NewMockClient(loadFixture(t, "7250-24"))
-	mock.ErrorOnCommand[bulkCmd] = errors.New("error - IP routing, vrf, ip policy, route-only, rpf-mode, ip-mac or ip tcp mss was configured on ports  1/1/16")
-	r := &InterfaceEthernetResource{client: mock, dialect: dialect08095}
-	_, p := ethStateAndPlan(t, r, nil, ethModel("1/1/16", 20, nil, true))
-	state, _ := ethStateAndPlan(t, r, nil, nil)
-	resp := resource.CreateResponse{State: state}
-	r.Create(context.Background(), resource.CreateRequest{Plan: p}, &resp)
-	if !resp.Diagnostics.HasError() {
-		t.Fatal("expected Create to fail when the bulk command is refused")
+	mock.Responses["show arp"] = arpVia("1/2/1")
+	mock.ErrorOnCommand[bulkCmd] = errors.New(bulkRefusal)
+	diags, recorded := applyEth(t, mock, dialect08095, true, nil, ethModel("1/1/22", 0, nil, true))
+	if !diags.HasError() {
+		t.Fatal("expected Create to report the bulk error")
 	}
-	if mock.WriteMemoryCalls != 0 {
-		t.Errorf("write memory must not run after a refused bulk command, got %d", mock.WriteMemoryCalls)
+	if !strings.Contains(fmt.Sprint(diags), "write memory") {
+		t.Errorf("error must say the partial change was saved: %v", diags)
 	}
-	if last := mock.Commands[len(mock.Commands)-1]; last != bulkCmd {
-		t.Errorf("nothing may follow the refused command, got %q", mock.Commands)
+	if recorded != nil {
+		t.Errorf("an errored Create must not record state (it would be tainted), got %+v", recorded)
+	}
+	if got := mock.Commands[len(mock.Commands)-2:]; !reflect.DeepEqual(got, []string{"show running-config", "write memory"}) {
+		t.Errorf("after the error the config must be re-read and saved, got %q", mock.Commands)
 	}
 }
 
-// --- convergence: both spellings yield the same membership ----------------
+// --- convergence against a simulated switch --------------------------------
 
-// simSwitch is a minimal model of FastIron VLAN membership, enough to replay
-// the provider's command streams. It rejects sequences FastIron rejects (a
-// port tagged and untagged in one VLAN, removing a membership that is not
-// there), so a passing test also shows each stream is legal. The two bulk*
-// flags parameterise what `vlan-config add all-tagged` is not documented to
-// say: whether it also tags the default VLAN 1, and whether it also tags (and
-// so un-untags) the port's untagged VLAN.
+// simSwitch is a minimal model of FastIron VLAN membership that implements
+// sshclient.CommandExecutor, so the resource runs against it end to end: its
+// verification re-read sees the effect of the commands it sent. It rejects
+// sequences FastIron rejects (a port tagged and untagged in one VLAN,
+// removing a membership that is not there).
+//
+// VLAN 1 is modelled honestly: a port that is not an explicit untagged member
+// of any VLAN is an implicit untagged member of DEFAULT-VLAN 1 (which the
+// running config does not print), and tagging it in VLAN 1 takes that native
+// membership away until the tag is removed. The bulk* fields parameterise
+// what `vlan-config add all-tagged` is not documented to do: also tag VLAN 1,
+// also convert the port's untagged VLAN to tagged, or fail part-way (tag the
+// first failAfter VLANs, then print `error - ...`).
 type simSwitch struct {
 	vlans            map[int]*simVLAN
 	inVLAN           int
 	inIface          string
+	version          string
+	arp              string
 	bulkTagsDefault  bool
 	bulkTagsUntagged bool
+	failAfter        int // < 0: never fails
+	commands         []string
+	saved            string // rendered config at the last write memory
+	t                *testing.T
 }
+
+var _ sshclient.CommandExecutor = (*simSwitch)(nil)
 
 type simVLAN struct{ tagged, untagged map[string]bool }
 
-func newSimSwitch(cfg *parser.RunningConfig, bulkTagsDefault, bulkTagsUntagged bool) *simSwitch {
-	s := &simSwitch{vlans: map[int]*simVLAN{}, bulkTagsDefault: bulkTagsDefault, bulkTagsUntagged: bulkTagsUntagged}
+func newSimSwitch(t *testing.T, cfg *parser.RunningConfig) *simSwitch {
+	s := &simSwitch{vlans: map[int]*simVLAN{}, version: "08.0.95mT213", arp: arpVia("1/2/1"), failAfter: -1, t: t}
 	for _, v := range cfg.VLANs {
 		sv := &simVLAN{tagged: map[string]bool{}, untagged: map[string]bool{}}
 		for _, p := range v.TaggedPorts {
@@ -369,6 +438,7 @@ func newSimSwitch(cfg *parser.RunningConfig, bulkTagsDefault, bulkTagsUntagged b
 		}
 		s.vlans[v.ID] = sv
 	}
+	s.saved = s.render()
 	return s
 }
 
@@ -381,9 +451,28 @@ func (s *simSwitch) vlanIDs() []int {
 	return ids
 }
 
-func (s *simSwitch) run(t *testing.T, cmds []string) {
+func (s *simSwitch) explicitlyUntagged(port string) bool {
+	for _, v := range s.vlans {
+		if v.untagged[port] {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *simSwitch) Execute(c string) (string, error) {
+	s.commands = append(s.commands, c)
+	if c == "show arp" {
+		return s.arp, nil
+	}
+	return "", nil
+}
+
+func (s *simSwitch) ExecuteInConfigMode(cmds []string) error {
+	t := s.t
 	t.Helper()
 	for _, c := range cmds {
+		s.commands = append(s.commands, c)
 		f := strings.Fields(c)
 		switch {
 		case f[0] == "vlan" && len(f) == 2:
@@ -397,19 +486,19 @@ func (s *simSwitch) run(t *testing.T, cmds []string) {
 		case c == "exit":
 			s.inVLAN, s.inIface = 0, ""
 		case strings.HasPrefix(c, "tagged ethe "):
-			v := s.ctxVLAN(t, c)
+			v := s.ctxVLAN(c)
 			if v.untagged[f[2]] {
 				t.Fatalf("%q: port is untagged in vlan %d", c, s.inVLAN)
 			}
 			v.tagged[f[2]] = true
 		case strings.HasPrefix(c, "no tagged ethe "):
-			v := s.ctxVLAN(t, c)
+			v := s.ctxVLAN(c)
 			if !v.tagged[f[3]] {
 				t.Fatalf("%q: port is not tagged in vlan %d", c, s.inVLAN)
 			}
 			delete(v.tagged, f[3])
 		case strings.HasPrefix(c, "untagged ethe "):
-			v := s.ctxVLAN(t, c)
+			v := s.ctxVLAN(c)
 			if v.tagged[f[2]] {
 				t.Fatalf("%q: port is tagged in vlan %d", c, s.inVLAN)
 			}
@@ -418,7 +507,7 @@ func (s *simSwitch) run(t *testing.T, cmds []string) {
 			}
 			v.untagged[f[2]] = true
 		case strings.HasPrefix(c, "no untagged ethe "):
-			v := s.ctxVLAN(t, c)
+			v := s.ctxVLAN(c)
 			if !v.untagged[f[3]] {
 				t.Fatalf("%q: port is not untagged in vlan %d", c, s.inVLAN)
 			}
@@ -427,73 +516,91 @@ func (s *simSwitch) run(t *testing.T, cmds []string) {
 			if s.inIface == "" {
 				t.Fatalf("%q outside interface context", c)
 			}
+			done := 0
 			for _, id := range s.vlanIDs() {
 				v := s.vlans[id]
 				if id == 1 && !s.bulkTagsDefault {
 					continue
 				}
-				if v.untagged[s.inIface] {
-					if s.bulkTagsUntagged {
-						delete(v.untagged, s.inIface)
-						v.tagged[s.inIface] = true
-					}
+				if v.tagged[s.inIface] {
 					continue
 				}
+				if s.failAfter >= 0 && done == s.failAfter {
+					return fmt.Errorf("command %q: %s", c, bulkRefusal)
+				}
+				if v.untagged[s.inIface] {
+					if !s.bulkTagsUntagged {
+						continue
+					}
+					delete(v.untagged, s.inIface)
+				}
 				v.tagged[s.inIface] = true
+				done++
 			}
 		default:
 			t.Fatalf("simSwitch: unknown command %q", c)
 		}
 	}
+	return nil
 }
 
-func (s *simSwitch) ctxVLAN(t *testing.T, c string) *simVLAN {
-	t.Helper()
+func (s *simSwitch) ctxVLAN(c string) *simVLAN {
+	s.t.Helper()
 	if s.inVLAN == 0 {
-		t.Fatalf("%q outside VLAN context", c)
+		s.t.Fatalf("%q outside VLAN context", c)
 	}
 	return s.vlans[s.inVLAN]
 }
 
-// membership reports port's membership as vlan -> "tagged"/"untagged". An
-// implicit untagged membership of VLAN 1 is not modelled (FastIron does not
-// print it either).
+func (s *simSwitch) ExecutePromptChanging(c string) error {
+	s.t.Fatalf("unexpected prompt-changing command %q", c)
+	return nil
+}
+
+func (s *simSwitch) ExecuteExpectingDisconnect(cmds []string) error {
+	s.t.Fatalf("unexpected disconnecting commands %q", cmds)
+	return nil
+}
+
+func (s *simSwitch) WriteMemory() error {
+	s.commands = append(s.commands, "write memory")
+	s.saved = s.render()
+	return nil
+}
+
+func (s *simSwitch) GetRunningConfig() (string, error) {
+	s.commands = append(s.commands, "show running-config")
+	return s.render(), nil
+}
+
+func (s *simSwitch) Close() error { return nil }
+
+// membership reports port's membership as vlan -> "tagged"/"untagged",
+// including the implicit untagged membership of DEFAULT-VLAN 1.
 func (s *simSwitch) membership(port string) map[int]string {
 	m := map[int]string{}
 	for id, v := range s.vlans {
 		if v.tagged[port] {
 			m[id] = "tagged"
 		}
-		if v.untagged[port] && id != 1 {
+		if v.untagged[port] {
 			m[id] = "untagged"
 		}
+	}
+	if !s.explicitlyUntagged(port) && m[1] == "" {
+		m[1] = "untagged" // implicit DEFAULT-VLAN membership
 	}
 	return m
 }
 
-// config renders the simulated membership as a parser.RunningConfig, which is
-// what verifyBulkTagging re-reads from the switch.
-func (s *simSwitch) config() *parser.RunningConfig {
-	cfg := &parser.RunningConfig{}
-	for _, id := range s.vlanIDs() {
-		v := s.vlans[id]
-		pv := parser.VLAN{ID: id}
-		for p := range v.tagged {
-			pv.TaggedPorts = append(pv.TaggedPorts, p)
-		}
-		for p := range v.untagged {
-			pv.UntaggedPorts = append(pv.UntaggedPorts, p)
-		}
-		cfg.VLANs = append(cfg.VLANs, pv)
-	}
-	return cfg
-}
-
-// render writes the simulated membership back out as running-config text,
-// the way FastIron prints it, for a mock's verification re-read.
+// render writes the simulated device out as running-config text the way
+// FastIron prints it (implicit VLAN 1 membership is not printed).
 func (s *simSwitch) render() string {
 	var b strings.Builder
-	b.WriteString("ver 08.0.95mT213\n!\n")
+	b.WriteString("Current configuration:\n!\n")
+	if s.version != "" {
+		fmt.Fprintf(&b, "ver %s\n!\n", s.version)
+	}
 	for _, id := range s.vlanIDs() {
 		v := s.vlans[id]
 		if id == 1 {
@@ -502,7 +609,7 @@ func (s *simSwitch) render() string {
 			fmt.Fprintf(&b, "vlan %d by port\n", id)
 		}
 		writePorts := func(kind string, set map[string]bool) {
-			if len(set) == 0 {
+			if len(set) == 0 || (id == 1 && kind == "untagged") {
 				return
 			}
 			ports := make([]string, 0, len(set))
@@ -516,6 +623,7 @@ func (s *simSwitch) render() string {
 		writePorts("untagged", v.untagged)
 		b.WriteString("!\n")
 	}
+	b.WriteString("ip route 0.0.0.0/0 10.0.20.1\n!\nend\n")
 	return b.String()
 }
 
@@ -531,92 +639,69 @@ func atoi(t *testing.T, s string) int {
 	return n
 }
 
-// For every tag_all_vlans transition the provider can generate, replaying the
-// bulk stream (plus the corrections verifyBulkTagging derives from the
-// resulting config) and the per-VLAN stream on the same starting device
-// yields identical membership — under every reading of what the bulk command
-// does to VLAN 1 and the untagged VLAN — and that membership is exactly the
-// expansion tag_all_vlans stands for.
+func (s *simSwitch) cli() []string {
+	var out []string
+	for _, c := range s.commands {
+		if c != "show running-config" && c != "write memory" && c != "show arp" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// For every tag_all_vlans transition the provider generates, running the
+// resource against the simulated switch with bulk tagging off and opted in —
+// under every reading of what the bulk command does to VLAN 1 and the untagged
+// VLAN — leaves identical membership, exactly the expansion tag_all_vlans
+// stands for (plus the port's native VLAN). Where bulk is not allowed the
+// opted-in stream is the per-VLAN stream. Every apply leaves the saved config
+// equal to the running config.
+//
+// The erroring reading (the bulk command tags a couple of VLANs, then prints
+// `error - ...`) does not claim equality after the failing apply. It claims
+// instead that the partial change is saved, that an Update records the device
+// truth in state, and that the follow-up apply (with native_bulk_tagging off,
+// the documented remedy) converges on the same membership as everything else.
 func TestTagAllVLANs_BulkAndExpansionConverge(t *testing.T) {
-	// In the capture 1/1/15 is tagged in 30-70 but not 10, i.e. a drifted
-	// trunk (see TestInterfaceEthernetUpdate_BulkHealsUnrecordedDrift). The
-	// scenarios that start from tag_all_vlans state need a device that matches
-	// that state, so tag it in 10 as well.
-	fixture := strings.Replace(loadFixture(t, "7250-24"),
-		" tagged ethe 1/1/19 to 1/1/20 ethe 1/2/1 ethe 1/2/3 to 1/2/8\n",
-		" tagged ethe 1/1/15 ethe 1/1/19 to 1/1/20 ethe 1/2/1 ethe 1/2/3 to 1/2/8\n", 1)
-	seed, err := parser.ParseRunningConfig(fixture)
+	seed, err := parser.ParseRunningConfig(fixture15(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	bare := stripDialectEvidence(fixture)
-
 	type scenario struct {
-		name        string
-		port        string
+		name, port  string
 		state, plan *InterfaceEthernetResourceModel
+		bulk        bool // whether the opted-in apply is expected to use the bulk command
 	}
 	scenarios := []scenario{
-		{"create trunk with untagged", "1/1/16", nil, ethModel("1/1/16", 20, nil, true)},
-		{"create trunk moving untagged", "1/1/16", nil, ethModel("1/1/16", 30, nil, true)},
-		// 1/1/22 is tagged in VLAN 20 and untagged nowhere: a create that
-		// leaves the port without an untagged VLAN must not start from one,
-		// since Create does not reconcile membership it was never told about
-		// (pre-existing behaviour, unchanged here).
-		{"create tagged-only trunk", "1/1/22", nil, ethModel("1/1/22", 0, nil, true)},
-		{"create with untagged 1", "1/1/22", nil, ethModel("1/1/22", 1, nil, true)},
-		{"explicit to tag_all", "1/1/15", ethModel("1/1/15", 20, []int64{30, 40, 50, 60, 70}, false), ethModel("1/1/15", 20, nil, true)},
-		{"drifted trunk repair", "1/1/15", ethModel("1/1/15", 20, []int64{30, 40, 50}, false), ethModel("1/1/15", 20, nil, true)},
-		{"tag_all change untagged", "1/1/15", ethModel("1/1/15", 20, nil, true), ethModel("1/1/15", 30, nil, true)},
-		{"tag_all drop untagged", "1/1/15", ethModel("1/1/15", 20, nil, true), ethModel("1/1/15", 0, nil, true)},
+		{"create trunk with untagged", "1/1/16", nil, ethModel("1/1/16", 20, nil, true), false},
+		{"create trunk moving untagged", "1/1/16", nil, ethModel("1/1/16", 30, nil, true), false},
+		// "create trunk no untagged" on 1/1/16 is left out: the port is
+		// untagged in 20 on the device and Create does not reconcile
+		// membership it was never told about, so main's stream tags it in 20
+		// on top of that, which FastIron refuses (pre-existing behaviour).
+		{"create tagged-only trunk", "1/1/22", nil, ethModel("1/1/22", 0, nil, true), true},
+		{"create with untagged 1", "1/1/22", nil, ethModel("1/1/22", 1, nil, true), false},
+		{"explicit to tag_all", "1/1/15", ethModel("1/1/15", 20, []int64{30, 40, 50, 60, 70}, false), ethModel("1/1/15", 20, nil, true), false},
+		{"drifted trunk repair", "1/1/15", ethModel("1/1/15", 20, []int64{30, 40, 50}, false), ethModel("1/1/15", 20, nil, true), false},
+		{"tagged-only trunk repair", "1/1/22", ethModel("1/1/22", 0, []int64{20}, false), ethModel("1/1/22", 0, nil, true), true},
+		{"management uplink repair", "1/2/1", ethModel("1/2/1", 20, []int64{10, 30, 40}, false), ethModel("1/2/1", 20, nil, true), false},
+		{"tag_all change untagged", "1/1/15", ethModel("1/1/15", 20, nil, true), ethModel("1/1/15", 30, nil, true), false},
+		{"tag_all drop untagged", "1/1/15", ethModel("1/1/15", 20, nil, true), ethModel("1/1/15", 0, nil, true), false},
 	}
-	semantics := []struct {
+	readings := []struct {
 		name                      string
 		tagsDefault, tagsUntagged bool
+		failAfter                 int
 	}{
-		{"skips VLAN 1 and untagged VLAN", false, false},
-		{"tags VLAN 1 too", true, false},
-		{"tags the untagged VLAN too", false, true},
-		{"tags both", true, true},
-	}
-
-	// commandsFor returns the stream the provider sends up to and including
-	// the membership change itself. Against the static mock, Create/Update's
-	// verification re-read sees a device the commands never touched and may
-	// append corrections for that stale picture; those are cut off here and
-	// re-derived below from the simulated device with the same function
-	// verifyBulkTagging uses (bulkTaggingCorrections), which is what a real
-	// switch's re-read would feed it.
-	commandsFor := func(sc scenario, d dialect.Dialect) []string {
-		var mock *sshclient.MockClient
-		if sc.state == nil {
-			var resp resource.CreateResponse
-			mock, resp = runCreate(t, bare, d, sc.plan)
-			mustOK(t, sc.name+" create", resp.Diagnostics, resp.Diagnostics)
-		} else {
-			var resp resource.UpdateResponse
-			mock, resp = runUpdate(t, bare, d, sc.state, sc.plan)
-			mustOK(t, sc.name+" update", resp.Diagnostics, resp.Diagnostics)
-		}
-		cmds := cliOf(mock)
-		for i, c := range cmds {
-			if c == bulkCmd {
-				return cmds[:i+2] // through the following "exit"
-			}
-		}
-		return cmds
+		{"skips VLAN 1 and untagged VLAN", false, false, -1},
+		{"tags VLAN 1 too", true, false, -1},
+		{"tags the untagged VLAN too", false, true, -1},
+		{"tags both", true, true, -1},
+		{"errors after two VLANs", false, false, 2},
+		{"tags VLAN 1 then errors", true, false, 2},
 	}
 
 	for _, sc := range scenarios {
-		bulkStream := commandsFor(sc, dialect08095)
-		if countCommand(bulkStream, bulkCmd) != 1 {
-			t.Fatalf("%s: expected exactly one %q in %q", sc.name, bulkCmd, bulkStream)
-		}
-		plainStream := commandsFor(sc, dialect.Dialect{})
-		if countCommand(plainStream, bulkCmd) != 0 {
-			t.Fatalf("%s: unknown firmware must not use %q: %q", sc.name, bulkCmd, plainStream)
-		}
-
 		var untagged int
 		if !sc.plan.UntaggedVLAN.IsNull() {
 			untagged = int(sc.plan.UntaggedVLAN.ValueInt64())
@@ -627,24 +712,81 @@ func TestTagAllVLANs_BulkAndExpansionConverge(t *testing.T) {
 		}
 		if untagged > 1 {
 			want[untagged] = "untagged"
+		} else {
+			want[1] = "untagged" // explicit (untagged_vlan = 1) or native DEFAULT-VLAN
 		}
 
-		plain := newSimSwitch(seed, false, false)
-		plain.run(t, plainStream)
-		if got := plain.membership(sc.port); !reflect.DeepEqual(got, want) {
-			t.Errorf("%s: expansion path membership %v, want %v", sc.name, got, want)
+		off := newSimSwitch(t, seed)
+		if diags, _ := applyEth(t, off, dialect08095, false, sc.state, sc.plan); diags.HasError() {
+			t.Fatalf("%s (off): %v", sc.name, diags)
+		}
+		if countCommand(off.commands, bulkCmd) != 0 || countCommand(off.commands, "show arp") != 0 {
+			t.Fatalf("%s: flag off must send neither the bulk command nor show arp: %q", sc.name, off.commands)
+		}
+		if got := off.membership(sc.port); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: per-VLAN membership %v, want %v", sc.name, got, want)
+		}
+		if off.saved != off.render() {
+			t.Errorf("%s: per-VLAN apply left running and saved configs divergent", sc.name)
 		}
 
-		for _, sem := range semantics {
-			bulk := newSimSwitch(seed, sem.tagsDefault, sem.tagsUntagged)
-			bulk.run(t, bulkStream)
-			corrections := bulkTaggingCorrections(bulk.config(), sc.port, untagged)
-			bulk.run(t, corrections)
-			if got := bulk.membership(sc.port); !reflect.DeepEqual(got, want) {
-				t.Errorf("%s / bulk %s: membership %v (after corrections %q), want %v", sc.name, sem.name, got, corrections, want)
+		for _, rd := range readings {
+			label := sc.name + " / bulk " + rd.name
+			sim := newSimSwitch(t, seed)
+			sim.bulkTagsDefault, sim.bulkTagsUntagged, sim.failAfter = rd.tagsDefault, rd.tagsUntagged, rd.failAfter
+			diags, recorded := applyEth(t, sim, dialect08095, true, sc.state, sc.plan)
+
+			if got := countCommand(sim.commands, bulkCmd); (got == 1) != sc.bulk {
+				t.Fatalf("%s: bulk command sent %d times, want bulk=%v: %q", label, got, sc.bulk, sim.commands)
 			}
-			if !sem.tagsDefault && !sem.tagsUntagged && len(corrections) != 0 {
-				t.Errorf("%s: a bulk command that already skips VLAN 1 and the untagged VLAN must need no corrections, got %q", sc.name, corrections)
+			if !sc.bulk {
+				if diags.HasError() {
+					t.Fatalf("%s: %v", label, diags)
+				}
+				if !reflect.DeepEqual(sim.cli(), off.cli()) {
+					t.Errorf("%s: opted-in stream differs from the per-VLAN stream:\n got %q\nwant %q", label, sim.cli(), off.cli())
+				}
+			}
+			if sim.saved != sim.render() {
+				t.Errorf("%s: running and saved configs diverge after the apply", label)
+			}
+
+			if sc.bulk && rd.failAfter >= 0 {
+				if !diags.HasError() {
+					t.Fatalf("%s: expected the bulk error to be reported", label)
+				}
+				// The follow-up apply: what Terraform does next with the
+				// recorded state, with native_bulk_tagging turned off.
+				next := sc.state
+				if sc.state != nil {
+					if recorded == nil || recorded.TagAllVLANs.ValueBool() {
+						t.Fatalf("%s: an errored Update must record the device membership with tag_all_vlans = false, got %+v", label, recorded)
+					}
+					got := map[int]bool{}
+					for _, id := range setToInt64Slice(context.Background(), recorded.TaggedVLANs, &diags) {
+						got[int(id)] = true
+					}
+					for id, kind := range sim.membership(sc.port) {
+						if kind == "tagged" && id != 1 && !got[id] {
+							t.Errorf("%s: recorded tagged_vlans %v misses device VLAN %d", label, got, id)
+						}
+					}
+					next = recorded
+				} else if recorded != nil {
+					t.Fatalf("%s: an errored Create must not record (tainted) state", label)
+				}
+				if d2, _ := applyEth(t, sim, dialect08095, false, next, sc.plan); d2.HasError() {
+					t.Fatalf("%s: follow-up apply: %v", label, d2)
+				}
+				if sim.saved != sim.render() {
+					t.Errorf("%s: running and saved configs diverge after the follow-up apply", label)
+				}
+			} else if diags.HasError() {
+				t.Fatalf("%s: %v", label, diags)
+			}
+
+			if got := sim.membership(sc.port); !reflect.DeepEqual(got, want) {
+				t.Errorf("%s: membership %v, want %v (commands %q)", label, got, want, sim.cli())
 			}
 		}
 	}
@@ -662,38 +804,4 @@ func expandedTagAll(cfg *parser.RunningConfig, untagged int) []int {
 	}
 	sort.Ints(ids)
 	return ids
-}
-
-// A side effect worth knowing: when state says tag_all_vlans = true but the
-// device is missing a VLAN that Read has not (yet) reported — 1/1/15 in the
-// capture lacks VLAN 10 — the per-VLAN path trusts state and never adds it,
-// while the bulk command tags every VLAN regardless. So any tag_all_vlans
-// apply that adds something on 08.0.50+ also heals that kind of drift.
-func TestInterfaceEthernetUpdate_BulkHealsUnrecordedDrift(t *testing.T) {
-	fixture := loadFixture(t, "7250-24")
-	seed, err := parser.ParseRunningConfig(fixture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state, plan := ethModel("1/1/15", 20, nil, true), ethModel("1/1/15", 30, nil, true)
-
-	mock, resp := runUpdate(t, stripDialectEvidence(fixture), dialect.Dialect{}, state, plan)
-	mustOK(t, "Update (expansion)", resp.Diagnostics, resp.Diagnostics)
-	plain := newSimSwitch(seed, false, false)
-	plain.run(t, cliOf(mock))
-	if got := plain.membership("1/1/15")[10]; got != "" {
-		t.Errorf("per-VLAN path should not have touched VLAN 10, got %q", got)
-	}
-
-	mock, resp = runUpdate(t, fixture, dialect08095, state, plan)
-	mustOK(t, "Update (bulk)", resp.Diagnostics, resp.Diagnostics)
-	cmds := cliOf(mock)
-	if i := indexOf(cmds, bulkCmd); i >= 0 {
-		cmds = cmds[:i+2]
-	}
-	bulk := newSimSwitch(seed, false, false)
-	bulk.run(t, cmds)
-	if got := bulk.membership("1/1/15")[10]; got != "tagged" {
-		t.Errorf("bulk path should have tagged the missing VLAN 10, got %q", got)
-	}
 }
