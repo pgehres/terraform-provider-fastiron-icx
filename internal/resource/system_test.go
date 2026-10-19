@@ -7,6 +7,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
 )
@@ -14,9 +15,8 @@ import (
 func newSwitchImageSystemResource() (*SystemResource, *sshclient.MockClient) {
 	mock := sshclient.NewMockClient("")
 	return &SystemResource{
-		client:          mock,
-		imageType:       parser.ImageTypeSwitch,
-		firmwareVersion: "08.0.95rT211",
+		client:  mock,
+		dialect: dialect.Detect("08.0.95rT211", parser.ImageTypeSwitch),
 	}, mock
 }
 
@@ -128,7 +128,7 @@ func TestSystemDelete_SwitchImageStateOnlyGlobalSTPSkips(t *testing.T) {
 // On a router image the state-only removal still sends `no global-stp`.
 func TestSystemUpdate_RouterImageTurnsOffGlobalSTP(t *testing.T) {
 	r, mock := newSwitchImageSystemResource()
-	r.imageType = parser.ImageTypeRouter
+	r.dialect = dialect.Detect(r.dialect.Version.Raw, parser.ImageTypeRouter)
 	state, plan := systemStateAndPlan(t, r, systemModel(true, true), systemModel(false, true))
 
 	resp := resource.UpdateResponse{State: state}

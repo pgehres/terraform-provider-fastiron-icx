@@ -8,6 +8,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 )
 
@@ -62,7 +63,7 @@ func TestInterfaceVEModifyPlan_ImageTypes(t *testing.T) {
 	for _, tt := range allImageTypes {
 		t.Run(tt.name, func(t *testing.T) {
 			r, mock := newSwitchImageVEResource()
-			r.imageType = tt.imageType
+			r.dialect = dialect.Detect(r.dialect.Version.Raw, tt.imageType)
 			plan := vePlan(t, r)
 
 			resp := resource.ModifyPlanResponse{Plan: plan}
@@ -93,7 +94,7 @@ func TestVLANModifyPlan_RouterInterface(t *testing.T) {
 	for _, tt := range allImageTypes {
 		t.Run(tt.name, func(t *testing.T) {
 			r, _ := newSwitchImageVLANResource()
-			r.imageType = tt.imageType
+			r.dialect = dialect.Detect(r.dialect.Version.Raw, tt.imageType)
 			_, plan := vlanStateAndPlan(t, r, vlanModel(types.Int64Null()), vlanModel(types.Int64Value(20)))
 
 			resp := resource.ModifyPlanResponse{Plan: plan}
@@ -136,7 +137,7 @@ func TestSystemModifyPlan_GlobalSTP(t *testing.T) {
 	for _, tt := range allImageTypes {
 		t.Run(tt.name, func(t *testing.T) {
 			r, _ := newSwitchImageSystemResource()
-			r.imageType = tt.imageType
+			r.dialect = dialect.Detect(r.dialect.Version.Raw, tt.imageType)
 			_, plan := systemStateAndPlan(t, r, systemModel(false, false), systemModel(true, false))
 
 			resp := resource.ModifyPlanResponse{Plan: plan}

@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	icxdatasource "github.com/pgehres/terraform-provider-fastiron-icx/internal/datasource"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
 	icxresource "github.com/pgehres/terraform-provider-fastiron-icx/internal/resource"
@@ -183,14 +184,14 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 	}
 
 	data := &providerdata.ProviderData{
-		Client:    client,
-		Username:  username,
-		ImageType: parser.ImageTypeUnknown,
+		Client:   client,
+		Username: username,
+		Dialect:  dialect.Detect("", parser.ImageTypeUnknown),
 	}
 
-	// Detect the firmware image type once per provider instance so resources
-	// can refuse router-image-only operations on switch-image devices before
-	// any commands are sent.
+	// Detect the firmware dialect (release + image type) once per provider
+	// instance so resources can refuse unsupported operations before any
+	// commands are sent and render dialect-specific syntax.
 	output, err := client.GetRunningConfig()
 	if err != nil {
 		// The client is already connected; close it so the switch's SSH
@@ -201,12 +202,12 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 		return
 	}
 	if parsed, err := parser.ParseRunningConfig(output); err != nil {
-		resp.Diagnostics.AddWarning("Could not detect firmware image type",
+		resp.Diagnostics.AddWarning("Could not detect firmware dialect",
 			"The running configuration could not be parsed: "+err.Error()+
-				". Router-image-only features will not be validated before commands are sent.")
+				". Firmware- and image-specific features will not be validated before commands are sent, "+
+				"and FastIron 08.0.9x command syntax will be used.")
 	} else {
-		data.FirmwareVersion = parsed.Global.Version
-		data.ImageType = parsed.ImageType()
+		data.Dialect = dialect.FromConfig(parsed)
 	}
 
 	resp.DataSourceData = data

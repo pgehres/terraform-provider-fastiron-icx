@@ -21,8 +21,10 @@ func (d Dialect) DHCPClientDisable(disable bool) string {
 }
 
 // DualMode renders the interface-context command selecting vlanID as the
-// untagged VLAN of a tagged (dual-mode) port. VLAN 1 is the bare form. Only
-// meaningful when d.Has(CapDualMode).
+// untagged VLAN of a tagged (dual-mode) port. FastIron documents the bare
+// form (`dual-mode`, no argument) as "untagged in the default VLAN", so VLAN 1
+// is emitted that way rather than as `dual-mode 1`. Only meaningful when
+// d.Has(CapDualMode).
 func (d Dialect) DualMode(vlanID int) string {
 	if vlanID == 1 {
 		return "dual-mode"

@@ -9,6 +9,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
@@ -129,12 +130,15 @@ func (d *StackUnitDataSource) Read(ctx context.Context, req datasource.ReadReque
 
 	state.ID = types.StringValue(strconv.Itoa(unitID))
 	state.UnitID = types.Int64Value(int64(unitID))
+	// Firmware facts come from the dialect layer, the single source of
+	// version/image interpretation (see internal/dialect).
+	dl := dialect.FromConfig(config)
 	if config.Global.Version != "" {
 		state.FirmwareVersion = types.StringValue(config.Global.Version)
 	} else {
 		state.FirmwareVersion = types.StringNull()
 	}
-	state.ImageType = types.StringValue(string(config.ImageType()))
+	state.ImageType = types.StringValue(string(dl.Image))
 
 	// Build modules list.
 	moduleValues := make([]attr.Value, len(found.Modules))

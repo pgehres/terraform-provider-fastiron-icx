@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/sshclient"
@@ -41,9 +42,8 @@ var reVLANName = regexp.MustCompile(`^[^\s"']+$`)
 var reNoNewlines = regexp.MustCompile(`^[^\r\n]*$`)
 
 type VLANResource struct {
-	client          sshclient.CommandExecutor
-	imageType       parser.ImageType
-	firmwareVersion string
+	client  sshclient.CommandExecutor
+	dialect dialect.Dialect
 }
 
 type VLANResourceModel struct {
@@ -151,8 +151,7 @@ func (r *VLANResource) Configure(_ context.Context, req resource.ConfigureReques
 		return
 	}
 	r.client = data.Client
-	r.imageType = data.ImageType
-	r.firmwareVersion = data.FirmwareVersion
+	r.dialect = data.Dialect
 }
 
 // ModifyPlan rejects a planned router_interface at plan time when the device is
@@ -171,7 +170,7 @@ func (r *VLANResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRe
 	if routerInterface.IsNull() || routerInterface.IsUnknown() {
 		return
 	}
-	requireRouterImage(r.imageType, r.firmwareVersion, "The router_interface attribute of icx_vlan", &resp.Diagnostics)
+	requireCapability(r.dialect, dialect.CapRouterInterface, "The router_interface attribute of icx_vlan", &resp.Diagnostics)
 }
 
 func (r *VLANResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -182,7 +181,7 @@ func (r *VLANResource) Create(ctx context.Context, req resource.CreateRequest, r
 	}
 
 	if !plan.RouterInterface.IsNull() &&
-		!requireRouterImage(r.imageType, r.firmwareVersion, "The router_interface attribute of icx_vlan", &resp.Diagnostics) {
+		!requireCapability(r.dialect, dialect.CapRouterInterface, "The router_interface attribute of icx_vlan", &resp.Diagnostics) {
 		return
 	}
 
@@ -267,7 +266,7 @@ func (r *VLANResource) Update(ctx context.Context, req resource.UpdateRequest, r
 	// switch image, so removing it must not error — buildUpdateCommands skips
 	// the `no router-interface` command there instead.
 	if !plan.RouterInterface.IsNull() &&
-		!requireRouterImage(r.imageType, r.firmwareVersion, "The router_interface attribute of icx_vlan", &resp.Diagnostics) {
+		!requireCapability(r.dialect, dialect.CapRouterInterface, "The router_interface attribute of icx_vlan", &resp.Diagnostics) {
 		return
 	}
 
@@ -416,7 +415,7 @@ func (r *VLANResource) buildUpdateCommands(ctx context.Context, plan, state *VLA
 	if !plan.RouterInterface.Equal(state.RouterInterface) {
 		// On a switch image the router-interface cannot exist (and the
 		// command does not), so there is nothing to remove.
-		if !state.RouterInterface.IsNull() && r.imageType != parser.ImageTypeSwitch {
+		if !state.RouterInterface.IsNull() && r.dialect.Has(dialect.CapRouterInterface) {
 			commands = append(commands, fmt.Sprintf("no router-interface ve %d", state.RouterInterface.ValueInt64()))
 		}
 		if !plan.RouterInterface.IsNull() {
