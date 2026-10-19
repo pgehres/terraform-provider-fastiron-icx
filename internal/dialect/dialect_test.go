@@ -88,42 +88,53 @@ func TestDetectHas(t *testing.T) {
 	}{
 		{"7250-24 router 08.0.95", "08.0.95mT213", parser.ImageTypeRouter, true, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: true,
 		}},
 		{"7150-24/C12P router 08.0.95", "08.0.95qT213", parser.ImageTypeRouter, true, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: true,
 		}},
 		{"C10ZP switch 08.0.95", "08.0.95rT211", parser.ImageTypeSwitch, true, caps{
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: true,
-			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: true,
 		}},
 		{"6430 switch 08.0.30", "08.0.30uT311", parser.ImageTypeSwitch, true, caps{
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: false,
-			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: true,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: true, CapVlanConfigAllTagged: false,
 		}},
 		{"6450 router 08.0.30", "08.0.30uT313", parser.ImageTypeRouter, true, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: false,
-			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: false, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: false,
 		}},
 		{"unparseable version, unknown image", "garbage", parser.ImageTypeUnknown, false, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: false,
 		}},
 		{"empty version, empty image", "", "", false, caps{
 			CapVEInterfaces: true, CapRouterInterface: true, CapGlobalSTP: true, CapManager: true,
-			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: false,
 		}},
 		// The two axes are independent: a structurally detected switch image
 		// still blocks router-only features when the version is unparseable.
 		{"unparseable version, switch image", "", parser.ImageTypeSwitch, false, caps{
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: true,
-			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: false,
 		}},
 		// And an old version with an undetected image does not guess the
 		// image-dependent DHCP spelling.
 		{"08.0.30 unknown image", "08.0.30uT31x", parser.ImageTypeUnknown, true, caps{
-			CapVEInterfaces: true, CapGlobalManagementIP: true, CapManager: false, CapDualMode: true, CapLegacyDHCPClient: false,
+			CapVEInterfaces: true, CapGlobalManagementIP: true, CapManager: false, CapDualMode: true, CapLegacyDHCPClient: false, CapVlanConfigAllTagged: false,
+		}},
+		// The bulk tagging command arrived in 08.0.50 and does not depend on
+		// the image.
+		{"08.0.50 first vlan-config release", "08.0.50T211", parser.ImageTypeUnknown, true, caps{
+			CapVlanConfigAllTagged: true, CapDualMode: true,
+		}},
+		{"08.0.40 last release without vlan-config", "08.0.40T311", parser.ImageTypeSwitch, true, caps{
+			CapVlanConfigAllTagged: false, CapDualMode: true,
+		}},
+		{"09.0.10 router", "09.0.10aT213", parser.ImageTypeRouter, true, caps{
+			CapVlanConfigAllTagged: true, CapDualMode: false,
 		}},
 	}
 	for _, tt := range tests {
@@ -349,5 +360,23 @@ func TestObserve(t *testing.T) {
 	}
 	if Detect("", "").Observe(nil).Known {
 		t.Error("Observe(nil) must be a no-op")
+	}
+}
+
+// The bulk tagging renderer is a fixed spelling; the capability decides
+// whether it may be used at all.
+func TestVlanConfigAddAllTagged(t *testing.T) {
+	d := Detect("08.0.95mT213", parser.ImageTypeRouter)
+	if got := d.VlanConfigAddAllTagged(); got != "vlan-config add all-tagged" {
+		t.Errorf("VlanConfigAddAllTagged() = %q", got)
+	}
+	if !IsSyntaxForm(CapVlanConfigAllTagged) {
+		t.Error("CapVlanConfigAllTagged must be a syntax form: unknown firmware falls back to per-VLAN tagging")
+	}
+	// A running config with a parseable version proves the capability even
+	// when the provider could not detect one at connect time.
+	o := Dialect{}.Observe(&parser.RunningConfig{Global: parser.GlobalSettings{Version: "08.0.95qT213"}})
+	if !o.Has(CapVlanConfigAllTagged) {
+		t.Error("Observe(08.0.95) must enable CapVlanConfigAllTagged")
 	}
 }
