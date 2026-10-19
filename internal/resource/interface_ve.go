@@ -132,7 +132,11 @@ func (r *InterfaceVEResource) Read(ctx context.Context, req resource.ReadRequest
 		return
 	}
 
-	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
+	// A switch-image device cannot have VE interfaces. Treat that as the VE
+	// being absent rather than erroring, so state left behind by a
+	// router→switch reimage can still be refreshed away and destroyed.
+	if r.imageType == parser.ImageTypeSwitch {
+		resp.State.RemoveResource(ctx)
 		return
 	}
 
@@ -246,7 +250,10 @@ func (r *InterfaceVEResource) Delete(ctx context.Context, req resource.DeleteReq
 		return
 	}
 
-	if !requireRouterImage(r.imageType, r.firmwareVersion, "icx_interface_ve", &resp.Diagnostics) {
+	// On a switch image the VE necessarily does not exist; succeed without
+	// sending commands so stale state from a router→switch reimage can be
+	// destroyed.
+	if r.imageType == parser.ImageTypeSwitch {
 		return
 	}
 

@@ -178,6 +178,9 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 	// any commands are sent.
 	output, err := client.GetRunningConfig()
 	if err != nil {
+		// The client is already connected; close it so the switch's SSH
+		// session is not leaked until process exit.
+		_ = client.Close()
 		resp.Diagnostics.AddError("Failed to read running config",
 			"Unable to read the running configuration during provider setup: "+err.Error())
 		return
