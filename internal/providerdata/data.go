@@ -23,4 +23,8 @@ type ProviderData struct {
 	// non-management trunks on FastIron 08.0.50+ only). When false every
 	// command stream is the per-VLAN expansion.
 	NativeBulkTagging bool
+	// Ports records the ethernet ports claimed by icx_interface_ethernet
+	// resources during the current operation, so a port declared by two
+	// resources is rejected at plan time. See PortRegistry.
+	Ports *PortRegistry
 }

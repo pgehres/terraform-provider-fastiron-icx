@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
@@ -19,7 +20,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/dialect"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/parser"
 	"github.com/pgehres/terraform-provider-fastiron-icx/internal/providerdata"
@@ -46,6 +49,9 @@ type InterfaceEthernetResource struct {
 	// nativeBulkTagging is the provider's experimental native_bulk_tagging
 	// opt-in (default false). See bulkTaggingAllowed.
 	nativeBulkTagging bool
+	// ports is the provider instance's registry of ports claimed during the
+	// current operation; nil (never configured) disables duplicate detection.
+	ports *providerdata.PortRegistry
 }
 
 type InterfaceEthernetResourceModel struct {
@@ -137,7 +143,7 @@ func (r *InterfaceEthernetResource) Schema(_ context.Context, _ resource.SchemaR
 				},
 			},
 			"tagged_vlans": schema.SetAttribute{
-				Description: "Set of VLAN IDs for tagged traffic on this port.",
+				Description: "Set of VLAN IDs for tagged traffic on this port. Mutually exclusive with tag_all_vlans.",
 				Optional:    true,
 				ElementType: types.Int64Type,
 				Validators: []validator.Set{
@@ -147,7 +153,7 @@ func (r *InterfaceEthernetResource) Schema(_ context.Context, _ resource.SchemaR
 				},
 			},
 			"tag_all_vlans": schema.BoolAttribute{
-				Description: "Tag all VLANs on the switch (excluding untagged_vlan) on this port. Useful for trunk ports. Mutually exclusive with tagged_vlans.",
+				Description: "Tag all VLANs on the switch (excluding untagged_vlan and VLAN 1) on this port. Useful for trunk ports. Mutually exclusive with tagged_vlans. Read checks the port's actual membership against that expansion: when a VLAN is missing, state reports tag_all_vlans = false with the actual tagged_vlans so the plan shows the repair, which applies additively.",
 				Optional:    true,
 				Computed:    true,
 				Default:     booldefault.StaticBool(false),
@@ -186,35 +192,32 @@ func (r *InterfaceEthernetResource) Configure(_ context.Context, req resource.Co
 	r.client = data.Client
 	r.dialect = data.Dialect
 	r.nativeBulkTagging = data.NativeBulkTagging
+	r.ports = data.Ports
 }
 
-// dialectFor returns the dialect to use against config: the Configure-time
-// detection, refined with evidence from config itself (its version when the
-// provider could not detect one, and any `dual-mode` lines it contains).
-func (r *InterfaceEthernetResource) dialectFor(config *parser.RunningConfig) dialect.Dialect {
-	return r.dialect.Observe(config)
-}
-
-// boolKnown reports whether b holds a value (neither null nor unknown).
-func boolKnown(b types.Bool) bool { return !b.IsNull() && !b.IsUnknown() }
-
-// disablesPort reports whether applying plan over state administratively
-// disables the port: the plan says enabled = false and state does not already
-// record it as disabled. state may be nil (create).
-func disablesPort(plan, state *InterfaceEthernetResourceModel) bool {
-	if !boolKnown(plan.Enabled) || plan.Enabled.ValueBool() {
-		return false
-	}
-	return state == nil || !boolKnown(state.Enabled) || state.Enabled.ValueBool()
-}
-
-// ModifyPlan refuses, at plan time, to disable the port the switch reaches its
-// management next hop through (see mgmtpath.go). It runs only when the plan
-// turns enabled from true (or unrecorded) to false, costs one running-config
-// read plus one `show arp`, and sends no configuration. The same check is
-// repeated in Create/Update as a backstop for a value only known at apply.
+// ModifyPlan runs two plan-time checks. First it rejects a port that another
+// icx_interface_ethernet resource on the same provider instance has already
+// claimed in this operation: two resources on one port clobber each other on
+// every apply and the plan never converges (CLAUDE.md gotcha #10), and nothing
+// in Terraform itself catches it — see providerdata.PortRegistry for what is
+// and is not detected. Then it refuses to disable the port the switch reaches
+// its management next hop through (see mgmtpath.go); that check runs only when
+// the plan turns enabled from true (or unrecorded) to false, costs one
+// running-config read plus one `show arp`, and sends no configuration. The
+// same check is repeated in Create/Update as a backstop for a value only known
+// at apply. Destroy plans skip both: they are not claims (the duplicate must
+// stay removable) and they disable nothing.
 func (r *InterfaceEthernetResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	if req.Plan.Raw.IsNull() || r.client == nil {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+	if r.ports != nil {
+		r.claimPort(req.Config, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+	if r.client == nil {
 		return
 	}
 	var plan InterfaceEthernetResourceModel
@@ -242,6 +245,71 @@ func (r *InterfaceEthernetResource) ModifyPlan(ctx context.Context, req resource
 		return
 	}
 	checkManagementPathDisable(r.client, config, plan.Port.ValueString(), &resp.Diagnostics)
+}
+
+// claimPort registers config's port with the provider's port registry and
+// turns a conflicting earlier claim into a plan error.
+func (r *InterfaceEthernetResource) claimPort(config tfsdk.Config, diags *diag.Diagnostics) {
+	if config.Raw.IsNull() || !config.Raw.IsKnown() {
+		return
+	}
+	// tftypes.Value.As hands back the Value's own attribute map, not a copy,
+	// so build a separate map rather than deleting from it: the request's
+	// Config must stay intact for the checks that run after this one.
+	var raw map[string]tftypes.Value
+	if err := config.Raw.As(&raw); err != nil {
+		diags.AddError("Unexpected configuration shape", err.Error())
+		return
+	}
+	portVal, ok := raw["port"]
+	if !ok || portVal.IsNull() || !portVal.IsFullyKnown() {
+		return // the port is not known until apply; nothing to compare yet
+	}
+	var port string
+	if err := portVal.As(&port); err != nil {
+		diags.AddError("Unexpected port value", err.Error())
+		return
+	}
+	attrs := make(map[string]tftypes.Value, len(raw))
+	for k, v := range raw {
+		if k != "port" && k != "id" {
+			attrs[k] = v
+		}
+	}
+
+	conflicts := r.ports.Claim(port, attrs)
+	if len(conflicts) == 0 {
+		return
+	}
+	diags.AddAttributeError(path.Root("port"),
+		fmt.Sprintf("Port %s is managed by more than one icx_interface_ethernet resource", port),
+		fmt.Sprintf("Another icx_interface_ethernet resource using this provider instance also declares port %s, "+
+			"with a different %s. Each apply would overwrite the other's port settings and VLAN membership, "+
+			"so the plan can never converge and the port's membership is undefined. Keep a single resource "+
+			"for the port. Before deleting the redundant resource from configuration, remove it from state "+
+			"with `terraform state rm <address>`: otherwise its destroy strips VLAN membership the surviving "+
+			"resource still owns, which on an uplink can cut the switch off.",
+			port, strings.Join(conflicts, ", ")))
+}
+
+// dialectFor returns the dialect to use against config: the Configure-time
+// detection, refined with evidence from config itself (its version when the
+// provider could not detect one, and any `dual-mode` lines it contains).
+func (r *InterfaceEthernetResource) dialectFor(config *parser.RunningConfig) dialect.Dialect {
+	return r.dialect.Observe(config)
+}
+
+// boolKnown reports whether b holds a value (neither null nor unknown).
+func boolKnown(b types.Bool) bool { return !b.IsNull() && !b.IsUnknown() }
+
+// disablesPort reports whether applying plan over state administratively
+// disables the port: the plan says enabled = false and state does not already
+// record it as disabled. state may be nil (create).
+func disablesPort(plan, state *InterfaceEthernetResourceModel) bool {
+	if !boolKnown(plan.Enabled) || plan.Enabled.ValueBool() {
+		return false
+	}
+	return state == nil || !boolKnown(state.Enabled) || state.Enabled.ValueBool()
 }
 
 func (r *InterfaceEthernetResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -607,15 +675,7 @@ func (r *InterfaceEthernetResource) resolveTaggedVLANs(ctx context.Context, plan
 
 	// Check for tag_all_vlans.
 	if plan.TagAllVLANs.ValueBool() {
-		var vlanIDs []int
-		for _, v := range config.VLANs {
-			if int64(v.ID) == untaggedVLAN || v.ID == 1 {
-				continue
-			}
-			vlanIDs = append(vlanIDs, v.ID)
-		}
-		sort.Ints(vlanIDs)
-		return vlanIDs
+		return expandAllVLANs(config, int(untaggedVLAN))
 	}
 
 	// Read individual VLAN IDs from the set.
@@ -627,6 +687,22 @@ func (r *InterfaceEthernetResource) resolveTaggedVLANs(ctx context.Context, plan
 	var vlanIDs []int
 	for _, id := range taggedInts {
 		vlanIDs = append(vlanIDs, int(id))
+	}
+	sort.Ints(vlanIDs)
+	return vlanIDs
+}
+
+// expandAllVLANs returns, sorted, the membership tag_all_vlans stands for on a
+// device with this running config: every VLAN except the default VLAN 1 and the
+// port's own untagged VLAN. Create, Update and Read all go through this one
+// expansion, so what Read expects is exactly what an apply would write.
+func expandAllVLANs(config *parser.RunningConfig, untaggedVLAN int) []int {
+	var vlanIDs []int
+	for _, v := range config.VLANs {
+		if v.ID == untaggedVLAN || v.ID == 1 {
+			continue
+		}
+		vlanIDs = append(vlanIDs, v.ID)
 	}
 	sort.Ints(vlanIDs)
 	return vlanIDs
@@ -1076,6 +1152,11 @@ func (r *InterfaceEthernetResource) buildVLANRemovalCommands(ctx context.Context
 
 // readVLANMembership reads VLAN membership for a port from the running config.
 //
+// A port in state with tag_all_vlans = true is checked against the expansion
+// that option stands for (see reconcileTagAllVLANs): when the device matches,
+// state is left exactly as it was, so a healthy trunk plans clean; when it
+// does not, state reports the device truth so the plan shows the repair.
+//
 // When the interface carries a `dual-mode [vlan]` line (FastIron 08.0.30-era
 // trunk-untagged dialect), that VLAN is the port's untagged VLAN regardless of
 // the VLAN-context lists, and it is excluded from tagged_vlans even though the
@@ -1116,9 +1197,8 @@ func (r *InterfaceEthernetResource) readVLANMembership(ctx context.Context, port
 		}
 	}
 
-	// If tag_all_vlans is set, don't overwrite tagged_vlans with the expanded list.
 	if state.TagAllVLANs.ValueBool() {
-		// Keep tag_all_vlans = true in state; don't touch tagged_vlans.
+		r.reconcileTagAllVLANs(ctx, port, taggedVLANs, untaggedVLAN, config, state, diags)
 	} else if len(taggedVLANs) > 0 {
 		state.TaggedVLANs = int64SliceToSet(ctx, taggedVLANs, diags)
 	} else {
@@ -1130,6 +1210,97 @@ func (r *InterfaceEthernetResource) readVLANMembership(ctx context.Context, port
 	} else {
 		state.UntaggedVLAN = types.Int64Null()
 	}
+}
+
+// reconcileTagAllVLANs is Read's half of tag_all_vlans (CLAUDE.md gotcha #8).
+//
+// tag_all_vlans cannot be read from the switch, but what it promises can be:
+// the port tagged in every VLAN that expandAllVLANs returns. When the device
+// honours that promise, state is left untouched — tagged_vlans stays whatever
+// the last apply stored (null for a plain tag_all_vlans resource), so there is
+// no diff and no perpetual churn. When a VLAN is missing (a hand-run `no tagged
+// ethe`, a VLAN that predates Terraform on this switch, an apply that died
+// halfway), state is rewritten to what the device actually has: tag_all_vlans =
+// false and tagged_vlans = the real tagged set. Against a configuration that
+// still says tag_all_vlans = true that is an ordinary update, and Update then
+// resolves the old side from the explicit set and the new side from the
+// expansion, so it issues `tagged ethe` for exactly the missing VLANs.
+//
+// The repair is additive by construction. The expansion is every VLAN except
+// VLAN 1 and the port's untagged VLAN, and a FastIron port cannot be both
+// tagged and untagged in one VLAN, so the device's tagged set is always a
+// subset of the expansion: Update has nothing to remove. (The one removal a
+// tag_all_vlans trunk can see is when untagged_vlan itself changes, which is an
+// explicit configuration change, not drift.) Should a device ever report a
+// tagged VLAN outside the expansion, the warning names it, because the apply
+// would drop that membership.
+//
+// On dual-mode firmware the dual-mode VLAN is the untagged VLAN and is already
+// excluded from actual by the caller, mirroring buildDualModeMembershipCommands.
+func (r *InterfaceEthernetResource) reconcileTagAllVLANs(ctx context.Context, port string, actual []int64, untaggedVLAN int, config *parser.RunningConfig, state *InterfaceEthernetResourceModel, diags *diag.Diagnostics) {
+	expected := expandAllVLANs(config, untaggedVLAN)
+
+	have := make(map[int]bool, len(actual))
+	for _, id := range actual {
+		have[int(id)] = true
+	}
+	var missing, extra []int
+	for _, id := range expected {
+		if !have[id] {
+			missing = append(missing, id)
+		}
+	}
+	for _, id := range actual {
+		if !intSliceContains(expected, int(id)) {
+			extra = append(extra, int(id))
+		}
+	}
+	sort.Ints(extra)
+	if len(missing) == 0 && len(extra) == 0 {
+		return
+	}
+
+	state.TagAllVLANs = types.BoolValue(false)
+	if len(actual) > 0 {
+		state.TaggedVLANs = int64SliceToSet(ctx, actual, diags)
+	} else {
+		state.TaggedVLANs = types.SetNull(types.Int64Type)
+	}
+
+	var detail strings.Builder
+	fmt.Fprintf(&detail, "Port %s is declared tag_all_vlans = true, but the switch does not tag it in every VLAN.", port)
+	if len(missing) > 0 {
+		fmt.Fprintf(&detail, " Missing from the port: VLAN %s.", joinInts(missing))
+	}
+	if len(extra) > 0 {
+		fmt.Fprintf(&detail, " Tagged outside the expansion: VLAN %s (an apply removes those memberships; check them first).", joinInts(extra))
+	}
+	detail.WriteString(" State now records the port's actual membership (tag_all_vlans = false, tagged_vlans = ")
+	if len(actual) > 0 {
+		fmt.Fprintf(&detail, "[%s]", joinInts64(actual))
+	} else {
+		detail.WriteString("null")
+	}
+	detail.WriteString("), so the plan shows an update back to tag_all_vlans = true; applying it tags the missing VLANs and removes nothing else." +
+		" A host on a missing VLAN typically has link and a correct address but never gets an ARP reply: this port is a transit trunk that drops its frames.")
+	diags.AddAttributeWarning(path.Root("tag_all_vlans"),
+		fmt.Sprintf("tag_all_vlans trunk %s has drifted", port), detail.String())
+}
+
+func joinInts(ids []int) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = fmt.Sprint(id)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func joinInts64(ids []int64) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = fmt.Sprint(id)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (r *InterfaceEthernetResource) getRunningConfig() (*parser.RunningConfig, error) {
