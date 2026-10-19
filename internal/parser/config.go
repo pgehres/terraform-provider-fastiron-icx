@@ -118,6 +118,8 @@ func (c *RunningConfig) parseStanza(lines []string) error {
 		c.Global.DefaultGateway = strings.TrimPrefix(first, "ip default-gateway ")
 	case strings.HasPrefix(first, "ip address "):
 		c.Global.IPAddress = strings.TrimPrefix(first, "ip address ")
+		fields := strings.Fields(c.Global.IPAddress)
+		c.Global.IPAddressDynamic = len(fields) > 2 && fields[len(fields)-1] == "dynamic"
 	case strings.HasPrefix(first, "ip dns server-address "):
 		// One line may carry up to four addresses; several lines accumulate.
 		c.Global.DNSServers = append(c.Global.DNSServers,
