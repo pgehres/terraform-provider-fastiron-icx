@@ -21,4 +21,15 @@ type Options struct {
 	// WARNING: this permits man-in-the-middle interception; use only on isolated
 	// lab networks where MITM is not a concern.
 	InsecureSkipHostKeyVerify bool
+
+	// LegacySSHAlgorithms additionally offers the SHA-1/CBC-era SSH algorithms
+	// that x/crypto still implements but excludes by default
+	// (diffie-hellman-group14-sha1, diffie-hellman-group1-sha1,
+	// diffie-hellman-group-exchange-sha1 key exchange; aes128-cbc and 3des-cbc
+	// ciphers; ssh-rsa and ssh-dss host key signatures). Old FastIron SSH
+	// stacks — e.g. FastIron 08.0.30 on the EOL ICX 6430 — support nothing
+	// newer. Modern algorithms stay first in the preference order, so switches
+	// that support them are unaffected. WARNING: these algorithms are
+	// cryptographically weak; enable only for EOL devices on trusted networks.
+	LegacySSHAlgorithms bool
 }

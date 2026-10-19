@@ -70,6 +70,10 @@ func (c *RunningConfig) parseStanza(lines []string) error {
 		return c.parseVEStanza(lines)
 	case strings.HasPrefix(first, "stack unit "):
 		return c.parseStackUnitStanza(lines)
+	case strings.HasPrefix(first, "module "):
+		// Stackless models (e.g. ICX 6430-C12 on FastIron 08.0.30) emit module
+		// lines at the top level, without a "stack unit N" wrapper.
+		c.parseBareModuleLine(first)
 	case strings.HasPrefix(first, "username "):
 		return c.parseUserLine(first)
 	case strings.HasPrefix(first, "aaa "):

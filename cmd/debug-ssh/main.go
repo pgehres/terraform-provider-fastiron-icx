@@ -15,6 +15,10 @@ func main() {
 		"connect only far enough to capture the switch's SSH host key, print it in host_key-ready formats, and exit; "+
 			"requires only FASTIRON_HOST (no credentials). Use this when ssh-keyscan returns nothing — older FastIron "+
 			"SSH stacks offer KEX algorithms modern OpenSSH refuses to negotiate.")
+	legacySSH := flag.Bool("legacy-ssh", false,
+		"additionally offer legacy SSH algorithms (SHA-1 key exchange, CBC ciphers, ssh-rsa/ssh-dss host key "+
+			"signatures) for very old FastIron stacks, e.g. 08.0.30 on the ICX 6430. The -print-host-key probe "+
+			"always offers them; this flag applies to the full connect.")
 	flag.Parse()
 
 	host := os.Getenv("FASTIRON_HOST")
@@ -53,13 +57,14 @@ func main() {
 	hostKey := os.Getenv("FASTIRON_HOST_KEY")
 
 	opts := sshclient.Options{
-		Host:           host,
-		Port:           22,
-		Username:       user,
-		Password:       pass,
-		EnablePassword: enablePass,
-		TimeoutSeconds: 15,
-		HostKey:        hostKey,
+		Host:                host,
+		Port:                22,
+		Username:            user,
+		Password:            pass,
+		EnablePassword:      enablePass,
+		TimeoutSeconds:      15,
+		HostKey:             hostKey,
+		LegacySSHAlgorithms: *legacySSH,
 	}
 
 	if hostKey == "" {

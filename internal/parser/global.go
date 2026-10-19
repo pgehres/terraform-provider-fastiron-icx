@@ -86,6 +86,35 @@ func (c *RunningConfig) parseStackUnitStanza(lines []string) error {
 	return nil
 }
 
+// parseBareModuleLine handles a top-level "module N <type>" line that is not
+// wrapped in a "stack unit N" stanza. Stackless models (e.g. the ICX 6430-C12
+// on FastIron 08.0.30) emit module lines at the top level; treat them as
+// belonging to an implicit unit 1.
+func (c *RunningConfig) parseBareModuleLine(line string) {
+	mm := moduleRe.FindStringSubmatch(line)
+	if mm == nil {
+		return
+	}
+	modID, _ := strconv.Atoi(mm[1])
+	unit := c.findOrCreateStackUnit(1)
+	unit.Modules = append(unit.Modules, StackModule{
+		ID:   modID,
+		Type: mm[2],
+	})
+}
+
+// findOrCreateStackUnit returns a pointer to the stack unit with the given ID,
+// appending a new empty unit if none exists yet.
+func (c *RunningConfig) findOrCreateStackUnit(id int) *StackUnit {
+	for i := range c.StackUnits {
+		if c.StackUnits[i].ID == id {
+			return &c.StackUnits[i]
+		}
+	}
+	c.StackUnits = append(c.StackUnits, StackUnit{ID: id})
+	return &c.StackUnits[len(c.StackUnits)-1]
+}
+
 func (c *RunningConfig) parseUserLine(line string) error {
 	// Format: "username NAME password HASH"
 	parts := strings.Fields(line)
