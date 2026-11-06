@@ -98,6 +98,10 @@ func TestDetectHas(t *testing.T) {
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: true,
 			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapClockTimezoneRegions: true, CapVlanConfigAllTagged: true,
 		}},
+		{"7450-48P switch 09.0.10", "09.0.10k_cd3T211", parser.ImageTypeSwitch, true, caps{
+			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: true,
+			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: false, CapLegacyDHCPClient: false, CapClockTimezoneRegions: true, CapVlanConfigAllTagged: true,
+		}},
 		{"6430 switch 08.0.30", "08.0.30uT311", parser.ImageTypeSwitch, true, caps{
 			CapVEInterfaces: false, CapRouterInterface: false, CapGlobalSTP: false, CapManager: false,
 			CapGlobalManagementIP: true, CapOpticalMonitor: true, CapDualMode: true, CapLegacyDHCPClient: true, CapClockTimezoneRegions: false, CapVlanConfigAllTagged: false,
@@ -328,6 +332,7 @@ func TestFromConfigFixtures(t *testing.T) {
 		{"7150-24", parser.ImageTypeRouter, false, "ip dhcp-client disable"},
 		{"7150-c12", parser.ImageTypeRouter, false, "ip dhcp-client disable"},
 		{"7150-c10zp", parser.ImageTypeSwitch, false, "ip dhcp-client disable"},
+		{"7450-48p", parser.ImageTypeSwitch, false, "ip dhcp-client disable"},
 		{"6430-c12", parser.ImageTypeSwitch, true, "no ip dhcp-client enable"},
 		{"6450-c12pd", parser.ImageTypeRouter, true, "ip dhcp-client disable"},
 	}

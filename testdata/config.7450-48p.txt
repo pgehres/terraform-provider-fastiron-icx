@@ -1,0 +1,78 @@
+Current configuration:
+!
+ver 09.0.10k_cd3T211
+!
+stack unit 1
+  module 1 icx7450-48p-poe-management-module
+  module 2 icx7400-xgf-4port-40g-module
+  module 3 icx7400-qsfp-1port-40g-module
+  module 4 icx7400-qsfp-1port-40g-module
+  stack-port ethernet 1/3/1
+  stack-port ethernet 1/4/1
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!
+boot system flash primary
+ip dns domain-list argosity.com dynamic
+ip dns server-address 192.0.2.1(dynamic)
+ip address 192.0.2.100 255.255.255.0 dynamic
+ip tftp blocksize 8192
+ip default-gateway 192.0.2.1 dynamic
+!
+!
+!
+interface management 1
+!
+!
+
+!
+!
+
+
+
+!
+!
+!
+!
+username super password ..... 
+username operator password ..... 
+!
+aaa authentication login default local
+!
+aaa authentication web-server default local
+!
+aaa authentication snmp-server default local
+!
+no ip dhcp-client auto-update enable
+!
+
+
+!
+
+
+!
+
+
+!
+no telnet server
+!
+manager registrar 
+manager port-list 987
+!
+
+
+!
+
+
+!
+
+end

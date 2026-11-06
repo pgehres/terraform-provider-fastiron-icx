@@ -239,7 +239,7 @@ resource "icx_logging" "this" {
 
 ### icx_poe
 
-Manages per-port Power over Ethernet settings.
+Manages per-port Power over Ethernet settings. The state is read back from the switch (`show inline power` and the running config), so out-of-band changes show as diffs. One option per port: `power_limit` or `priority`.
 
 ```hcl
 resource "icx_poe" "camera" {
