@@ -429,10 +429,18 @@ func TestConnectUnknownTransport(t *testing.T) {
 }
 
 func TestAuthMethodsGatedOnOptIn(t *testing.T) {
-	if n := len(authMethods(Options{Password: "x"})); n != 1 {
+	count := func(opts Options) int {
+		t.Helper()
+		m, err := authMethods(opts)
+		if err != nil {
+			t.Fatalf("authMethods: %v", err)
+		}
+		return len(m)
+	}
+	if n := count(Options{Password: "x"}); n != 1 {
 		t.Errorf("default must offer password auth only, got %d methods", n)
 	}
-	if n := len(authMethods(Options{AllowEmptyCredentials: true})); n != 2 {
+	if n := count(Options{AllowEmptyCredentials: true}); n != 2 {
 		t.Errorf("opt-in must add keyboard-interactive, got %d methods", n)
 	}
 }

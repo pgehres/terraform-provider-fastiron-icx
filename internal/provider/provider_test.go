@@ -2,8 +2,13 @@ package provider
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -97,6 +102,71 @@ func TestResolveConnectionEmptyCredentials(t *testing.T) {
 	}
 	if !strings.Contains(detail, "empty username, password, enable_password") {
 		t.Errorf("warning detail = %q, want it to name the empty fields", detail)
+	}
+}
+
+func testPrivateKey(t *testing.T) string {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(block))
+}
+
+// Over SSH a private key replaces the password: no error, no warning, and
+// the key reaches the client options.
+func TestResolveConnectionPrivateKey(t *testing.T) {
+	s := sshSettings()
+	s.Password, s.PrivateKey = "", testPrivateKey(t)
+	opts, diags := resolveConnection(s)
+	if len(diags) != 0 {
+		t.Fatalf("unexpected diagnostics: %v", diags)
+	}
+	if opts.PrivateKey != s.PrivateKey || opts.Password != "" {
+		t.Error("the private key must reach the client options unchanged, with no password")
+	}
+}
+
+func TestResolveConnectionPrivateKeyErrors(t *testing.T) {
+	// An unparseable key fails at configure time, and the key is not echoed.
+	s := sshSettings()
+	s.PrivateKey = "garbage-key-material"
+	_, diags := resolveConnection(s)
+	if !hasSummary(diags, diag.SeverityError, "Invalid private_key") {
+		t.Fatalf("errors = %v, want Invalid private_key", summaries(diags, diag.SeverityError))
+	}
+	for _, d := range diags {
+		if strings.Contains(d.Detail(), "garbage-key-material") {
+			t.Errorf("diagnostic echoes the key: %q", d.Detail())
+		}
+	}
+
+	// Telnet cannot use a key, so it still needs the password and reports
+	// the key as ignored.
+	s = sshSettings()
+	s.Password, s.PrivateKey = "", testPrivateKey(t)
+	s.Transport, s.InsecureTransportAck = "telnet", true
+	_, diags = resolveConnection(s)
+	if !hasSummary(diags, diag.SeverityError, "Missing password") {
+		t.Errorf("errors = %v, want Missing password over telnet", summaries(diags, diag.SeverityError))
+	}
+	s.Password = "pw"
+	_, diags = resolveConnection(s)
+	if !hasSummary(diags, diag.SeverityWarning, "SSH settings ignored") {
+		t.Errorf("warnings = %v, want private_key reported as ignored", summaries(diags, diag.SeverityWarning))
+	}
+
+	// A passphrase without a key is unused, which deserves a warning.
+	s = sshSettings()
+	s.PrivateKeyPassphrase = "pp"
+	_, diags = resolveConnection(s)
+	if !hasSummary(diags, diag.SeverityWarning, "private_key_passphrase without private_key") {
+		t.Errorf("warnings = %v", summaries(diags, diag.SeverityWarning))
 	}
 }
 

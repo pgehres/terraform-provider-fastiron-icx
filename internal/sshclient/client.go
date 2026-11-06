@@ -131,9 +131,14 @@ func NewClient(opts Options) (*Client, error) {
 		return nil, fmt.Errorf("host key config: %w", err)
 	}
 
+	auth, err := authMethods(opts)
+	if err != nil {
+		return nil, err
+	}
+
 	config := &ssh.ClientConfig{
 		User:            opts.Username,
-		Auth:            authMethods(opts),
+		Auth:            auth,
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         time.Duration(opts.TimeoutSeconds) * time.Second,
 	}
@@ -216,14 +221,26 @@ func NewClient(opts Options) (*Client, error) {
 // x/crypto client always tries the "none" method first (RFC 4252 §5.2) and
 // only then the methods listed here, in the order the server suggests them —
 // so a switch with no credentials configured is already covered when it
-// accepts "none". Password authentication is always offered. With
+// accepts "none". With a PrivateKey, public key authentication is offered
+// first, and the password only when one is set. Without a key, password
+// authentication is always offered. With
 // AllowEmptyCredentials the password (empty or not) is additionally given as
 // the answer to every keyboard-interactive question, which is how some SSH
 // stacks present their (possibly empty) password prompt instead of the
 // "password" method; it is gated so that the default connection behaviour —
 // a single password attempt — does not change for anyone else.
-func authMethods(opts Options) []ssh.AuthMethod {
-	methods := []ssh.AuthMethod{ssh.Password(opts.Password)}
+func authMethods(opts Options) ([]ssh.AuthMethod, error) {
+	var methods []ssh.AuthMethod
+	if opts.PrivateKey != "" {
+		signer, err := ParsePrivateKey(opts.PrivateKey, opts.PrivateKeyPassphrase)
+		if err != nil {
+			return nil, err
+		}
+		methods = append(methods, ssh.PublicKeys(signer))
+	}
+	if opts.PrivateKey == "" || opts.Password != "" {
+		methods = append(methods, ssh.Password(opts.Password))
+	}
 	if opts.AllowEmptyCredentials {
 		methods = append(methods, ssh.KeyboardInteractive(
 			func(_, _ string, questions []string, _ []bool) ([]string, error) {
@@ -234,7 +251,29 @@ func authMethods(opts Options) []ssh.AuthMethod {
 				return answers, nil
 			}))
 	}
-	return methods
+	return methods, nil
+}
+
+// ParsePrivateKey parses a PEM-encoded SSH private key, decrypting it with
+// passphrase when one is given. The error never contains key material.
+func ParsePrivateKey(pemKey, passphrase string) (ssh.Signer, error) {
+	var (
+		signer ssh.Signer
+		err    error
+	)
+	if passphrase != "" {
+		signer, err = ssh.ParsePrivateKeyWithPassphrase([]byte(pemKey), []byte(passphrase))
+	} else {
+		signer, err = ssh.ParsePrivateKey([]byte(pemKey))
+	}
+	if err != nil {
+		var missing *ssh.PassphraseMissingError
+		if errors.As(err, &missing) {
+			return nil, errors.New("private key is encrypted: set the private key passphrase")
+		}
+		return nil, fmt.Errorf("parse private key: %w", err)
+	}
+	return signer, nil
 }
 
 // newSessionClient wraps an already-connected interactive terminal — the SSH

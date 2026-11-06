@@ -46,7 +46,8 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 ### Provider Config
 - Uses provider aliases for multi-switch management (one alias per switch)
 - No default provider needed if all resources specify `provider = icx.<alias>`
-- Env vars: `FASTIRON_HOST`, `FASTIRON_USERNAME`, `FASTIRON_PASSWORD`, `FASTIRON_ENABLE_PASSWORD`, `FASTIRON_HOST_KEY`, `FASTIRON_PORT`, `FASTIRON_TRANSPORT`
+- Env vars: `FASTIRON_HOST`, `FASTIRON_USERNAME`, `FASTIRON_PASSWORD`, `FASTIRON_ENABLE_PASSWORD`, `FASTIRON_PRIVATE_KEY`, `FASTIRON_PRIVATE_KEY_PASSPHRASE`, `FASTIRON_HOST_KEY`, `FASTIRON_PORT`, `FASTIRON_TRANSPORT`
+- **Public key auth** (`private_key`, PEM text): `authMethods` offers the key first and the password only when one is set (no key: password always, as before). `resolveConnection` parses the key up front (`sshclient.ParsePrivateKey`, errors never contain key material), lets it replace the password over SSH only (telnet still needs the password and reports the key as ignored), and warns on a passphrase without a key. Tested end to end in `pubkey_test.go` against an x/crypto SSH server that accepts only the key and pipes the shell into `fakeSwitch`. Validated live on an ICX 7450 with FastIron 09.0.10k (`debug-ssh -key`).
 - Connection policy lives in `resolveConnection` (provider.go), a pure function unit-tested in provider_test.go: credentials required unless `allow_empty_credentials` (warns); SSH needs `host_key` or `insecure_skip_host_key_verify`; `transport = "telnet"` needs `insecure_transport_ack` (error without, plaintext warning with, and SSH-only settings warn as ignored). Port 0 lets the transport pick 22/23.
 
 ## Key Decisions & Gotchas

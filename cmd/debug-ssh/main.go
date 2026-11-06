@@ -30,6 +30,10 @@ func main() {
 	allowEmpty := flag.Bool("allow-empty-credentials", false,
 		"permit empty FASTIRON_USERNAME / FASTIRON_PASSWORD / FASTIRON_ENABLE_PASSWORD, as a factory-fresh switch "+
 			"with no local users accepts (the provider's allow_empty_credentials).")
+	keyFile := flag.String("key", "",
+		"path to an SSH private key for public key authentication (the provider's private_key); "+
+			"FASTIRON_PRIVATE_KEY_FILE is also honoured. With a key, FASTIRON_PASSWORD may be empty. "+
+			"An encrypted key needs FASTIRON_PRIVATE_KEY_PASSPHRASE.")
 	port := flag.Int("port", 0, "TCP port; 0 = the transport's default (22 for ssh, 23 for telnet). FASTIRON_PORT is also honoured.")
 	flag.Parse()
 
@@ -67,8 +71,22 @@ func main() {
 	user := os.Getenv("FASTIRON_USERNAME")
 	pass := os.Getenv("FASTIRON_PASSWORD")
 
-	if host == "" || (!*allowEmpty && (user == "" || pass == "")) {
-		fmt.Fprintln(os.Stderr, "Set FASTIRON_HOST, FASTIRON_USERNAME, FASTIRON_PASSWORD (or pass -allow-empty-credentials for a switch with no users)")
+	if *keyFile == "" {
+		*keyFile = os.Getenv("FASTIRON_PRIVATE_KEY_FILE")
+	}
+	var privateKey string
+	if *keyFile != "" {
+		b, err := os.ReadFile(*keyFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read private key: %v\n", err)
+			os.Exit(1)
+		}
+		privateKey = string(b)
+	}
+
+	if host == "" || (!*allowEmpty && (user == "" || (pass == "" && privateKey == ""))) {
+		fmt.Fprintln(os.Stderr, "Set FASTIRON_HOST, FASTIRON_USERNAME and FASTIRON_PASSWORD or -key "+
+			"(or pass -allow-empty-credentials for a switch with no users)")
 		os.Exit(1)
 	}
 
@@ -85,6 +103,8 @@ func main() {
 		Port:                  *port,
 		Username:              user,
 		Password:              pass,
+		PrivateKey:            privateKey,
+		PrivateKeyPassphrase:  os.Getenv("FASTIRON_PRIVATE_KEY_PASSPHRASE"),
 		EnablePassword:        enablePass,
 		TimeoutSeconds:        15,
 		HostKey:               hostKey,
