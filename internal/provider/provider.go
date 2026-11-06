@@ -38,6 +38,8 @@ type FastIronICXProviderModel struct {
 	Username                  types.String `tfsdk:"username"`
 	Password                  types.String `tfsdk:"password"`
 	EnablePassword            types.String `tfsdk:"enable_password"`
+	PrivateKey                types.String `tfsdk:"private_key"`
+	PrivateKeyPassphrase      types.String `tfsdk:"private_key_passphrase"`
 	Timeout                   types.Int64  `tfsdk:"timeout"`
 	HostKey                   types.String `tfsdk:"host_key"`
 	InsecureSkipHostKeyVerify types.Bool   `tfsdk:"insecure_skip_host_key_verify"`
@@ -80,7 +82,7 @@ func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest
 				Validators:  []validator.String{noControlCharacters{}},
 			},
 			"password": schema.StringAttribute{
-				Description: "Login password. Required unless allow_empty_credentials is set. Can also be set with the FASTIRON_PASSWORD environment variable.",
+				Description: "Login password. Required unless private_key (SSH) or allow_empty_credentials is set. Can also be set with the FASTIRON_PASSWORD environment variable.",
 				Optional:    true,
 				Sensitive:   true,
 				Validators:  []validator.String{noControlCharacters{}},
@@ -90,6 +92,19 @@ func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest
 				Optional:    true,
 				Sensitive:   true,
 				Validators:  []validator.String{noControlCharacters{}},
+			},
+			"private_key": schema.StringAttribute{
+				Description: "PEM-encoded SSH private key for public key authentication, e.g. file(\"~/.ssh/id_ed25519\"). " +
+					"Offered before the password; with a key, password may be omitted. SSH only. " +
+					"Can also be set with the FASTIRON_PRIVATE_KEY environment variable.",
+				Optional:  true,
+				Sensitive: true,
+			},
+			"private_key_passphrase": schema.StringAttribute{
+				Description: "Passphrase for an encrypted private_key. " +
+					"Can also be set with the FASTIRON_PRIVATE_KEY_PASSPHRASE environment variable.",
+				Optional:  true,
+				Sensitive: true,
 			},
 			"timeout": schema.Int64Attribute{
 				Description: "Connection and per-command read timeout in seconds. Defaults to 30.",
@@ -159,6 +174,7 @@ func (p *FastIronICXProvider) Schema(_ context.Context, _ provider.SchemaRequest
 // variables applied and nothing validated yet.
 type connectionSettings struct {
 	Host, Username, Password, EnablePassword string
+	PrivateKey, PrivateKeyPassphrase         string
 	HostKey, Transport                       string
 	Port, Timeout                            int
 	InsecureSkipHostKeyVerify                bool
@@ -174,7 +190,8 @@ type connectionSettings struct {
 //
 //   - host is required;
 //   - username and password are required unless allow_empty_credentials,
-//     which warns;
+//     which warns; over SSH a private_key replaces the password, and a key
+//     that does not parse is an error;
 //   - over SSH one of host_key / insecure_skip_host_key_verify is required;
 //   - telnet requires insecure_transport_ack, warns that it is plaintext,
 //     and warns about SSH-only settings it ignores.
@@ -220,7 +237,7 @@ func resolveConnection(s connectionSettings) (sshclient.Options, diag.Diagnostic
 				emptyCredentialsHint)
 			return sshclient.Options{}, diags
 		}
-		if s.Password == "" {
+		if s.Password == "" && (s.PrivateKey == "" || transport != sshclient.TransportSSH) {
 			diags.AddError("Missing password", "The password must be set in the provider configuration or the FASTIRON_PASSWORD environment variable."+
 				emptyCredentialsHint)
 			return sshclient.Options{}, diags
@@ -240,8 +257,19 @@ func resolveConnection(s connectionSettings) (sshclient.Options, diag.Diagnostic
 		}
 	}
 
+	if s.PrivateKey == "" && s.PrivateKeyPassphrase != "" {
+		diags.AddWarning("private_key_passphrase without private_key",
+			"private_key_passphrase is set but private_key is not, so the passphrase is not used.")
+	}
+
 	switch transport {
 	case sshclient.TransportSSH:
+		if s.PrivateKey != "" {
+			if _, err := sshclient.ParsePrivateKey(s.PrivateKey, s.PrivateKeyPassphrase); err != nil {
+				diags.AddError("Invalid private_key", "The SSH private key could not be used: "+err.Error())
+				return sshclient.Options{}, diags
+			}
+		}
 		if s.HostKey == "" && !s.InsecureSkipHostKeyVerify {
 			diags.AddError(
 				"Missing SSH host key",
@@ -282,6 +310,9 @@ func resolveConnection(s connectionSettings) (sshclient.Options, diag.Diagnostic
 		if s.LegacySSHAlgorithms {
 			ignored = append(ignored, "legacy_ssh_algorithms")
 		}
+		if s.PrivateKey != "" {
+			ignored = append(ignored, "private_key")
+		}
 		if len(ignored) > 0 {
 			diags.AddWarning("SSH settings ignored with telnet",
 				strings.Join(ignored, ", ")+" only apply to the SSH transport and are ignored while transport = \"telnet\".")
@@ -294,6 +325,8 @@ func resolveConnection(s connectionSettings) (sshclient.Options, diag.Diagnostic
 		Username:                  s.Username,
 		Password:                  s.Password,
 		EnablePassword:            s.EnablePassword,
+		PrivateKey:                s.PrivateKey,
+		PrivateKeyPassphrase:      s.PrivateKeyPassphrase,
 		TimeoutSeconds:            s.Timeout,
 		HostKey:                   s.HostKey,
 		InsecureSkipHostKeyVerify: s.InsecureSkipHostKeyVerify,
@@ -356,6 +389,8 @@ func (p *FastIronICXProvider) Configure(ctx context.Context, req provider.Config
 		Username:                  stringValueOrEnv(config.Username, "FASTIRON_USERNAME"),
 		Password:                  stringValueOrEnv(config.Password, "FASTIRON_PASSWORD"),
 		EnablePassword:            stringValueOrEnv(config.EnablePassword, "FASTIRON_ENABLE_PASSWORD"),
+		PrivateKey:                stringValueOrEnv(config.PrivateKey, "FASTIRON_PRIVATE_KEY"),
+		PrivateKeyPassphrase:      stringValueOrEnv(config.PrivateKeyPassphrase, "FASTIRON_PRIVATE_KEY_PASSPHRASE"),
 		HostKey:                   stringValueOrEnv(config.HostKey, "FASTIRON_HOST_KEY"),
 		Transport:                 stringValueOrEnv(config.Transport, "FASTIRON_TRANSPORT"),
 		Timeout:                   30,

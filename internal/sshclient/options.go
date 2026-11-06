@@ -17,6 +17,14 @@ type Options struct {
 	EnablePassword string
 	TimeoutSeconds int
 
+	// PrivateKey is a PEM-encoded SSH private key (OpenSSH, PKCS#1, PKCS#8 or
+	// SEC1 format) for public key authentication. When set, the SSH transport
+	// offers it before the password, and Password may be empty. Telnet
+	// ignores it.
+	PrivateKey string
+	// PrivateKeyPassphrase decrypts PrivateKey when it is encrypted.
+	PrivateKeyPassphrase string
+
 	// Transport selects the interactive transport: TransportSSH (the default
 	// when empty) or TransportTelnet. Telnet is plaintext — credentials and
 	// every command cross the wire unencrypted and the switch's identity is

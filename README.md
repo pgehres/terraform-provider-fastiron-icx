@@ -50,7 +50,9 @@ resource "icx_interface_ethernet" "server1" {
 | `host` | Switch IP or hostname | Yes | `FASTIRON_HOST` |
 | `port` | TCP port (default: 22 for SSH, 23 for telnet) | No | `FASTIRON_PORT` |
 | `username` | Login username | Unless `allow_empty_credentials` | `FASTIRON_USERNAME` |
-| `password` | Login password | Unless `allow_empty_credentials` | `FASTIRON_PASSWORD` |
+| `password` | Login password | Unless `private_key` or `allow_empty_credentials` | `FASTIRON_PASSWORD` |
+| `private_key` | PEM SSH private key for public key auth, e.g. `file("~/.ssh/id_ed25519")` | No | `FASTIRON_PRIVATE_KEY` |
+| `private_key_passphrase` | Passphrase for an encrypted `private_key` | No | `FASTIRON_PRIVATE_KEY_PASSPHRASE` |
 | `enable_password` | Enable mode password | No | `FASTIRON_ENABLE_PASSWORD` |
 | `timeout` | Connection / command timeout in seconds (default: 30) | No | |
 | `host_key` | SSH host key or `SHA256:` fingerprint (one of this or `insecure_skip_host_key_verify` is required over SSH) | See docs | `FASTIRON_HOST_KEY` |

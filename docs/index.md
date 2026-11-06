@@ -166,6 +166,20 @@ resource "icx_vlan" "servers" {
 }
 ```
 
+### SSH Public Key Authentication
+
+```terraform
+provider "icx" {
+  host            = "192.168.1.1"
+  username        = "admin"
+  private_key     = file("~/.ssh/icx_admin")
+  enable_password = var.enable_password
+  host_key        = "192.168.1.1 ecdsa-sha2-nistp384 AAAAE2VjZHNh..."
+}
+```
+
+With `private_key` the provider offers public key authentication first, and `password` may be omitted. If `password` is also set, it is offered after the key. Load the public key on the switch first. On FastIron 09.0.x the import is `copy tftp flash <server> <file> ssh-pub-key-file` (the 08.0.x `ip ssh pub-key-file` command was removed). The file is the RFC 4716 form of the key (`ssh-keygen -e -f key.pub`).
+
 ### Multi-Switch Usage with Provider Aliases
 
 ```terraform
@@ -209,7 +223,9 @@ resource "icx_vlan" "servers_access" {
 | `host` | string | yes | `FASTIRON_HOST` | Hostname or IP address of the switch. |
 | `port` | number | no | `FASTIRON_PORT` | TCP port of the CLI transport. Defaults to 22 for SSH, 23 for telnet. |
 | `username` | string | see note | `FASTIRON_USERNAME` | Login username. Required unless `allow_empty_credentials` is set. |
-| `password` | string | see note | `FASTIRON_PASSWORD` | Login password. Required unless `allow_empty_credentials` is set. Sensitive. |
+| `password` | string | see note | `FASTIRON_PASSWORD` | Login password. Required unless `private_key` (SSH) or `allow_empty_credentials` is set. Sensitive. |
+| `private_key` | string | no | `FASTIRON_PRIVATE_KEY` | PEM-encoded SSH private key for public key authentication, e.g. `file("~/.ssh/id_ed25519")`. Offered before the password. SSH only. Sensitive. |
+| `private_key_passphrase` | string | no | `FASTIRON_PRIVATE_KEY_PASSPHRASE` | Passphrase for an encrypted `private_key`. Sensitive. |
 | `enable_password` | string | no | `FASTIRON_ENABLE_PASSWORD` | Enable mode password. Required if the switch prompts for one (unless `allow_empty_credentials` is set); safe to set even when the switch has no enable password configured. Sensitive. |
 | `timeout` | number | no | — | Connection and per-command read timeout in seconds. Defaults to 30. |
 | `host_key` | string | see note | `FASTIRON_HOST_KEY` | The switch's SSH host public key in `known_hosts` format or `SHA256:<fingerprint>`. Obtain with `ssh-keyscan <host>` (see the host-key note above if it prints nothing). One of `host_key` or `insecure_skip_host_key_verify` is required over SSH; ignored over telnet. |
@@ -234,9 +250,17 @@ TCP port of the CLI transport. Defaults to `22` for SSH and `23` for telnet. Can
 
 Login username. Can also be set with the `FASTIRON_USERNAME` environment variable. May be omitted or empty only when `allow_empty_credentials = true`.
 
-#### `password` (Required unless `allow_empty_credentials`, Sensitive)
+#### `password` (Required unless `private_key` or `allow_empty_credentials`, Sensitive)
 
-Login password. Can also be set with the `FASTIRON_PASSWORD` environment variable. May be omitted or empty only when `allow_empty_credentials = true`.
+Login password. Can also be set with the `FASTIRON_PASSWORD` environment variable. May be omitted or empty when `private_key` is set (SSH only; telnet always needs the password) or when `allow_empty_credentials = true`.
+
+#### `private_key` (Optional, Sensitive)
+
+PEM-encoded SSH private key (OpenSSH, PKCS#1, PKCS#8 or SEC1 format) for public key authentication. Use `file()` to read it. The provider offers the key first, then the password if one is set. A key that does not parse fails at configure time; the error never contains key material. Ignored over telnet, with a warning. Can also be set with the `FASTIRON_PRIVATE_KEY` environment variable (the PEM text itself, not a path).
+
+#### `private_key_passphrase` (Optional, Sensitive)
+
+Passphrase for an encrypted `private_key`. A passphrase without a key gives a warning. Can also be set with the `FASTIRON_PRIVATE_KEY_PASSPHRASE` environment variable.
 
 #### `enable_password` (Optional, Sensitive)
 
