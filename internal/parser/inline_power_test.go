@@ -29,17 +29,19 @@ func TestParseInlinePowerFixture(t *testing.T) {
 
 // Rows captured on 09.0.10k after `no inline power` (1/1/46) and from a
 // re-enabled port (allocation without a device), plus a powered port in the
-// same layout.
+// same layout, and a port with a non-PoE device behind a PoE injector
+// (Oper State "Non-PD").
 func TestParseInlinePowerRows(t *testing.T) {
 	out := " Port\tAdmin \tOper    ---Power(mWatts)---  PD Type  PD Class     Pri  Fault/\n" +
 		"     \tState \tState   Consumed  Allocated                             Error\n" +
 		"-----------------------------------------------------------------------------\n" +
 		" 1/1/46\tOff\tOff            0          0  n/a      n/a            3  n/a\n" +
 		" 1/1/47\tOn \tOff            0      30000  n/a      n/a            3  n/a\n" +
-		"  1/1/1\tOn \tOn          9350      30000  IEEE PD  Class 4        2  n/a\r\n"
+		"  1/1/1\tOn \tOn          9350      30000  IEEE PD  Class 4        2  n/a\r\n" +
+		"  1/1/2\tOn \tNon-PD         0          0  n/a      n/a            1  n/a\n"
 	rows := ParseInlinePower(out)
-	if len(rows) != 3 {
-		t.Fatalf("got %d rows, want 3: %+v", len(rows), rows)
+	if len(rows) != 4 {
+		t.Fatalf("got %d rows, want 4: %+v", len(rows), rows)
 	}
 	if r := rows["1/1/46"]; r.AdminOn || r.OperOn {
 		t.Errorf("1/1/46 = %+v, want admin Off", r)
@@ -49,6 +51,9 @@ func TestParseInlinePowerRows(t *testing.T) {
 	}
 	if r := rows["1/1/1"]; !r.OperOn || r.ConsumedMW != 9350 {
 		t.Errorf("1/1/1 = %+v, want oper On, 9350 mW consumed", r)
+	}
+	if r, ok := rows["1/1/2"]; !ok || !r.AdminOn || r.OperOn {
+		t.Errorf("1/1/2 = %+v (found %v), want admin On, oper not On", r, ok)
 	}
 }
 

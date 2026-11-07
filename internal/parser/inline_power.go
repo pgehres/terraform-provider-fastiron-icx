@@ -12,6 +12,7 @@ type InlinePowerStatus struct {
 	// AdminOn is the Admin State column: PoE is enabled on the port.
 	AdminOn bool
 	// OperOn is the Oper State column: a powered device draws power now.
+	// Other values (Off, Non-PD for a device that is not PoE) give false.
 	OperOn bool
 	// ConsumedMW and AllocatedMW are the Power(mWatts) columns.
 	ConsumedMW  int64
@@ -22,7 +23,7 @@ type InlinePowerStatus struct {
 // row: port, admin state, oper state, consumed and allocated milliwatts. The
 // later columns (PD type, PD class, priority, fault) can hold free text such
 // as "n/a" or a class name, so they are not parsed.
-var inlinePowerRowRe = regexp.MustCompile(`^\s*(\d+/\d+/\d+)\s+(On|Off)\s+(On|Off)\s+(\d+)\s+(\d+)\b`)
+var inlinePowerRowRe = regexp.MustCompile(`^\s*(\d+/\d+/\d+)\s+(On|Off)\s+(\S+)\s+(\d+)\s+(\d+)\b`)
 
 // ParseInlinePower parses the per-port rows of `show inline power` or
 // `show inline power <port>` output (captured on an ICX 7450 with FastIron
