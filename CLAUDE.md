@@ -41,6 +41,7 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 - **`icx_snmp`**: communities are write-only (running config shows `.....` or `1 $enc`), kept from state on Read except when the device has none at all; `string` is Sensitive and every community string is redacted from diagnostics (`redactSecrets`, same mechanism as `icx_user`). Import shows a benign re-add diff. `contact`/`location` are read normally.
 - **`icx_logging`**: `logging host`, `logging buffered <n>`, `no logging buffered <level>` (modelled as `disabled_levels` — FastIron toggles levels individually, there is no minimum-level knob), `logging facility`. Null = device default; Read reports null when the line is absent.
 - **Management IP (`icx_management_ip`)**: switch image only (`CapGlobalManagementIP`). `ip address` is only sent with `allow_management_ip_change = true`, always last, through `ExecuteExpectingDisconnect`; Delete sends nothing; omitted `default_gateway`/`dns_servers` are kept (Optional+Computed). Router-image devices use `icx_interface_ve`.
+- **`icx_poe`**: `enabled` is read from the Admin column of `show inline power <port>` (`parser.ParseInlinePower`), because the default differs by model (a 7450 port with no line is powered; the 7150 fixtures print ` inline power`). `power_limit`/`priority` come from the interface stanza (`EthernetInterface.PoE`). FastIron 09.0.10 keeps ONE ` inline power` option per port (a new one replaces the old), so `buildCommands` sends exactly one command for the whole state, and `power_limit`/`priority` conflict (config validators, plus no option with `enabled = false`). Never send `no inline power <option>`: on 09.0.10 `no inline power power-limit N` turns PoE off, and without the value it is "Incomplete command". Removing an option or Delete sends a plain `inline power`. Captured live on an ICX 7450-48P with 09.0.10k (`testdata/inline-power.7450-48p.txt`); 08.0.95 behaviour is not verified.
 - **`write memory`**: Called after every CRUD operation, but skipped if no CLI commands were actually sent.
 
 ### Provider Config
@@ -82,6 +83,7 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 - Debug SSH tool: `go run ./cmd/debug-ssh/` with `FASTIRON_HOST/USERNAME/PASSWORD` env vars
 
 ## Switch Models Tested
+- ICX 7450-48P — FastIron 09.0.10k switch image, 48 PoE+ ports (1-8 high power), 4x10G SFP+ and 2x40G modules; fixture and PoE output captured live
 - ICX 7250-24 — 2 modules, SFP+, full feature set
 - ICX 7150-24 — 3 modules including SFP+
 - ICX 7150-C12P — 12-port PoE compact, optical-monitor
@@ -94,7 +96,7 @@ Terraform provider for Brocade/Ruckus ICX switches running FastIron firmware 08.
 - **Validate telnet + empty credentials live** (gotcha #15): a no-credential switch over telnet (which IAC options the switch sends, that a bare LF is one Enter, whether it echoes under DONT ECHO, `telnet@` prompt) and over SSH (`none` / empty password / keyboard-interactive acceptance, `enable` with no password), plus a switch that does present a `User Name:`/`Password:` telnet login.
 - **Validate `icx_management_ip` live** (gotcha #13): whether the switch image accepts `ip address <new>` as a direct replacement, whether the queued `write memory` survives the session drop, and the exact `no ip dns server-address` syntax. Needs console access.
 - LAG / Port Channel support
-- PoE Read from `show inline power` output
+- PoE high-power options (`power-by-class`, `overdrive`, `interface-mode-2pair-pse`) and the 08.0.95 PoE dialect (whether options also replace each other there)
 - SSH hardening settings
 - SNMP traps/hosts/views and logging console/persistence (only communities, contact, location, hosts, buffer and facility are modelled)
 - **Validate `icx_ntp`, `icx_snmp`, `icx_logging` and port `enabled` live**: whether `clock timezone` prompts for confirmation on 08.0.95, the `no disable serve` spelling, that `snmp-server contact` text with spaces round-trips unquoted, the real `show arp` column layout on both images (mgmtpath.go parses leniently), and which buffered levels are on by default.

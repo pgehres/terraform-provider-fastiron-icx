@@ -1,0 +1,61 @@
+
+Power Capacity:    	Total is 748000 mWatts. Current Free is 748000 mWatts.
+
+Power Allocations: 	Requests Honored 48 times
+
+
+ Port	Admin 	Oper    ---Power(mWatts)---  PD Type  PD Class     Pri  Fault/
+     	State 	State   Consumed  Allocated                             Error
+-----------------------------------------------------------------------------
+  1/1/1	On 	Off            0          0  n/a      n/a            3  n/a
+  1/1/2	On 	Off            0          0  n/a      n/a            3  n/a
+  1/1/3	On 	Off            0          0  n/a      n/a            3  n/a
+  1/1/4	On 	Off            0          0  n/a      n/a            3  n/a
+  1/1/5	On 	Off            0          0  n/a      n/a            3  n/a
+  1/1/6	On 	Off            0          0  n/a      n/a            3  n/a
+  1/1/7	On 	Off            0          0  n/a      n/a            3  n/a
+  1/1/8	On 	Off            0          0  n/a      n/a            3  n/a
+  1/1/9	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/10	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/11	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/12	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/13	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/14	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/15	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/16	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/17	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/18	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/19	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/20	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/21	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/22	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/23	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/24	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/25	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/26	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/27	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/28	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/29	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/30	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/31	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/32	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/33	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/34	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/35	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/36	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/37	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/38	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/39	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/40	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/41	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/42	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/43	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/44	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/45	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/46	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/47	On 	Off            0          0  n/a      n/a            3  n/a
+ 1/1/48	On 	Off            0          0  n/a      n/a            3  n/a
+-----------------------------------------------------------------------------
+ Total	      	               0          0
+
+

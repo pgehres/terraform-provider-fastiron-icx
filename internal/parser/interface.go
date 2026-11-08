@@ -22,7 +22,25 @@ type EthernetInterface struct {
 	// Disabled is true when the interface carries a ` disable` line: the
 	// port is administratively down. Ports without the line are enabled.
 	Disabled bool
+	// PoE holds the interface's ` inline power ...` options. FastIron 09.0.10
+	// keeps one option per port (a new `inline power <option>` replaces the
+	// previous one). The PoE admin state is not here: whether a port without
+	// a line is powered depends on the model, so read it from
+	// `show inline power` (ParseInlinePower).
+	PoE PoEConfig
+	// RawLines holds every line not parsed into a field above, and also the
+	// ` inline power` lines parsed into PoE.
 	RawLines []string
+}
+
+// PoEConfig is the inline power configuration of one ethernet interface.
+type PoEConfig struct {
+	// Disabled is true for a ` no inline power` line.
+	Disabled bool
+	// PowerLimit is the milliwatt limit from ` inline power power-limit N`.
+	PowerLimit *int64
+	// Priority is the class from ` inline power priority N` (1 is highest).
+	Priority *int64
 }
 
 // VEInterface represents a parsed virtual ethernet interface configuration.
@@ -37,6 +55,8 @@ var (
 	veIfRe  = regexp.MustCompile(`^interface ve (\d+)`)
 	// FastIron prints the dual-mode VLAN with two spaces: ` dual-mode  102`.
 	dualModeRe = regexp.MustCompile(`^dual-mode(?:\s+(\d+))?$`)
+	// ` inline power power-limit 25000`, ` inline power priority 2`.
+	poeOptionRe = regexp.MustCompile(`^inline power (power-limit|priority) (\d+)$`)
 )
 
 func (c *RunningConfig) parseEthernetStanza(lines []string) error {
@@ -53,6 +73,20 @@ func (c *RunningConfig) parseEthernetStanza(lines []string) error {
 
 	for _, line := range lines[1:] {
 		trimmed := strings.TrimSpace(line)
+
+		if trimmed == "no inline power" {
+			iface.PoE.Disabled = true
+		} else if pm := poeOptionRe.FindStringSubmatch(trimmed); pm != nil {
+			v, err := strconv.ParseInt(pm[2], 10, 64)
+			if err != nil {
+				return fmt.Errorf("interface %s %s: %w", iface.Port, trimmed, err)
+			}
+			if pm[1] == "power-limit" {
+				iface.PoE.PowerLimit = &v
+			} else {
+				iface.PoE.Priority = &v
+			}
+		}
 
 		switch {
 		case strings.HasPrefix(trimmed, "port-name "):
